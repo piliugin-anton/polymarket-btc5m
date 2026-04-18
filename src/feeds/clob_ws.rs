@@ -1,13 +1,16 @@
 //! Polymarket CLOB WebSocket — public `market` channel for order book + trades.
 //!
 //! We subscribe to the two token IDs (UP and DOWN) of the active market and
-//! consume book snapshots + price changes. For user-specific fills we'd need
+//! consume book snapshots + price changes. The feed may send either tagged
+//! `event_type` messages, or a wrapped `{ "market", "price_changes": [...] }`
+//! batch with per-row `asset_id`. For user-specific fills we'd need
 //! the `user` channel with signed auth — left as a follow-up (see trading.rs
 //! for how we'd derive the L2 creds).
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use std::collections::{BTreeMap, HashMap};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -67,6 +70,24 @@ struct RawChange {
     size:  String,
 }
 
+/// Alternate CLOB shape: one object with `market` + `price_changes` (per-row `asset_id`).
+#[derive(Debug, Deserialize)]
+struct MarketPriceChangesMsg {
+    #[serde(default, rename = "market")]
+    #[allow(dead_code)]
+    market: Option<String>,
+    #[serde(default)]
+    price_changes: Vec<MarketPriceChangeItem>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketPriceChangeItem {
+    asset_id: String,
+    price:    String,
+    size:     String,
+    side:     String,
+}
+
 pub fn spawn(token_ids: Vec<String>, tx: mpsc::Sender<BookSnapshot>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -97,7 +118,6 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     }
 
     // Keep local book state so price_change events can be applied
-    use std::collections::{BTreeMap, HashMap};
     // asset_id → (bids map, asks map). We use i64 keyed by price*100 because
     // price tick is 0.01 and BTreeMap needs Ord.
     let mut books: HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)> = HashMap::new();
@@ -149,62 +169,78 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                     first_text_logged = true;
                 }
 
-                // CLOB sends arrays of events sometimes; handle both shapes.
-                let events: Vec<RawEvent> = match serde_json::from_str::<Vec<RawEvent>>(&txt) {
-                    Ok(v) => v,
-                    Err(arr_err) => match serde_json::from_str::<RawEvent>(&txt) {
-                        Ok(e) => vec![e],
-                        Err(obj_err) => {
-                            warn!(
-                                len = txt.len(),
-                                snippet = %snip_frame(&txt, 280),
-                                arr_err = %arr_err,
-                                obj_err = %obj_err,
-                                "CLOB WS text not parsed as book events — check schema / topic",
-                            );
-                            continue;
-                        }
+                // CLOB: `[{event_type:...}]`, single event, or `{ market, price_changes:[...] }`.
+                if let Ok(events) = serde_json::from_str::<Vec<RawEvent>>(&txt) {
+                    for ev in events {
+                        apply_raw_event(&mut books, ev, tx).await;
                     }
-                };
-
-                for ev in events {
-                    match ev {
-                        RawEvent::Book { asset_id, bids, asks } => {
-                            let entry = books.entry(asset_id.clone()).or_default();
-                            entry.0.clear(); entry.1.clear();
-                            for l in &bids {
-                                if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
-                                    entry.0.insert((p * 100.0).round() as i64, s);
-                                }
-                            }
-                            for l in &asks {
-                                if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
-                                    entry.1.insert((p * 100.0).round() as i64, s);
-                                }
-                            }
-                            send_snapshot(&asset_id, entry, tx).await;
-                        }
-                        RawEvent::PriceChange { asset_id, changes } => {
-                            let entry = books.entry(asset_id.clone()).or_default();
-                            for c in &changes {
-                                let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
-                                let key = (p * 100.0).round() as i64;
-                                let map = if c.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
-                                if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
-                            }
-                            send_snapshot(&asset_id, entry, tx).await;
-                        }
-                        RawEvent::Other => {}
-                    }
+                    continue;
                 }
+                if let Ok(ev) = serde_json::from_str::<RawEvent>(&txt) {
+                    apply_raw_event(&mut books, ev, tx).await;
+                    continue;
+                }
+                if let Ok(msg) = serde_json::from_str::<MarketPriceChangesMsg>(&txt) {
+                    for ch in &msg.price_changes {
+                        let entry = books.entry(ch.asset_id.clone()).or_default();
+                        let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
+                        let key = (p * 100.0).round() as i64;
+                        let map = if ch.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
+                        if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
+                        send_snapshot(&ch.asset_id, entry, tx).await;
+                    }
+                    continue;
+                }
+
+                warn!(
+                    len = txt.len(),
+                    snippet = %snip_frame(&txt, 280),
+                    "CLOB WS text not parsed (book / price_change / market price_changes)",
+                );
             }
         }
     }
 }
 
+async fn apply_raw_event(
+    books: &mut HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)>,
+    ev: RawEvent,
+    tx: &mpsc::Sender<BookSnapshot>,
+) {
+    match ev {
+        RawEvent::Book { asset_id, bids, asks } => {
+            let entry = books.entry(asset_id.clone()).or_default();
+            entry.0.clear();
+            entry.1.clear();
+            for l in &bids {
+                if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
+                    entry.0.insert((p * 100.0).round() as i64, s);
+                }
+            }
+            for l in &asks {
+                if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
+                    entry.1.insert((p * 100.0).round() as i64, s);
+                }
+            }
+            send_snapshot(&asset_id, entry, tx).await;
+        }
+        RawEvent::PriceChange { asset_id, changes } => {
+            let entry = books.entry(asset_id.clone()).or_default();
+            for c in &changes {
+                let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
+                let key = (p * 100.0).round() as i64;
+                let map = if c.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
+                if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
+            }
+            send_snapshot(&asset_id, entry, tx).await;
+        }
+        RawEvent::Other => {}
+    }
+}
+
 async fn send_snapshot(
     asset_id: &str,
-    (bids, asks): &(std::collections::BTreeMap<i64, f64>, std::collections::BTreeMap<i64, f64>),
+    (bids, asks): &(BTreeMap<i64, f64>, BTreeMap<i64, f64>),
     tx: &mpsc::Sender<BookSnapshot>,
 ) {
     // bids: high→low, asks: low→high

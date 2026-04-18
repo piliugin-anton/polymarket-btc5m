@@ -4,7 +4,8 @@
 //!   1. crossterm key events
 //!   2. Chainlink price ticks
 //!   3. CLOB book snapshots
-//!   4. Periodic ticks for market rolling
+//!   4. CLOB conditional balances (positions) after each market roll
+//!   5. Periodic ticks for market rolling
 //!
 //! Trading actions post results back through the same channel.
 
@@ -23,10 +24,11 @@ pub enum AppEvent {
     Price(PriceTick),
     Book(BookSnapshot),
     MarketRoll(ActiveMarket),
+    /// CLOB conditional token balances for the current market's UP/DOWN tokens (human shares).
+    PositionsLoaded { up_shares: f64, down_shares: f64 },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
     OrderErr(String),
-    Quit,
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
@@ -225,12 +227,28 @@ impl AppState {
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
+                // Return to normal keys (u/d/…) — otherwise `s` / limit modal survives a roll.
+                self.input_mode = InputMode::Normal;
                 self.status_line = format!("New market: {}", m.question);
                 self.latched_price_to_beat = None;
                 self.market = Some(m);
                 self.book_up = None; self.book_down = None;
                 self.position_up = Default::default();
                 self.position_down = Default::default();
+            }
+            AppEvent::PositionsLoaded { up_shares, down_shares } => {
+                // Cost basis is unknown until filled in-session; shares come from CLOB balances.
+                self.position_up = Position {
+                    shares: up_shares,
+                    avg_entry: 0.0,
+                };
+                self.position_down = Position {
+                    shares: down_shares,
+                    avg_entry: 0.0,
+                };
+                self.status_line = format!(
+                    "Positions from CLOB — UP {up_shares:.2} / DOWN {down_shares:.2} sh (avg @ session)"
+                );
             }
             AppEvent::OrderAck { side, outcome, qty, price } => {
                 let realized = match side {
@@ -246,7 +264,7 @@ impl AppState {
                     side_str(side), outcome.as_str());
             }
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
-            AppEvent::Key(_) | AppEvent::Quit => {} // handled in events.rs
+            AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
     }
 }
@@ -259,22 +277,21 @@ pub fn resolve_market_order(
     state: &AppState,
     outcome: Outcome,
     side: Side,
-    size_usdc_or_shares: f64,
+    size: f64,
 ) -> Option<(f64, f64, OrderType)> {
     // We use FOK against the best visible level. If the level has less size
     // than requested, caller should fall back to FAK.
     match side {
         Side::Buy => {
             let ask = state.best_ask(outcome)?;
-            // size_usdc_or_shares is interpreted as USDC notional for buys
-            let shares = (size_usdc_or_shares / ask).max(0.01);
+            // `size` = USDC notional → shares at best ask
+            let shares = (size / ask).max(0.01);
             Some((shares, ask, OrderType::Fak))
         }
         Side::Sell => {
             let bid = state.best_bid(outcome)?;
-            // For sells the size is in shares — but the TUI keeps "size" in USDC,
-            // so we convert USDC notional → shares at bid for consistency.
-            let shares = (size_usdc_or_shares / bid).max(0.01);
+            // `size` = shares to sell (maker leg is outcome tokens; must not treat as USDC).
+            let shares = size.max(0.01);
             Some((shares, bid, OrderType::Fak))
         }
     }

@@ -3,7 +3,7 @@
 //! All trading-sensitive values come from environment variables. See `.env.example`.
 
 use anyhow::{bail, Context, Result};
-use alloy_primitives::{Address, U256};
+use alloy_primitives::Address;
 use std::str::FromStr;
 
 // ── Polymarket endpoints ────────────────────────────────────────────
@@ -17,10 +17,15 @@ pub const RTDS_WS_URL: &str = "wss://ws-live-data.polymarket.com";
 // ── Polygon ─────────────────────────────────────────────────────────
 pub const POLYGON_CHAIN_ID: u64 = 137;
 
-// CTF Exchange + NegRisk Exchange (verifyingContract for EIP-712 domain)
-// Source: https://docs.polymarket.com
-pub const CTF_EXCHANGE: &str         = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
-pub const NEG_RISK_CTF_EXCHANGE: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+// CTF Exchange — V1 EIP-712 (`domain.version` = "1"). Used while `GET /version` returns 1.
+// From Polymarket `clob-client-v2` `MATIC_CONTRACTS` (`exchange` / `negRiskExchange`).
+pub const CTF_EXCHANGE_V1: &str          = "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E";
+pub const NEG_RISK_CTF_EXCHANGE_V1: &str = "0xC5d563A36AE78145C45a50134d48A1215220f80a";
+
+// CTF Exchange — V2 EIP-712 (`domain.version` = "2") for when `GET /version` returns 2.
+// https://docs.polymarket.com/v2-migration#for-api-users
+pub const CTF_EXCHANGE_V2: &str          = "0xE111180000d2663C0091e4f400237545B87B996B";
+pub const NEG_RISK_CTF_EXCHANGE_V2: &str = "0xe2222d279d744050d28e00520010520000310F59";
 
 /// Signature type (see CTF Exchange `OrderStructs.sol`).
 ///
@@ -46,9 +51,10 @@ pub struct Config {
     /// EOA address derived from `private_key` — filled by `signer.address()`.
     pub signer_address: Address,
     pub sig_type: SignatureType,
-    /// Default order size in USDC (human units, e.g. 10.0).
+    /// Default size: USDC for BUY; **shares** for SELL (`DEFAULT_SIZE_USDC` env name is historical).
     pub default_size_usdc: f64,
-    /// Max fill slippage for market orders, in basis points.
+    /// Max fill slippage for market orders, in basis points (not yet applied in order paths).
+    #[allow(dead_code)]
     pub market_slippage_bps: u32,
 }
 
@@ -85,11 +91,16 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(200); // 2% default slippage tolerance on market orders
 
-        // Derive signer address using alloy
-        use alloy_signer::Signer as _;
         let signer: alloy_signer_local::PrivateKeySigner = private_key.parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
         let signer_address = signer.address();
+
+        if signer_address != funder && sig_type == SignatureType::Eoa {
+            bail!(
+                "POLYMARKET_SIG_TYPE=0 (EOA) requires POLYMARKET_FUNDER to match the wallet derived from POLYMARKET_PK. \
+                 Your funder is a different address (typically the Polymarket Gnosis Safe). Set POLYMARKET_SIG_TYPE=2."
+            );
+        }
 
         Ok(Self {
             private_key,
@@ -100,18 +111,4 @@ impl Config {
             market_slippage_bps,
         })
     }
-}
-
-/// Helper: 1 USDC = 1_000_000 base units (USDC has 6 decimals on Polygon).
-pub fn usdc_to_base(amount: f64) -> U256 {
-    // Multiply in integer space to avoid f64 precision issues.
-    let micros = (amount * 1_000_000.0).round() as u128;
-    U256::from(micros)
-}
-
-/// Convert CTF token amount (6-decimal) to f64 shares.
-pub fn base_to_shares(base: U256) -> f64 {
-    // Shares are expressed with the same 1e6 scale as USDC on Polymarket.
-    let v: u128 = base.try_into().unwrap_or(0);
-    (v as f64) / 1_000_000.0
 }

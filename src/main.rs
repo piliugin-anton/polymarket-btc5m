@@ -32,9 +32,9 @@ use crossterm::{
 use events::Action;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
-use std::{io::stdout, sync::Arc, time::Duration};
+use std::{collections::HashMap, io::stdout, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, Mutex};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use trading::{OrderArgs, OrderType, Side, TradingClient};
 
 #[tokio::main]
@@ -130,13 +130,46 @@ async fn main() -> Result<()> {
 
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();
+    let trading_for_positions = trading.clone();
     tokio::spawn(async move {
         let mut current: Option<tokio::task::JoinHandle<()>> = None;
         while let Some(m) = market_rx.recv().await {
             if let Some(h) = current.take() { h.abort(); }
             let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
             current = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
-            let _ = tx_for_books.send(AppEvent::MarketRoll(m)).await;
+            let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
+
+            let t = trading_for_positions.clone();
+            let txp = tx_for_books.clone();
+            let up_id = m.up_token_id.clone();
+            let down_id = m.down_token_id.clone();
+            tokio::spawn(async move {
+                let mut cli = t.lock().await;
+                if let Err(e) = cli.ensure_creds().await {
+                    debug!(error = %e, "positions sync skipped: no CLOB creds");
+                    return;
+                }
+                let up = cli
+                    .fetch_conditional_balance_shares(&up_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        debug!(error = %e, token = %up_id, "fetch UP balance failed");
+                        0.0
+                    });
+                let down = cli
+                    .fetch_conditional_balance_shares(&down_id)
+                    .await
+                    .unwrap_or_else(|e| {
+                        debug!(error = %e, token = %down_id, "fetch DOWN balance failed");
+                        0.0
+                    });
+                let _ = txp
+                    .send(AppEvent::PositionsLoaded {
+                        up_shares: up,
+                        down_shares: down,
+                    })
+                    .await;
+            });
         }
     });
 
@@ -150,21 +183,42 @@ async fn main() -> Result<()> {
     let mut state = AppState::new(cfg.default_size_usdc);
 
     // ── main loop ────────────────────────────────────────────────────
+    /// Drain coalesced feed events in one frame so a burst of book updates
+    /// does not force one `draw()` per message (that made size-edit feel frozen).
+    const MAX_EVENTS_PER_FRAME: usize = 8192;
+
     let result: Result<()> = loop {
-        // Render first so startup shows something.
         term.draw(|f| ui::draw(f, &state))?;
 
-        let Some(ev) = rx.recv().await else { break Ok(()) };
+        let Some(mut ev) = rx.recv().await else { break Ok(()) };
 
-        // Key events go through `handle_key`; everything else just applies.
-        if let AppEvent::Key(k) = ev {
-            let action = events::handle_key(&mut state, k);
-            dispatch_action(action, &state, &trading, &tx);
-            continue;
+        let mut should_quit = false;
+        let mut processed = 0usize;
+        loop {
+            match ev {
+                AppEvent::Key(k) => {
+                    let action = events::handle_key(&mut state, k);
+                    if matches!(action, Action::Quit) {
+                        should_quit = true;
+                        break;
+                    }
+                    dispatch_action(action, &state, &trading, &tx);
+                }
+                e => state.apply(e),
+            }
+            processed += 1;
+            if processed >= MAX_EVENTS_PER_FRAME {
+                break;
+            }
+            match rx.try_recv() {
+                Ok(next) => ev = next,
+                Err(_) => break,
+            }
         }
-        if matches!(ev, AppEvent::Quit) { break Ok(()); }
 
-        state.apply(ev);
+        if should_quit {
+            break Ok(());
+        }
     };
 
     // ── teardown ─────────────────────────────────────────────────────
@@ -183,7 +237,13 @@ fn spawn_price_feed(tx: mpsc::Sender<AppEvent>) {
     feeds::chainlink::spawn(ptx);
     tokio::spawn(async move {
         while let Some(p) = prx.recv().await {
-            let _ = tx.send(AppEvent::Price(p)).await;
+            // RTDS can outpace the TUI; forward only the latest tick per burst so
+            // `Price` does not crowd out `Book` on the shared bounded queue.
+            let mut latest = p;
+            while let Ok(more) = prx.try_recv() {
+                latest = more;
+            }
+            let _ = tx.try_send(AppEvent::Price(latest));
         }
     });
 }
@@ -192,7 +252,15 @@ fn clob_forwarder(tx: mpsc::Sender<AppEvent>) -> mpsc::Sender<feeds::clob_ws::Bo
     let (btx, mut brx) = mpsc::channel::<feeds::clob_ws::BookSnapshot>(64);
     tokio::spawn(async move {
         while let Some(b) = brx.recv().await {
-            let _ = tx.send(AppEvent::Book(b)).await;
+            // Collapse bursts so UP/DOWN snapshots both get a chance on the queue.
+            let mut latest: HashMap<String, feeds::clob_ws::BookSnapshot> = HashMap::new();
+            latest.insert(b.asset_id.clone(), b);
+            while let Ok(more) = brx.try_recv() {
+                latest.insert(more.asset_id.clone(), more);
+            }
+            for snap in latest.into_values() {
+                let _ = tx.try_send(AppEvent::Book(snap));
+            }
         }
     });
     btx
@@ -204,7 +272,9 @@ fn spawn_ticker(tx: mpsc::Sender<AppEvent>) {
         iv.tick().await;
         loop {
             iv.tick().await;
-            if tx.send(AppEvent::Tick).await.is_err() { break; }
+            if tx.try_send(AppEvent::Tick).is_err() && tx.is_closed() {
+                break;
+            }
         }
     });
 }
@@ -218,7 +288,7 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                     if tx.send(AppEvent::Key(k)).await.is_err() { break; }
                 }
                 CtEvent::Resize(_, _) => {
-                    let _ = tx.send(AppEvent::Tick).await; // force redraw
+                    let _ = tx.try_send(AppEvent::Tick); // redraw; never block crossterm reader
                 }
                 _ => {}
             }
@@ -252,6 +322,13 @@ fn spawn_market_watcher(
 
 // ── action dispatch ─────────────────────────────────────────────────
 
+fn forward_order_err(tx: &mpsc::Sender<AppEvent>, msg: String) {
+    let tx = tx.clone();
+    tokio::spawn(async move {
+        let _ = tx.send(AppEvent::OrderErr(msg)).await;
+    });
+}
+
 fn dispatch_action(
     action:  Action,
     state:   &AppState,
@@ -259,8 +336,9 @@ fn dispatch_action(
     tx:      &mpsc::Sender<AppEvent>,
 ) {
     match action {
-        Action::None             => {}
-        Action::Quit             => { let _ = tx.try_send(AppEvent::Quit); }
+        Action::None => {}
+        // `main` handles `Action::Quit` before calling this; kept for an exhaustive `match`.
+        Action::Quit => {}
         Action::ForceMarketRoll  => { /* market watcher polls every 10s; r is a no-op for now */ }
         Action::CancelAll        => {
             let t  = trading.clone();
@@ -274,27 +352,32 @@ fn dispatch_action(
         }
         Action::PlaceMarket { outcome, side, size_usdc } => {
             let Some(market) = state.market.clone() else {
-                let _ = tx.try_send(AppEvent::OrderErr("no active market".into()));
+                forward_order_err(tx, "no active market".into());
                 return;
             };
             let Some((shares, price, otype)) = resolve_market_order(state, outcome, side, size_usdc) else {
-                let _ = tx.try_send(AppEvent::OrderErr("no book liquidity".into()));
+                forward_order_err(tx, "no book liquidity".into());
                 return;
             };
+            let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
-                trading.clone(), tx.clone(), market, outcome, side, shares, price, otype,
+                trading.clone(), tx.clone(), market, outcome, side, shares, price, otype, buy_notional,
             );
         }
         Action::PlaceLimit { outcome, side, price, size_usdc } => {
             let Some(market) = state.market.clone() else {
-                let _ = tx.try_send(AppEvent::OrderErr("no active market".into()));
+                forward_order_err(tx, "no active market".into());
                 return;
             };
-            // For limit buys, `size_usdc` is notional; we convert to shares at the limit price.
-            // For limit sells, we treat `size_usdc` as the USDC value at the limit price.
-            let shares = (size_usdc / price).max(0.01);
+            // Limit BUY: `size_usdc` = USDC notional → shares at limit price.
+            // Limit SELL: `size_usdc` = shares (field name is historical).
+            let shares = match side {
+                Side::Buy => (size_usdc / price).max(0.01),
+                Side::Sell => size_usdc.max(0.01),
+            };
+            let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
-                trading.clone(), tx.clone(), market, outcome, side, shares, price, OrderType::Gtc,
+                trading.clone(), tx.clone(), market, outcome, side, shares, price, OrderType::Gtc, buy_notional,
             );
         }
     }
@@ -310,19 +393,46 @@ fn spawn_order(
     shares:   f64,
     price:    f64,
     otype:    OrderType,
+    buy_notional_usdc: Option<f64>,
 ) {
     tokio::spawn(async move {
         let token_id = match outcome {
             Outcome::Up   => market.up_token_id,
             Outcome::Down => market.down_token_id,
         };
+        debug!(
+            ?outcome,
+            ?side,
+            shares,
+            price,
+            ?otype,
+            slug = %market.slug,
+            neg_risk = market.neg_risk,
+            token_id = %token_id,
+            "spawn_order: calling TradingClient::place_order"
+        );
         let args = OrderArgs {
-            token_id, side, price, size: shares, neg_risk: market.neg_risk,
+            token_id,
+            side,
+            price,
+            size: shares,
+            neg_risk: market.neg_risk,
+            tick_size: market.tick_size.clone(),
+            buy_notional_usdc,
         };
         let mut cli = trading.lock().await;
         match cli.place_order(args, otype).await {
             Ok(resp) => {
-                if resp.success || resp.status.as_deref() == Some("matched") {
+                let ok_ui = resp.success || resp.status.as_deref() == Some("matched");
+                debug!(
+                    success_flag = resp.success,
+                    status = ?resp.status,
+                    order_id = ?resp.order_id,
+                    error = ?resp.error,
+                    ok_ui,
+                    "spawn_order: place_order returned Ok (verify ok_ui for TUI ack)"
+                );
+                if ok_ui {
                     let _ = tx.send(AppEvent::OrderAck {
                         side, outcome, qty: shares, price,
                     }).await;
@@ -331,7 +441,10 @@ fn spawn_order(
                     let _ = tx.send(AppEvent::OrderErr(msg)).await;
                 }
             }
-            Err(e) => { let _ = tx.send(AppEvent::OrderErr(e.to_string())).await; }
+            Err(e) => {
+                debug!(error = %e, "spawn_order: place_order returned Err");
+                let _ = tx.send(AppEvent::OrderErr(e.to_string())).await;
+            }
         }
     });
 }

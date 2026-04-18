@@ -12,7 +12,9 @@ use crate::trading::Side;
 pub enum Action {
     None,
     Quit,
+    /// Market: BUY `size_usdc` = USDC to spend; SELL = **shares** to close.
     PlaceMarket { outcome: Outcome, side: Side, size_usdc: f64 },
+    /// Limit: BUY size = USDC notional; SELL size = **shares**.
     PlaceLimit  { outcome: Outcome, side: Side, price: f64, size_usdc: f64 },
     CancelAll,
     ForceMarketRoll,
@@ -70,7 +72,8 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
 
 fn edit_size_mode(state: &mut AppState, k: KeyEvent) -> Action {
     match k.code {
-        KeyCode::Enter | KeyCode::Esc => {
+        // Many terminals send CR/LF (`\r` / `\n`) for Return instead of `KeyCode::Enter`.
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') | KeyCode::Esc => {
             // Validate: keep old value if parse fails
             if state.size_input.parse::<f64>().is_err() {
                 state.size_input = format!("{:.2}", state.default_size_usdc);
@@ -113,7 +116,7 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             };
             Action::None
         }
-        KeyCode::Enter => {
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') => {
             let price = state.limit_price_input.parse::<f64>();
             let size  = state.limit_size_input.parse::<f64>();
             match (price, size) {

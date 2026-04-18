@@ -34,7 +34,9 @@ pub struct PriceTick {
 #[derive(Debug, Deserialize)]
 struct Envelope {
     #[serde(default)] topic: String,
-    #[serde(default, rename = "type")] kind: String,
+    #[serde(default, rename = "type")]
+    #[allow(dead_code)]
+    kind: String,
     #[serde(default)] payload: Option<Payload>,
 }
 

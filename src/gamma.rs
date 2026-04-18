@@ -31,12 +31,13 @@ const BTC_5M_WINDOW_SEC: i64 = 300;
 /// What the rest of the app needs to know about a market.
 #[derive(Debug, Clone)]
 pub struct ActiveMarket {
+    #[allow(dead_code)]
     pub condition_id:   String,
     pub question:       String,
     pub slug:           String,
     pub up_token_id:    String,
     pub down_token_id:  String,
-    pub tick_size:      String,   // e.g. "0.01"
+    pub tick_size:      String,   // e.g. "0.01" — CLOB rounding (`ROUNDING_CONFIG`)
     pub neg_risk:       bool,
     pub price_to_beat:  Option<f64>, // Polymarket crypto-price API, else description, else RTDS latch in app
     pub opens_at:       DateTime<Utc>,
@@ -52,8 +53,12 @@ pub struct ActiveMarket {
 
 #[derive(Debug, Deserialize)]
 struct RawEvent {
-    #[serde(default)] title:     String,
-    #[serde(default)] slug:      String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    title:     String,
+    #[serde(default)]
+    #[allow(dead_code)]
+    slug:      String,
     #[serde(default, rename = "startDate")] start_date: Option<String>,
     #[serde(default, rename = "endDate")]   end_date:   Option<String>,
     #[serde(default)] markets:   Vec<RawMarket>,
@@ -273,10 +278,15 @@ fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
     };
 
     let price_to_beat = extract_price_to_beat(&m.description); // overridden in find_current_btc_5m when API returns openPrice
-    let tick_size = m
-        .tick_size_f
-        .map(|v| format!("{v:.2}"))
-        .unwrap_or_else(|| "0.01".into());
+    // Canonical tick strings for `ROUNDING_CONFIG` parity (avoid `0.001 → "0.00"` with `:.2`).
+    let tick_size = match m.tick_size_f {
+        Some(v) if (v - 0.1).abs() < 1e-6 => "0.1".into(),
+        Some(v) if (v - 0.01).abs() < 1e-7 => "0.01".into(),
+        Some(v) if (v - 0.001).abs() < 1e-8 => "0.001".into(),
+        Some(v) if (v - 0.0001).abs() < 1e-9 => "0.0001".into(),
+        Some(v) => format!("{v}"),
+        None => "0.01".into(),
+    };
 
     Ok(ActiveMarket {
         condition_id: m.condition_id.clone(),

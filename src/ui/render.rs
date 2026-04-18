@@ -261,7 +261,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
     let keys = Line::from(vec![
         Span::styled("size ", Style::default().fg(Color::DarkGray)),
         size_span,
-        Span::raw(" USDC   "),
+        Span::raw(" buy$·sell sh "),
         key("u", "buy UP"), sep(),
         key("d", "buy DOWN"), sep(),
         key("U", "sell UP"), sep(),
@@ -321,6 +321,14 @@ fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
     };
     f.render_widget(Paragraph::new(mk(price_hl, "price", &s.limit_price_input)), rows[0]);
     f.render_widget(Paragraph::new(mk(size_hl,  "size",  &s.limit_size_input )), rows[1]);
+    let size_hint = match side {
+        crate::trading::Side::Buy => "size = USDC notional",
+        crate::trading::Side::Sell => "size = shares",
+    };
+    f.render_widget(
+        Paragraph::new(Span::styled(format!("   {size_hint}"), Style::default().fg(Color::DarkGray))),
+        rows[2],
+    );
 
     f.render_widget(
         Paragraph::new(Line::from(vec![

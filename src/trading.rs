@@ -1,30 +1,15 @@
 //! Trading layer — EIP-712 order construction + CLOB REST submission.
 //!
-//! We do the signing in pure Rust using `alloy` + `alloy-sol-types`. The
-//! order struct is lifted verbatim from Polymarket's `ctf-exchange`:
-//!
-//! ```solidity
-//! struct Order {
-//!     uint256 salt;
-//!     address maker;
-//!     address signer;
-//!     address taker;        // 0x0 = public order
-//!     uint256 tokenId;
-//!     uint256 makerAmount;
-//!     uint256 takerAmount;
-//!     uint256 expiration;   // 0 = GTC
-//!     uint256 nonce;
-//!     uint256 feeRateBps;
-//!     uint8   side;         // 0=BUY, 1=SELL
-//!     uint8   signatureType;
-//! }
-//! ```
+//! EIP-712 order shape follows **`GET https://clob.polymarket.com/version`** (see Polymarket
+//! `clob-client-v2` `resolveVersion`): production currently returns **`1`**, i.e. domain
+//! `version: "1"` and the V1 `Order` struct (incl. `taker`, `expiration`, `nonce`, `feeRateBps`).
+//! When the API reports **`2`**, we use the V2 struct from the migration docs.
 //!
 //! L1 (EIP-712 wallet sig) is used ONCE to derive API credentials. After that
 //! every order-posting request is authed with L2 (HMAC-SHA256 over
 //! `timestamp + method + path + body` using the base64-decoded `secret`).
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use alloy_primitives::{Address, U256, B256, hex};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
@@ -34,35 +19,71 @@ use hmac::{Hmac, Mac};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::str::FromStr;
+use tracing::debug;
 
 use crate::config::{
-    Config, SignatureType, CTF_EXCHANGE, CLOB_HOST, NEG_RISK_CTF_EXCHANGE, POLYGON_CHAIN_ID,
-    usdc_to_base,
+    Config, CLOB_HOST, CTF_EXCHANGE_V1, CTF_EXCHANGE_V2, NEG_RISK_CTF_EXCHANGE_V1,
+    NEG_RISK_CTF_EXCHANGE_V2, POLYGON_CHAIN_ID,
 };
 
-// ── EIP-712 Order struct (derived via alloy-sol-types) ──────────────
-sol! {
-    #[derive(Debug)]
-    struct Order {
-        uint256 salt;
-        address maker;
-        address signer;
-        address taker;
-        uint256 tokenId;
-        uint256 makerAmount;
-        uint256 takerAmount;
-        uint256 expiration;
-        uint256 nonce;
-        uint256 feeRateBps;
-        uint8   side;
-        uint8   signatureType;
+// ── EIP-712 Order structs (CLOB V1 vs V2) ───────────────────────────
+// EIP-712 `encodeType` must use the literal name **`Order`** (Polymarket `primaryType: "Order"`).
+// `sol!` sets that name from the Solidity struct id — `struct OrderV1` would hash as `OrderV1(...)`,
+// which breaks verification. Use separate modules so both can be named `Order`.
+mod clob_order_v1 {
+    use super::*;
+    sol! {
+        #[derive(Debug)]
+        struct Order {
+            uint256 salt;
+            address maker;
+            address signer;
+            address taker;
+            uint256 tokenId;
+            uint256 makerAmount;
+            uint256 takerAmount;
+            uint256 expiration;
+            uint256 nonce;
+            uint256 feeRateBps;
+            uint8   side;
+            uint8   signatureType;
+        }
     }
 }
 
-fn domain(verifying_contract: Address) -> Eip712Domain {
+mod clob_order_v2 {
+    use super::*;
+    sol! {
+        #[derive(Debug)]
+        struct Order {
+            uint256 salt;
+            address maker;
+            address signer;
+            uint256 tokenId;
+            uint256 makerAmount;
+            uint256 takerAmount;
+            uint8   side;
+            uint8   signatureType;
+            uint256 timestamp;
+            bytes32 metadata;
+            bytes32 builder;
+        }
+    }
+}
+
+fn domain_v1(verifying_contract: Address) -> Eip712Domain {
     eip712_domain! {
         name:              "Polymarket CTF Exchange",
         version:           "1",
+        chain_id:          POLYGON_CHAIN_ID,
+        verifying_contract: verifying_contract,
+    }
+}
+
+fn domain_v2(verifying_contract: Address) -> Eip712Domain {
+    eip712_domain! {
+        name:              "Polymarket CTF Exchange",
+        version:           "2",
         chain_id:          POLYGON_CHAIN_ID,
         verifying_contract: verifying_contract,
     }
@@ -79,6 +100,7 @@ impl Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // FOK/GTD not used by the bot yet; kept for parity with CLOB order types
 pub enum OrderType { Gtc, Fok, Fak, Gtd }
 
 impl OrderType {
@@ -95,6 +117,12 @@ pub struct OrderArgs {
     pub price:    f64,     // 0.01..=0.99
     pub size:     f64,     // in shares
     pub neg_risk: bool,
+    /// Gamma `orderPriceMinTickSize` as string, e.g. `"0.01"` — drives amount rounding per
+    /// `clob-client-v2` `ROUNDING_CONFIG` / `getOrderRawAmounts`.
+    pub tick_size: String,
+    /// BUY only: USDC notional the user requested. After share ticks, recomputed USDC can fall
+    /// below this (e.g. $1 → $0.99); we bump shares until `maker` ≥ this (2-dec floor).
+    pub buy_notional_usdc: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -114,6 +142,21 @@ pub struct PostOrderResponse {
     pub error:    Option<String>,
 }
 
+/// `GET /fee-rate` — <https://docs.polymarket.com/api-reference/market-data/get-fee-rate>
+#[derive(Debug, Deserialize)]
+struct FeeRateResponse {
+    #[serde(rename = "base_fee")]
+    base_fee: u64,
+}
+
+/// `GET /balance-allowance` — Polymarket `clob-client-v2` `getBalanceAllowance`.
+#[derive(Debug, Deserialize)]
+struct BalanceAllowanceResponse {
+    /// API may return a JSON string or number.
+    #[serde(default)]
+    balance: Option<serde_json::Value>,
+}
+
 // ── Client ──────────────────────────────────────────────────────────
 
 pub struct TradingClient {
@@ -121,6 +164,9 @@ pub struct TradingClient {
     signer:  PrivateKeySigner,
     creds:   Option<ApiCreds>,
     config:  Config,
+    /// Cached `GET /version` → `version` field (1 or 2). Polymarket `clob-client-v2` uses this
+    /// to pick EIP-712 domain + struct; production Polygon currently returns **1**.
+    cached_clob_order_version: Option<u32>,
 }
 
 impl TradingClient {
@@ -132,7 +178,29 @@ impl TradingClient {
             signer,
             creds: None,
             config,
+            cached_clob_order_version: None,
         })
+    }
+
+    async fn fetch_clob_order_version(&mut self) -> Result<u32> {
+        if let Some(v) = self.cached_clob_order_version {
+            return Ok(v);
+        }
+        let url = format!("{CLOB_HOST}/version");
+        let resp = self.http.get(&url).send().await.with_context(|| url.clone())?;
+        let status = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            return Err(anyhow!("GET /version failed: {} — {}", status, snip(&txt)));
+        }
+        #[derive(Deserialize)]
+        struct VersionBody {
+            version: u32,
+        }
+        let VersionBody { version } = serde_json::from_str(&txt)
+            .with_context(|| format!("decode GET /version: {}", snip(&txt)))?;
+        self.cached_clob_order_version = Some(version);
+        Ok(version)
     }
 
     /// Derive (or create) the L2 API credentials by producing an EIP-712
@@ -377,92 +445,289 @@ impl TradingClient {
         Err(anyhow!("CLOB auth diagnostic failed"))
     }
 
+    async fn fetch_fee_rate_bps(&self, token_id: &str) -> Result<u64> {
+        let mut url = url::Url::parse(&format!("{CLOB_HOST}/fee-rate"))
+            .context("parse /fee-rate URL")?;
+        url.query_pairs_mut().append_pair("token_id", token_id);
+        let resp = self.http
+            .get(url.as_str())
+            .send()
+            .await
+            .context("GET /fee-rate")?;
+        let status = resp.status();
+        let txt = resp.text().await.context("reading /fee-rate body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "CLOB GET /fee-rate failed: {} — {}",
+                status,
+                snip(&txt)
+            ));
+        }
+        let fr: FeeRateResponse = serde_json::from_str(&txt)
+            .with_context(|| format!("decoding fee rate: {}", snip(&txt)))?;
+        debug!(
+            token_id = %token_id,
+            base_fee = fr.base_fee,
+            "fetch_fee_rate_bps"
+        );
+        Ok(fr.base_fee)
+    }
+
+    /// Conditional (outcome token) balance for `token_id`, in **human shares** (raw / 1e6).
+    ///
+    /// Uses L2 auth — same as `clob-client-v2` `getBalanceAllowance` with
+    /// `asset_type: CONDITIONAL`.
+    pub async fn fetch_conditional_balance_shares(&mut self, token_id: &str) -> Result<f64> {
+        let creds = self.ensure_creds().await?;
+        let ts = chrono::Utc::now().timestamp();
+        let path = "/balance-allowance";
+        let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+            .context("parse /balance-allowance URL")?;
+        url.query_pairs_mut()
+            .append_pair("asset_type", "CONDITIONAL")
+            .append_pair("token_id", token_id)
+            .append_pair("signature_type", &(self.config.sig_type as u8).to_string());
+
+        let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+
+        let resp = self.http
+            .get(url.as_str())
+            .header("POLY_ADDRESS",    format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY",    &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP",  ts.to_string())
+            .header("POLY_SIGNATURE",  l2_sig)
+            .send()
+            .await
+            .context("GET /balance-allowance")?;
+        let status = resp.status();
+        let txt = resp.text().await.context("reading /balance-allowance body")?;
+        if !status.is_success() {
+            return Err(anyhow!(
+                "CLOB GET /balance-allowance failed: {} — {}",
+                status,
+                snip(&txt)
+            ));
+        }
+        let parsed: BalanceAllowanceResponse = serde_json::from_str(&txt)
+            .with_context(|| format!("decode /balance-allowance: {}", snip(&txt)))?;
+        let raw: u128 = match &parsed.balance {
+            Some(serde_json::Value::String(s)) => s.parse().unwrap_or(0),
+            Some(serde_json::Value::Number(n)) => n.as_u128().unwrap_or(0),
+            _ => 0,
+        };
+        let shares = raw as f64 / 1_000_000.0;
+        debug!(token_id = %token_id, %raw, shares, "fetch_conditional_balance_shares");
+        Ok(shares)
+    }
+
     /// Build + sign an order and POST it to the CLOB.
     pub async fn place_order(&mut self, args: OrderArgs, order_type: OrderType)
         -> Result<PostOrderResponse>
     {
         let creds = self.ensure_creds().await?;
+        let fee_bps = self.fetch_fee_rate_bps(&args.token_id).await?;
 
-        // 1. Compute maker/taker amounts from price+size.
-        //    BUY:  makerAmount = size * price (USDC),  takerAmount = size (shares)
-        //    SELL: makerAmount = size (shares),        takerAmount = size * price (USDC)
-        let (maker_amount, taker_amount) = amounts_for(args.side, args.size, args.price);
+        // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
+        let (maker_amount, taker_amount) = amounts_for(
+            args.side,
+            args.size,
+            args.price,
+            &args.tick_size,
+            args.buy_notional_usdc,
+        );
 
-        // 2. Build the struct.
-        let salt  = rand::random::<u64>();
-        let nonce = 0u64; // Polymarket CLOB uses 0 unless you're cancelling on-chain by nonce
-        let verifying = if args.neg_risk { NEG_RISK_CTF_EXCHANGE } else { CTF_EXCHANGE };
-        let verifying_addr = Address::from_str(verifying)?;
+        // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
+        let ts_ms = chrono::Utc::now().timestamp_millis();
+        let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
 
-        let order = Order {
-            salt:          U256::from(salt),
-            maker:         self.config.funder,             // funder address
-            signer:        self.signer.address(),           // EOA that signs
-            taker:         Address::ZERO,                   // public order
-            tokenId:       U256::from_str(&args.token_id).context("token_id")?,
-            makerAmount:   maker_amount,
-            takerAmount:   taker_amount,
-            expiration:    U256::ZERO,                      // GTC
-            nonce:         U256::from(nonce),
-            feeRateBps:    U256::ZERO,                      // fees are currently zero on PM
-            side:          args.side.as_u8(),
-            signatureType: self.config.sig_type as u8,
+        let api_version = self.fetch_clob_order_version().await?;
+        let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
+
+        let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };
+        let verifying_v2 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V2 } else { CTF_EXCHANGE_V2 };
+
+        debug!(
+            token_id = %args.token_id,
+            side     = ?args.side,
+            price    = args.price,
+            size     = args.size,
+            neg_risk = args.neg_risk,
+            ?order_type,
+            clob_api_version = api_version,
+            exchange_v1 = verifying_v1,
+            exchange_v2 = verifying_v2,
+            maker_amount = %maker_amount,
+            taker_amount = %taker_amount,
+            salt,
+            ts_ms,
+            fee_bps,
+            sig_type = self.config.sig_type as u8,
+            funder   = %self.config.funder,
+            signer   = %self.signer.address(),
+            tick     = %args.tick_size,
+            "place_order: inputs + amounts (pre-sign)"
+        );
+
+        const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
+        const ZERO32: &str =
+            "0x0000000000000000000000000000000000000000000000000000000000000000";
+
+        let body = match api_version {
+            1 => {
+                // EIP-712 V1 — `exchangeOrderBuilderV1.ts` + `ctfExchangeV1TypedData.ts`
+                let verifying_addr = Address::from_str(verifying_v1)?;
+                let order = clob_order_v1::Order {
+                    salt: U256::from(salt),
+                    maker: self.config.funder,
+                    signer: self.signer.address(),
+                    taker: Address::ZERO,
+                    tokenId: token_id_u256,
+                    makerAmount: maker_amount,
+                    takerAmount: taker_amount,
+                    expiration: U256::ZERO,
+                    nonce: U256::ZERO,
+                    feeRateBps: U256::from(fee_bps),
+                    side: args.side.as_u8(),
+                    signatureType: self.config.sig_type as u8,
+                };
+                let dom = domain_v1(verifying_addr);
+                let hash = order.eip712_signing_hash(&dom);
+                let sig = self.signer.sign_hash(&hash).await?;
+                let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+
+                #[derive(Serialize)]
+                struct OrderPayloadV1<'a> {
+                    #[serde(rename = "deferExec")] defer_exec: bool,
+                    #[serde(rename = "postOnly")] post_only: bool,
+                    order: OrderWireV1,
+                    owner: &'a str,
+                    #[serde(rename = "orderType")] order_type: &'a str,
+                }
+                #[derive(Serialize)]
+                struct OrderWireV1 {
+                    salt: u64,
+                    maker: String,
+                    signer: String,
+                    taker: String,
+                    #[serde(rename = "tokenId")] token_id: String,
+                    #[serde(rename = "makerAmount")] maker_amount: String,
+                    #[serde(rename = "takerAmount")] taker_amount: String,
+                    side: String,
+                    expiration: String,
+                    nonce: String,
+                    #[serde(rename = "feeRateBps")] fee_rate_bps: String,
+                    #[serde(rename = "signatureType")] signature_type: u8,
+                    signature: String,
+                }
+                let payload = OrderPayloadV1 {
+                    defer_exec: false,
+                    post_only: false,
+                    order: OrderWireV1 {
+                        salt,
+                        maker: format!("{:#x}", order.maker),
+                        signer: format!("{:#x}", order.signer),
+                        taker: PUBLIC_TAKER.into(),
+                        token_id: order.tokenId.to_string(),
+                        maker_amount: order.makerAmount.to_string(),
+                        taker_amount: order.takerAmount.to_string(),
+                        side: args.side.as_str().to_string(),
+                        expiration: "0".into(),
+                        nonce: "0".into(),
+                        fee_rate_bps: fee_bps.to_string(),
+                        signature_type: self.config.sig_type as u8,
+                        signature: sig_hex,
+                    },
+                    owner: &creds.api_key,
+                    order_type: order_type.as_str(),
+                };
+                serde_json::to_string(&payload)?
+            }
+            2 => {
+                // EIP-712 V2 — `exchangeOrderBuilderV2.ts` + `ctfExchangeV2TypedData.ts`
+                let verifying_addr = Address::from_str(verifying_v2)?;
+                let ts_u256 = U256::from(ts_ms as u128);
+                let order = clob_order_v2::Order {
+                    salt: U256::from(salt),
+                    maker: self.config.funder,
+                    signer: self.signer.address(),
+                    tokenId: token_id_u256,
+                    makerAmount: maker_amount,
+                    takerAmount: taker_amount,
+                    side: args.side.as_u8(),
+                    signatureType: self.config.sig_type as u8,
+                    timestamp: ts_u256,
+                    metadata: B256::ZERO,
+                    builder: B256::ZERO,
+                };
+                let dom = domain_v2(verifying_addr);
+                let hash = order.eip712_signing_hash(&dom);
+                let sig = self.signer.sign_hash(&hash).await?;
+                let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+
+                #[derive(Serialize)]
+                struct OrderPayloadV2<'a> {
+                    #[serde(rename = "deferExec")] defer_exec: bool,
+                    #[serde(rename = "postOnly")] post_only: bool,
+                    order: OrderWireV2,
+                    owner: &'a str,
+                    #[serde(rename = "orderType")] order_type: &'a str,
+                }
+                #[derive(Serialize)]
+                struct OrderWireV2 {
+                    salt: u64,
+                    maker: String,
+                    signer: String,
+                    taker: String,
+                    #[serde(rename = "tokenId")] token_id: String,
+                    #[serde(rename = "makerAmount")] maker_amount: String,
+                    #[serde(rename = "takerAmount")] taker_amount: String,
+                    side: String,
+                    expiration: String,
+                    nonce: String,
+                    #[serde(rename = "signatureType")] signature_type: u8,
+                    signature: String,
+                    timestamp: String,
+                    metadata: String,
+                    builder: String,
+                }
+                let payload = OrderPayloadV2 {
+                    defer_exec: false,
+                    post_only: false,
+                    order: OrderWireV2 {
+                        salt,
+                        maker: format!("{:#x}", order.maker),
+                        signer: format!("{:#x}", order.signer),
+                        taker: PUBLIC_TAKER.into(),
+                        token_id: order.tokenId.to_string(),
+                        maker_amount: order.makerAmount.to_string(),
+                        taker_amount: order.takerAmount.to_string(),
+                        side: args.side.as_str().to_string(),
+                        expiration: "0".into(),
+                        nonce: "0".into(),
+                        signature_type: self.config.sig_type as u8,
+                        signature: sig_hex,
+                        timestamp: ts_ms.to_string(),
+                        metadata: ZERO32.into(),
+                        builder: ZERO32.into(),
+                    },
+                    owner: &creds.api_key,
+                    order_type: order_type.as_str(),
+                };
+                serde_json::to_string(&payload)?
+            }
+            v => bail!("CLOB GET /version returned unsupported order version {v}"),
         };
 
-        // 3. Sign with EIP-712.
-        let dom  = domain(verifying_addr);
-        let hash = order.eip712_signing_hash(&dom);
-        let sig  = self.signer.sign_hash(&hash).await?;
-        let sig_hex = format!("0x{}", hex::encode(sig.as_bytes()));
+        self.post_order_http(&creds, body).await
+    }
 
-        // 4. Compute the order hash (used as orderID).
-        let order_hash: B256 = hash;
-
-        // 5. POST /order with L2 auth.
-        #[derive(Serialize)]
-        struct OrderPayload<'a> {
-            order: SignedOrder<'a>,
-            owner: &'a str,
-            #[serde(rename = "orderType")] order_type: &'a str,
-        }
-        #[derive(Serialize)]
-        struct SignedOrder<'a> {
-            salt:           String,
-            maker:          String,
-            signer:         String,
-            taker:          String,
-            #[serde(rename = "tokenId")] token_id: String,
-            #[serde(rename = "makerAmount")] maker_amount: String,
-            #[serde(rename = "takerAmount")] taker_amount: String,
-            side:           &'a str,
-            expiration:     String,
-            nonce:          String,
-            #[serde(rename = "feeRateBps")] fee_rate_bps: String,
-            #[serde(rename = "signatureType")] signature_type: u8,
-            signature:      String,
-            hash:           String,
-        }
-        let payload = OrderPayload {
-            order: SignedOrder {
-                salt:           salt.to_string(),
-                maker:          format!("{:#x}", order.maker),
-                signer:         format!("{:#x}", order.signer),
-                taker:          format!("{:#x}", order.taker),
-                token_id:       order.tokenId.to_string(),
-                maker_amount:   order.makerAmount.to_string(),
-                taker_amount:   order.takerAmount.to_string(),
-                side:           args.side.as_str(),
-                expiration:     "0".into(),
-                nonce:          "0".into(),
-                fee_rate_bps:   "0".into(),
-                signature_type: self.config.sig_type as u8,
-                signature:      sig_hex,
-                hash:           format!("0x{}", hex::encode(order_hash)),
-            },
-            owner:      &creds.api_key,
-            order_type: order_type.as_str(),
-        };
-        let body = serde_json::to_string(&payload)?;
+    async fn post_order_http(&mut self, creds: &ApiCreds, body: String) -> Result<PostOrderResponse> {
+        debug!(
+            json_bytes = body.len(),
+            json_snip  = %snip(&body),
+            "place_order: POST body (snipped; see logs for full size)"
+        );
 
         let ts = chrono::Utc::now().timestamp();
         let path = "/order";
@@ -482,10 +747,24 @@ impl TradingClient {
 
         let status = resp.status();
         let txt    = resp.text().await?;
+        debug!(
+            status = %status,
+            response_snip = %snip(&txt),
+            "place_order: raw HTTP response"
+        );
         if !status.is_success() {
             return Err(anyhow!("CLOB POST /order failed: {} — {}", status, txt));
         }
-        serde_json::from_str(&txt).context("decoding order response")
+        let out: PostOrderResponse = serde_json::from_str(&txt)
+            .with_context(|| format!("decoding order response: {}", snip(&txt)))?;
+        debug!(
+            success = out.success,
+            order_id = ?out.order_id,
+            order_status = ?out.status,
+            error_msg = ?out.error,
+            "place_order: parsed JSON (check success/status — API can return 200 with success=false)"
+        );
+        Ok(out)
     }
 
     /// Cancel all open orders for this user.
@@ -510,12 +789,120 @@ impl TradingClient {
     }
 }
 
-/// price×size → (makerAmount, takerAmount) in base units (1e6 decimals).
-fn amounts_for(side: Side, size_shares: f64, price: f64) -> (U256, U256) {
-    let notional = size_shares * price;
+/// Polymarket `ROUNDING_CONFIG` (`roundingConfig.ts`): `(price_dec, size_dec)` for price / share rounding.
+fn round_cfg_from_tick(tick: &str) -> (u32, u32) {
+    let x = tick.trim().parse::<f64>().unwrap_or(0.01);
+    if (x - 0.1).abs() < 1e-6 {
+        (1, 2)
+    } else if (x - 0.01).abs() < 1e-7 {
+        (2, 2)
+    } else if (x - 0.001).abs() < 1e-8 {
+        (3, 2)
+    } else if (x - 0.0001).abs() < 1e-9 {
+        (4, 2)
+    } else {
+        (2, 2)
+    }
+}
+
+fn decimal_places_f64(num: f64) -> u32 {
+    if !num.is_finite() {
+        return 0;
+    }
+    if (num - num.trunc()).abs() < 1e-12 {
+        return 0;
+    }
+    let s = format!("{:.14}", num);
+    let s = s.trim_end_matches('0');
+    if let Some(p) = s.find('.') {
+        (s.len() - p - 1) as u32
+    } else {
+        0
+    }
+}
+
+fn round_down_f64(num: f64, decimals: u32) -> f64 {
+    let p = 10_f64.powi(decimals as i32);
+    (num * p).floor() / p
+}
+
+fn round_up_f64(num: f64, decimals: u32) -> f64 {
+    let p = 10_f64.powi(decimals as i32);
+    (num * p).ceil() / p
+}
+
+fn round_normal_f64(num: f64, decimals: u32) -> f64 {
+    if decimal_places_f64(num) <= decimals {
+        return num;
+    }
+    let p = 10_f64.powi(decimals as i32);
+    ((num + f64::EPSILON) * p).round() / p
+}
+
+fn human_to_base_units_6(human: f64) -> U256 {
+    if !human.is_finite() || human <= 0.0 {
+        return U256::ZERO;
+    }
+    let micros = (human * 1_000_000.0).floor() as u128;
+    U256::from(micros)
+}
+
+/// price×size → (makerAmount, takerAmount) in **1e6** base units (`parseUnits(..., 6)` in TS).
+///
+/// CLOB validates **market-style** orders as: **USDC leg ≤ 2** decimal places, **share leg ≤ 4**
+/// (buy: maker=USDC / taker=shares; sell: maker=shares / taker=USDC). The TS `amount` field in
+/// `ROUNDING_CONFIG` is *not* this limit — using it produced USDC with up to 6 decimals and broke buys.
+fn amounts_for(
+    side: Side,
+    size_shares: f64,
+    price: f64,
+    tick: &str,
+    buy_notional_usdc: Option<f64>,
+) -> (U256, U256) {
+    const USDC_DECIMALS: u32 = 2;
+    const SHARE_DECIMALS_MAX: u32 = 4;
+
+    let (price_dec, size_dec) = round_cfg_from_tick(tick);
+    let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
+    let raw_price = round_normal_f64(price, price_dec);
+
     match side {
-        Side::Buy  => (usdc_to_base(notional),    usdc_to_base(size_shares)),
-        Side::Sell => (usdc_to_base(size_shares), usdc_to_base(notional)),
+        Side::Buy => {
+            // Rounding shares down then USDC down can wipe a cent (e.g. 1 USDC → $0.99 vs $1 min).
+            let floor_notional = buy_notional_usdc
+                .filter(|n| n.is_finite() && *n > 0.0)
+                .map(|n| round_down_f64(n, USDC_DECIMALS))
+                .unwrap_or_else(|| round_up_f64(size_shares * raw_price, USDC_DECIMALS));
+
+            if !size_shares.is_finite() || size_shares <= 0.0 || !floor_notional.is_finite() || floor_notional <= 0.0
+            {
+                return (U256::ZERO, U256::ZERO);
+            }
+
+            // Integer share ticks so we never get stuck on float `1.92 + 0.01`.
+            let scale = 10_i64.pow(share_dec.min(6) as u32);
+            let mut taker_ticks = ((size_shares * scale as f64).ceil() as i64).max(1);
+            let mut raw_maker = 0.0_f64;
+            let mut raw_taker = 0.0_f64;
+            let mut guard = 0u32;
+            while guard < 50_000 {
+                raw_taker = taker_ticks as f64 / scale as f64;
+                // `round_down(maker)` made implied price **below** the limit (e.g. $1.00/1.93 <
+                // $0.52 ask) → FAK: "no orders found to match". `round_up` keeps USDC/shares ≥ limit.
+                raw_maker = round_up_f64(raw_taker * raw_price, USDC_DECIMALS);
+                if raw_maker + 1e-9 >= floor_notional {
+                    break;
+                }
+                taker_ticks += 1;
+                guard += 1;
+            }
+            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+        }
+        Side::Sell => {
+            let raw_maker = round_down_f64(size_shares, share_dec);
+            let raw_taker = round_down_f64(raw_maker * raw_price, USDC_DECIMALS);
+            (human_to_base_units_6(raw_maker), human_to_base_units_6(raw_taker))
+        }
     }
 }
 
