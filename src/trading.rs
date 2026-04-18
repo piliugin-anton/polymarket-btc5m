@@ -149,6 +149,31 @@ struct FeeRateResponse {
     base_fee: u64,
 }
 
+/// Polymarket `clob-client-v2` `GET /data/trades` — one row per user fill (L2 auth).
+/// Shape matches `Trade` in `clob-client-v2` `types/clob.ts`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ClobTrade {
+    pub id: String,
+    #[serde(alias = "assetId")]
+    pub asset_id: String,
+    pub side: String,
+    pub size: String,
+    pub price: String,
+    #[serde(alias = "matchTime")]
+    pub match_time: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct TradesPage {
+    data: Vec<ClobTrade>,
+    #[serde(alias = "nextCursor")]
+    next_cursor: String,
+}
+
+/// Cursor sentinels — `clob-client-v2` `constants.ts`.
+const TRADES_INITIAL_CURSOR: &str = "MA==";
+const TRADES_END_CURSOR: &str = "LTE=";
+
 /// `GET /balance-allowance` — Polymarket `clob-client-v2` `getBalanceAllowance`.
 #[derive(Debug, Deserialize)]
 struct BalanceAllowanceResponse {
@@ -521,6 +546,52 @@ impl TradingClient {
         Ok(shares)
     }
 
+    /// All trades for `condition_id` (Gamma `conditionId` / CLOB `market`), paginated like TS `getTrades`.
+    pub async fn fetch_trades_for_market(&mut self, condition_id: &str) -> Result<Vec<ClobTrade>> {
+        let creds = self.ensure_creds().await?;
+        let path = "/data/trades";
+        let mut cursor = TRADES_INITIAL_CURSOR.to_string();
+        let mut out = Vec::new();
+        loop {
+            let ts = chrono::Utc::now().timestamp();
+            let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+                .context("parse /data/trades URL")?;
+            url.query_pairs_mut()
+                .append_pair("market", condition_id)
+                .append_pair("next_cursor", &cursor);
+            let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+            let resp = self
+                .http
+                .get(url.as_str())
+                .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+                .header("POLY_API_KEY", &creds.api_key)
+                .header("POLY_PASSPHRASE", &creds.passphrase)
+                .header("POLY_TIMESTAMP", ts.to_string())
+                .header("POLY_SIGNATURE", l2_sig)
+                .send()
+                .await
+                .context("GET /data/trades")?;
+            let status = resp.status();
+            let txt = resp.text().await.context("reading /data/trades body")?;
+            if !status.is_success() {
+                return Err(anyhow!(
+                    "CLOB GET /data/trades failed: {} — {}",
+                    status,
+                    snip(&txt)
+                ));
+            }
+            let page: TradesPage = serde_json::from_str(&txt)
+                .with_context(|| format!("decode /data/trades: {}", snip(&txt)))?;
+            out.extend(page.data);
+            if page.next_cursor == TRADES_END_CURSOR || page.next_cursor.is_empty() {
+                break;
+            }
+            cursor = page.next_cursor;
+        }
+        debug!(market = %condition_id, n = out.len(), "fetch_trades_for_market");
+        Ok(out)
+    }
+
     /// Build + sign an order and POST it to the CLOB.
     pub async fn place_order(&mut self, args: OrderArgs, order_type: OrderType)
         -> Result<PostOrderResponse>
@@ -805,22 +876,6 @@ fn round_cfg_from_tick(tick: &str) -> (u32, u32) {
     }
 }
 
-fn decimal_places_f64(num: f64) -> u32 {
-    if !num.is_finite() {
-        return 0;
-    }
-    if (num - num.trunc()).abs() < 1e-12 {
-        return 0;
-    }
-    let s = format!("{:.14}", num);
-    let s = s.trim_end_matches('0');
-    if let Some(p) = s.find('.') {
-        (s.len() - p - 1) as u32
-    } else {
-        0
-    }
-}
-
 fn round_down_f64(num: f64, decimals: u32) -> f64 {
     let p = 10_f64.powi(decimals as i32);
     (num * p).floor() / p
@@ -829,14 +884,6 @@ fn round_down_f64(num: f64, decimals: u32) -> f64 {
 fn round_up_f64(num: f64, decimals: u32) -> f64 {
     let p = 10_f64.powi(decimals as i32);
     (num * p).ceil() / p
-}
-
-fn round_normal_f64(num: f64, decimals: u32) -> f64 {
-    if decimal_places_f64(num) <= decimals {
-        return num;
-    }
-    let p = 10_f64.powi(decimals as i32);
-    ((num + f64::EPSILON) * p).round() / p
 }
 
 fn human_to_base_units_6(human: f64) -> U256 {
@@ -864,7 +911,14 @@ fn amounts_for(
 
     let (price_dec, size_dec) = round_cfg_from_tick(tick);
     let share_dec = size_dec.min(SHARE_DECIMALS_MAX);
-    let raw_price = round_normal_f64(price, price_dec);
+    // Limit price must not be **more passive** than the book after tick rounding:
+    // BUY: ceil to tick so implied USDC/shares ≥ visible ask (matches TS aggressive rounding).
+    // SELL: floor to tick so min USDC/shares ≤ visible bid — `round_normal` could lift0.527→0.53
+    // and cause FAK "no orders found to match" when the best bid is below that rounded price.
+    let raw_price = match side {
+        Side::Buy => round_up_f64(price, price_dec),
+        Side::Sell => round_down_f64(price, price_dec),
+    };
 
     match side {
         Side::Buy => {

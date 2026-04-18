@@ -14,7 +14,8 @@ use std::collections::VecDeque;
 
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::gamma::ActiveMarket;
-use crate::trading::{Side, OrderType};
+use crate::trading::{ClobTrade, Side, OrderType};
+use tracing::debug;
 
 // ── Public event enum ───────────────────────────────────────────────
 
@@ -24,8 +25,13 @@ pub enum AppEvent {
     Price(PriceTick),
     Book(BookSnapshot),
     MarketRoll(ActiveMarket),
-    /// CLOB conditional token balances for the current market's UP/DOWN tokens (human shares).
-    PositionsLoaded { up_shares: f64, down_shares: f64 },
+    /// CLOB positions for the current market: balances + cost basis replayed from `GET /data/trades`.
+    PositionsLoaded {
+        position_up:   Position,
+        position_down: Position,
+        /// Newest first, capped before send — merged into `fills` (session panel).
+        fills_bootstrap: Vec<Fill>,
+    },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
     OrderErr(String),
@@ -59,6 +65,17 @@ impl Position {
         self.shares -= closed;
         if self.shares.abs() < 1e-9 { *self = Default::default(); }
         pnl
+    }
+
+    /// One CLOB fill: BUY extends inventory; SELL realizes against `avg_entry`.
+    pub fn apply_fill(&mut self, side: Side, qty: f64, price: f64) -> f64 {
+        match side {
+            Side::Buy => {
+                self.add(qty, price);
+                0.0
+            }
+            Side::Sell => self.reduce(qty, price),
+        }
     }
 }
 
@@ -236,25 +253,30 @@ impl AppState {
                 self.position_up = Default::default();
                 self.position_down = Default::default();
             }
-            AppEvent::PositionsLoaded { up_shares, down_shares } => {
-                // Cost basis is unknown until filled in-session; shares come from CLOB balances.
-                self.position_up = Position {
-                    shares: up_shares,
-                    avg_entry: 0.0,
-                };
-                self.position_down = Position {
-                    shares: down_shares,
-                    avg_entry: 0.0,
-                };
+            AppEvent::PositionsLoaded {
+                position_up,
+                position_down,
+                fills_bootstrap,
+            } => {
+                self.position_up = position_up;
+                self.position_down = position_down;
+                self.fills.clear();
+                for f in fills_bootstrap {
+                    self.fills.push_front(f);
+                    if self.fills.len() > 64 {
+                        self.fills.pop_back();
+                    }
+                }
                 self.status_line = format!(
-                    "Positions from CLOB — UP {up_shares:.2} / DOWN {down_shares:.2} sh (avg @ session)"
+                    "Positions from CLOB — UP {:.2} @ {:.3} / DOWN {:.2} @ {:.3}",
+                    self.position_up.shares,
+                    self.position_up.avg_entry,
+                    self.position_down.shares,
+                    self.position_down.avg_entry,
                 );
             }
             AppEvent::OrderAck { side, outcome, qty, price } => {
-                let realized = match side {
-                    Side::Buy  => { self.position_mut(outcome).add(qty, price); 0.0 }
-                    Side::Sell => self.position_mut(outcome).reduce(qty, price),
-                };
+                let realized = self.position_mut(outcome).apply_fill(side, qty, price);
                 self.realized_pnl += realized;
                 self.fills.push_front(Fill {
                     ts: Utc::now(), side, outcome, qty, price, realized,
@@ -271,6 +293,121 @@ impl AppState {
 
 fn side_str(s: Side) -> &'static str { match s { Side::Buy => "BUY", Side::Sell => "SELL" } }
 
+fn parse_trade_timestamp(s: &str) -> DateTime<Utc> {
+    let s = s.trim();
+    if s.is_empty() {
+        return DateTime::<Utc>::UNIX_EPOCH;
+    }
+    if let Ok(n) = s.parse::<i64>() {
+        if n > 100_000_000_000 {
+            return DateTime::from_timestamp_millis(n).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+        }
+        return DateTime::from_timestamp(n, 0).unwrap_or(DateTime::<Utc>::UNIX_EPOCH);
+    }
+    DateTime::parse_from_rfc3339(s)
+        .map(|d| d.with_timezone(&Utc))
+        .unwrap_or(DateTime::<Utc>::UNIX_EPOCH)
+}
+
+fn parse_clob_side(s: &str) -> Option<Side> {
+    match s.trim().to_ascii_uppercase().as_str() {
+        "BUY" => Some(Side::Buy),
+        "SELL" => Some(Side::Sell),
+        _ => None,
+    }
+}
+
+fn merge_chain_balance(replay: Position, balance: f64) -> Position {
+    if !balance.is_finite() || balance.abs() < 1e-12 {
+        return Position::default();
+    }
+    let shares = balance;
+    let tol = f64::max(0.02, 0.02 * balance.abs());
+    let avg_entry = if replay.shares > 1e-9 {
+        if (replay.shares - balance).abs() > tol {
+            debug!(
+                replay_shares = replay.shares,
+                chain_shares = balance,
+                "position replay vs chain balance mismatch; keeping replay avg as estimate"
+            );
+        }
+        replay.avg_entry
+    } else {
+        0.0
+    };
+    Position {
+        shares,
+        avg_entry,
+    }
+}
+
+/// Replay Polymarket `GET /data/trades` for the active market to recover VWAP entries and fills.
+pub fn hydrate_positions_from_trades(
+    trades: &[ClobTrade],
+    up_token_id: &str,
+    down_token_id: &str,
+    balance_up: f64,
+    balance_down: f64,
+) -> (Position, Position, Vec<Fill>) {
+    let mut indexed: Vec<(DateTime<Utc>, &str, &ClobTrade)> = trades
+        .iter()
+        .filter(|t| t.asset_id == up_token_id || t.asset_id == down_token_id)
+        .map(|t| (parse_trade_timestamp(&t.match_time), t.id.as_str(), t))
+        .collect();
+    indexed.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(b.1)));
+
+    let mut up = Position::default();
+    let mut down = Position::default();
+    let mut fills_chrono: Vec<Fill> = Vec::new();
+
+    for (_, _, t) in indexed {
+        let outcome = if t.asset_id == up_token_id {
+            Outcome::Up
+        } else {
+            Outcome::Down
+        };
+        let Some(side) = parse_clob_side(&t.side) else {
+            debug!(id = %t.id, side = %t.side, "skip trade with unknown side");
+            continue;
+        };
+        let Ok(qty) = t.size.parse::<f64>() else {
+            debug!(id = %t.id, "skip trade with bad size");
+            continue;
+        };
+        let Ok(price) = t.price.parse::<f64>() else {
+            debug!(id = %t.id, "skip trade with bad price");
+            continue;
+        };
+        if !qty.is_finite() || qty <= 0.0 || !price.is_finite() {
+            continue;
+        }
+        let ts = parse_trade_timestamp(&t.match_time);
+        let realized = match outcome {
+            Outcome::Up => up.apply_fill(side, qty, price),
+            Outcome::Down => down.apply_fill(side, qty, price),
+        };
+        fills_chrono.push(Fill {
+            ts,
+            side,
+            outcome,
+            qty,
+            price,
+            realized,
+        });
+    }
+
+    let position_up = merge_chain_balance(up, balance_up);
+    let position_down = merge_chain_balance(down, balance_down);
+
+    let fills_bootstrap: Vec<Fill> = fills_chrono.into_iter().rev().take(64).collect();
+
+    (position_up, position_down, fills_bootstrap)
+}
+
+fn clamp_prob(p: f64) -> f64 {
+    p.clamp(0.01, 0.99)
+}
+
 /// Derive the OrderArgs + order_type we'd submit for a given user intent,
 /// given the current book.
 pub fn resolve_market_order(
@@ -278,21 +415,77 @@ pub fn resolve_market_order(
     outcome: Outcome,
     side: Side,
     size: f64,
+    slippage_bps: u32,
 ) -> Option<(f64, f64, OrderType)> {
-    // We use FOK against the best visible level. If the level has less size
-    // than requested, caller should fall back to FAK.
+    let slip = slippage_bps as f64 / 10_000.0;
     match side {
         Side::Buy => {
             let ask = state.best_ask(outcome)?;
-            // `size` = USDC notional → shares at best ask
+            // Widen ceiling so a thin or stale book still crosses (`MARKET_SLIPPAGE_BPS`).
+            let price = clamp_prob(ask * (1.0 + slip));
+            // `size` = USDC notional → shares at reference ask
             let shares = (size / ask).max(0.01);
-            Some((shares, ask, OrderType::Fak))
+            Some((shares, price, OrderType::Fak))
         }
         Side::Sell => {
             let bid = state.best_bid(outcome)?;
+            let price = clamp_prob(bid * (1.0 - slip));
             // `size` = shares to sell (maker leg is outcome tokens; must not treat as USDC).
             let shares = size.max(0.01);
-            Some((shares, bid, OrderType::Fak))
+            Some((shares, price, OrderType::Fak))
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::trading::ClobTrade;
+
+    fn trade(
+        id: &str,
+        asset_id: &str,
+        side: &str,
+        size: &str,
+        price: &str,
+        match_time: &str,
+    ) -> ClobTrade {
+        ClobTrade {
+            id: id.to_string(),
+            asset_id: asset_id.to_string(),
+            side: side.to_string(),
+            size: size.to_string(),
+            price: price.to_string(),
+            match_time: match_time.to_string(),
+        }
+    }
+
+    #[test]
+    fn hydrate_vwap_two_buys() {
+        let up = "111";
+        let down = "222";
+        let trades = vec![
+            trade("a", up, "BUY", "10", "0.5", "1000"),
+            trade("b", up, "BUY", "10", "0.6", "2000"),
+        ];
+        let (pu, pd, fills) = hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0);
+        assert!((pu.shares - 20.0).abs() < 1e-6);
+        assert!((pu.avg_entry - 0.55).abs() < 1e-6);
+        assert!(pd.shares.abs() < 1e-9);
+        assert_eq!(fills.len(), 2);
+    }
+
+    #[test]
+    fn hydrate_sell_realized_in_fill() {
+        let up = "111";
+        let trades = vec![
+            trade("a", up, "BUY", "10", "0.5", "1000"),
+            trade("b", up, "SELL", "4", "0.7", "2000"),
+        ];
+        let (pu, _, fills) = hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0);
+        assert!((pu.shares - 6.0).abs() < 1e-6);
+        assert!((pu.avg_entry - 0.5).abs() < 1e-6);
+        let sell_fill = fills.iter().find(|f| f.side == Side::Sell).unwrap();
+        assert!((sell_fill.realized - 4.0 * (0.7 - 0.5)).abs() < 1e-6);
     }
 }

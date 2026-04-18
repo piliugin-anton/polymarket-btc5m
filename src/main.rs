@@ -22,7 +22,7 @@ mod trading;
 mod ui;
 
 use anyhow::{Context, Result};
-use app::{AppEvent, AppState, Outcome, resolve_market_order};
+use app::{hydrate_positions_from_trades, AppEvent, AppState, Outcome, resolve_market_order};
 use config::Config;
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture, Event as CtEvent, EventStream},
@@ -143,6 +143,7 @@ async fn main() -> Result<()> {
             let txp = tx_for_books.clone();
             let up_id = m.up_token_id.clone();
             let down_id = m.down_token_id.clone();
+            let condition_id = m.condition_id.clone();
             tokio::spawn(async move {
                 let mut cli = t.lock().await;
                 if let Err(e) = cli.ensure_creds().await {
@@ -163,10 +164,20 @@ async fn main() -> Result<()> {
                         debug!(error = %e, token = %down_id, "fetch DOWN balance failed");
                         0.0
                     });
+                let trades = match cli.fetch_trades_for_market(&condition_id).await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!(error = %e, market = %condition_id, "fetch /data/trades failed; avg entry unknown");
+                        vec![]
+                    }
+                };
+                let (position_up, position_down, fills_bootstrap) =
+                    hydrate_positions_from_trades(&trades, &up_id, &down_id, up, down);
                 let _ = txp
                     .send(AppEvent::PositionsLoaded {
-                        up_shares: up,
-                        down_shares: down,
+                        position_up,
+                        position_down,
+                        fills_bootstrap,
                     })
                     .await;
             });
@@ -202,7 +213,7 @@ async fn main() -> Result<()> {
                         should_quit = true;
                         break;
                     }
-                    dispatch_action(action, &state, &trading, &tx);
+                    dispatch_action(action, &state, &trading, &tx, cfg.market_slippage_bps);
                 }
                 e => state.apply(e),
             }
@@ -334,6 +345,7 @@ fn dispatch_action(
     state:   &AppState,
     trading: &Arc<Mutex<TradingClient>>,
     tx:      &mpsc::Sender<AppEvent>,
+    market_slippage_bps: u32,
 ) {
     match action {
         Action::None => {}
@@ -355,7 +367,9 @@ fn dispatch_action(
                 forward_order_err(tx, "no active market".into());
                 return;
             };
-            let Some((shares, price, otype)) = resolve_market_order(state, outcome, side, size_usdc) else {
+            let Some((shares, price, otype)) =
+                resolve_market_order(state, outcome, side, size_usdc, market_slippage_bps)
+            else {
                 forward_order_err(tx, "no book liquidity".into());
                 return;
             };

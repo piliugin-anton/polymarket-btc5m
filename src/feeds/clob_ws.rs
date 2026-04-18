@@ -17,6 +17,19 @@ use tracing::{info, warn};
 
 use crate::config::CLOB_WS_URL;
 
+/// Book map key: price quantized to 1e-6 (supports ticks finer than 0.01; `(p*100).round()` collided).
+const PRICE_KEY_SCALE: f64 = 1_000_000.0;
+
+#[inline]
+fn price_to_key(p: f64) -> i64 {
+    (p * PRICE_KEY_SCALE).round() as i64
+}
+
+#[inline]
+fn key_to_price(k: i64) -> f64 {
+    k as f64 / PRICE_KEY_SCALE
+}
+
 fn snip_frame(txt: &str, max: usize) -> String {
     let t = txt.trim();
     if t.len() <= max {
@@ -118,8 +131,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     }
 
     // Keep local book state so price_change events can be applied
-    // asset_id → (bids map, asks map). We use i64 keyed by price*100 because
-    // price tick is 0.01 and BTreeMap needs Ord.
+    // asset_id → (bids map, asks map). Keys are micro-ticks (`price_to_key`).
     let mut books: HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)> = HashMap::new();
 
     let mut ping = tokio::time::interval(std::time::Duration::from_secs(10));
@@ -184,7 +196,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                     for ch in &msg.price_changes {
                         let entry = books.entry(ch.asset_id.clone()).or_default();
                         let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
-                        let key = (p * 100.0).round() as i64;
+                        let key = price_to_key(p);
                         let map = if ch.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
                         if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
                         send_snapshot(&ch.asset_id, entry, tx).await;
@@ -214,12 +226,12 @@ async fn apply_raw_event(
             entry.1.clear();
             for l in &bids {
                 if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
-                    entry.0.insert((p * 100.0).round() as i64, s);
+                    entry.0.insert(price_to_key(p), s);
                 }
             }
             for l in &asks {
                 if let (Ok(p), Ok(s)) = (l.price.parse::<f64>(), l.size.parse::<f64>()) {
-                    entry.1.insert((p * 100.0).round() as i64, s);
+                    entry.1.insert(price_to_key(p), s);
                 }
             }
             send_snapshot(&asset_id, entry, tx).await;
@@ -228,7 +240,7 @@ async fn apply_raw_event(
             let entry = books.entry(asset_id.clone()).or_default();
             for c in &changes {
                 let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
-                let key = (p * 100.0).round() as i64;
+                let key = price_to_key(p);
                 let map = if c.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
                 if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
             }
@@ -244,7 +256,20 @@ async fn send_snapshot(
     tx: &mpsc::Sender<BookSnapshot>,
 ) {
     // bids: high→low, asks: low→high
-    let bids: Vec<_> = bids.iter().rev().map(|(p, s)| BookLevel { price: *p as f64 / 100.0, size: *s }).collect();
-    let asks: Vec<_> = asks.iter().map(|(p, s)| BookLevel { price: *p as f64 / 100.0, size: *s }).collect();
+    let bids: Vec<_> = bids
+        .iter()
+        .rev()
+        .map(|(p, s)| BookLevel {
+            price: key_to_price(*p),
+            size: *s,
+        })
+        .collect();
+    let asks: Vec<_> = asks
+        .iter()
+        .map(|(p, s)| BookLevel {
+            price: key_to_price(*p),
+            size: *s,
+        })
+        .collect();
     let _ = tx.send(BookSnapshot { asset_id: asset_id.to_string(), bids, asks }).await;
 }

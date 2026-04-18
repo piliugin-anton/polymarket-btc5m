@@ -53,8 +53,7 @@ pub struct Config {
     pub sig_type: SignatureType,
     /// Default size: USDC for BUY; **shares** for SELL (`DEFAULT_SIZE_USDC` env name is historical).
     pub default_size_usdc: f64,
-    /// Max fill slippage for market orders, in basis points (not yet applied in order paths).
-    #[allow(dead_code)]
+    /// Max fill slippage for market FAK orders, in basis points (widens buy ceiling / sell floor).
     pub market_slippage_bps: u32,
 }
 
