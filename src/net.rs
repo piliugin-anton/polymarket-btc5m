@@ -21,6 +21,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use base64::prelude::*;
+use socket2::{SockRef, TcpKeepalive};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{
@@ -29,16 +30,59 @@ use tokio_tungstenite::{
 };
 use url::Url;
 
+/// OS-level keepalive so idle TLS/WebSocket tunnels are probed before the peer times us out.
+fn configure_tcp_keepalive(tcp: &TcpStream) -> Result<()> {
+    use std::time::Duration;
+    let sock = SockRef::from(tcp);
+    let ka = TcpKeepalive::new().with_time(Duration::from_secs(30));
+    if let Err(e) = sock.set_tcp_keepalive(&ka) {
+        tracing::debug!(error = %e, "set_tcp_keepalive");
+    }
+    Ok(())
+}
+
+/// Resolve `wss`/`ws` URL to `host:port` and connect a plain TCP socket (then TLS happens in `client_async_tls`).
+async fn ws_tcp_connect(url: &str) -> Result<TcpStream> {
+    let target = Url::parse(url).context("parse ws URL")?;
+    let host = target.host_str().context("ws url has no host")?;
+    let port = target.port().unwrap_or_else(|| match target.scheme() {
+        "wss" | "https" => 443,
+        _ => 80,
+    });
+    let addr = format!("{host}:{port}");
+    let tcp = TcpStream::connect(&addr)
+        .await
+        .with_context(|| format!("tcp connect to {addr}"))?;
+    configure_tcp_keepalive(&tcp)?;
+    Ok(tcp)
+}
+
 /// Read the proxy URL from env if present.
 pub fn proxy_env() -> Option<String> {
     std::env::var("POLYMARKET_PROXY").ok().filter(|s| !s.is_empty())
 }
 
 /// Build a shared `reqwest::Client` with proxy support if configured.
+///
+/// * **HTTP/2 only:** TLS ALPN is set to `h2` so all requests use one multiplexed connection per
+///   host where the server supports HTTP/2 (Polymarket APIs do). If TLS fails with “no protocol”,
+///   the endpoint may be HTTP/1-only — remove `http2_prior_knowledge` in that case.
+/// * **Pool:** `pool_idle_timeout(None)` keeps idle sockets in the pool; TCP keepalive below
+///   catches dead peers.
+/// * **HTTP/2 PING:** periodic pings while idle keep the HTTP/2 connection from going stale.
 pub fn reqwest_client() -> Result<reqwest::Client> {
+    use std::time::Duration;
     let mut b = reqwest::Client::builder()
         .user_agent("btc5m-bot/0.1")
-        .timeout(std::time::Duration::from_secs(15));
+        .timeout(Duration::from_secs(15))
+        .http2_prior_knowledge()
+        .http2_keep_alive_interval(Duration::from_secs(30))
+        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_while_idle(true)
+        .pool_idle_timeout(None)
+        .tcp_keepalive(Duration::from_secs(30))
+        .tcp_keepalive_interval(Duration::from_secs(15))
+        .tcp_keepalive_retries(3u32);
     if let Some(p) = proxy_env() {
         let proxy = reqwest::Proxy::all(&p).context("invalid POLYMARKET_PROXY for reqwest")?;
         b = b.proxy(proxy);
@@ -54,8 +98,12 @@ pub async fn ws_connect(
     url: &str,
 ) -> Result<(WebSocketStream<MaybeTlsStream<TcpStream>>, Response)> {
     match proxy_env() {
-        None => tokio_tungstenite::connect_async(url).await
-            .map_err(|e| anyhow!("ws connect_async: {e}")),
+        None => {
+            let tcp = ws_tcp_connect(url).await?;
+            tokio_tungstenite::client_async_tls(url, tcp)
+                .await
+                .map_err(|e| anyhow!("ws connect (tls handshake): {e}"))
+        }
         Some(p) => {
             let proxy = Url::parse(&p).context("parse POLYMARKET_PROXY as URL")?;
             let target = Url::parse(url).context("parse ws URL")?;
@@ -69,6 +117,7 @@ pub async fn ws_connect(
                 "socks5" | "socks5h" => socks5_connect(&proxy, host, port).await?,
                 other => bail!("unsupported proxy scheme '{other}' — use http, https, or socks5"),
             };
+            configure_tcp_keepalive(&tcp)?;
             tokio_tungstenite::client_async_tls(url, tcp)
                 .await
                 .map_err(|e| anyhow!("ws handshake over proxy: {e}"))
@@ -84,6 +133,7 @@ async fn http_connect(proxy: &Url, host: &str, port: u16) -> Result<TcpStream> {
     let mut tcp = TcpStream::connect((phost, pport))
         .await
         .with_context(|| format!("tcp connect to proxy {phost}:{pport}"))?;
+    configure_tcp_keepalive(&tcp)?;
 
     // Build CONNECT request with optional basic auth.
     let auth = if proxy.username().is_empty() {
