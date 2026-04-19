@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
 
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
+use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
 use crate::trading::{ClobOpenOrder, ClobTrade, Side, OrderType};
 use tracing::debug;
@@ -58,19 +59,24 @@ impl Outcome {
 #[derive(Debug, Clone, Default)]
 pub struct Position {
     pub shares:    f64,
-    pub avg_entry: f64, // volume-weighted, in price terms (0.01..0.99)
+    /// Volume-weighted average **USDC cost per share**, including Polymarket **taker** fees on buys
+    /// (Crypto: `fee = C × 0.072 × p × (1-p)` per [fees](https://docs.polymarket.com/trading/fees)).
+    pub avg_entry: f64,
 }
 impl Position {
     fn add(&mut self, qty: f64, price: f64) {
         let new_total = self.shares + qty;
         if new_total.abs() < 1e-9 { *self = Default::default(); return; }
-        self.avg_entry = (self.shares * self.avg_entry + qty * price) / new_total;
+        let buy_cost =
+            qty.mul_add(price, polymarket_crypto_taker_fee_usdc(qty, price));
+        self.avg_entry = (self.shares * self.avg_entry + buy_cost) / new_total;
         self.shares    = new_total;
     }
     fn reduce(&mut self, qty: f64, price: f64) -> f64 {
-        // returns realized pnl for the portion closed
+        // returns realized pnl for the portion closed (taker fee on sell deducted)
         let closed = qty.min(self.shares);
-        let pnl    = closed * (price - self.avg_entry);
+        let fee_out = polymarket_crypto_taker_fee_usdc(closed, price);
+        let pnl = closed.mul_add(price, -fee_out) - closed * self.avg_entry;
         self.shares -= closed;
         if self.shares.abs() < 1e-9 { *self = Default::default(); }
         pnl
@@ -229,7 +235,10 @@ impl AppState {
     pub fn unrealized_pnl(&self, outcome: Outcome) -> f64 {
         let p = self.position(outcome);
         match self.mark(outcome) {
-            Some(m) if p.shares > 0.0 => p.shares * (m - p.avg_entry),
+            Some(m) if p.shares > 0.0 => {
+                let fee_out = polymarket_crypto_taker_fee_usdc(p.shares, m);
+                p.shares.mul_add(m, -fee_out) - p.shares * p.avg_entry
+            }
             _ => 0.0,
         }
     }
@@ -399,28 +408,38 @@ pub fn open_orders_from_clob(
     out
 }
 
+/// Combine trade replay with on-chain conditional balance.
+///
+/// Polymarket `GET /balance-allowance` for `CONDITIONAL` returns **spendable** outcome shares.
+/// Tokens committed to a resting **SELL** disappear from that balance until the order fills or
+/// cancels, while [`GET /data/trades`](https://docs.polymarket.com) still reflects true net
+/// position. The Positions panel therefore prefers replay for `shares` (and VWAP) whenever we
+/// have it, and only falls back to `balance` when the trade list is empty or failed to load.
 fn merge_chain_balance(replay: Position, balance: f64) -> Position {
-    if !balance.is_finite() || balance.abs() < 1e-12 {
+    let bal_ok = balance.is_finite() && balance.abs() >= 1e-12;
+    let replay_ok = replay.shares > 1e-9;
+
+    if !replay_ok && !bal_ok {
         return Position::default();
     }
-    let shares = balance;
-    let tol = f64::max(0.02, 0.02 * balance.abs());
-    let avg_entry = if replay.shares > 1e-9 {
-        if (replay.shares - balance).abs() > tol {
+
+    let shares = if replay_ok { replay.shares } else { balance };
+
+    let avg_entry = if replay_ok {
+        let tol = f64::max(0.02, 0.02 * f64::max(replay.shares.abs(), balance.abs()));
+        if bal_ok && (replay.shares - balance).abs() > tol {
             debug!(
                 replay_shares = replay.shares,
-                chain_shares = balance,
-                "position replay vs chain balance mismatch; keeping replay avg as estimate"
+                spendable_balance_shares = balance,
+                "position from trades vs spendable conditional balance (e.g. open SELL escrow)"
             );
         }
         replay.avg_entry
     } else {
         0.0
     };
-    Position {
-        shares,
-        avg_entry,
-    }
+
+    Position { shares, avg_entry }
 }
 
 /// Replay Polymarket `GET /data/trades` for the active market to recover VWAP entries and fills.
@@ -531,6 +550,7 @@ pub fn resolve_market_order(
 mod tests {
     use super::*;
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
+    use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::trading::{ClobOpenOrder, ClobTrade};
 
     fn trade(
@@ -593,7 +613,11 @@ mod tests {
         ];
         let (pu, pd, fills) = hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0);
         assert!((pu.shares - 20.0).abs() < 1e-6);
-        assert!((pu.avg_entry - 0.55).abs() < 1e-6);
+        // VWAP of USDC cost/share incl. crypto taker fees on each BUY.
+        let c1 = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
+        let c2 = 10.0f64.mul_add(0.6, polymarket_crypto_taker_fee_usdc(10.0, 0.6));
+        let expect_avg = (c1 + c2) / 20.0;
+        assert!((pu.avg_entry - expect_avg).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
         assert_eq!(fills.len(), 2);
     }
@@ -637,8 +661,33 @@ mod tests {
         ];
         let (pu, _, fills) = hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0);
         assert!((pu.shares - 6.0).abs() < 1e-6);
-        assert!((pu.avg_entry - 0.5).abs() < 1e-6);
+        let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
+        let expect_avg = buy_cost / 10.0;
+        assert!((pu.avg_entry - expect_avg).abs() < 1e-6);
         let sell_fill = fills.iter().find(|f| f.side == Side::Sell).unwrap();
-        assert!((sell_fill.realized - 4.0 * (0.7 - 0.5)).abs() < 1e-6);
+        let expect_realized = 4.0f64.mul_add(0.7, -polymarket_crypto_taker_fee_usdc(4.0, 0.7))
+            - 4.0 * expect_avg;
+        assert!((sell_fill.realized - expect_realized).abs() < 1e-6);
+    }
+
+    /// Spendable conditional balance is low while shares are escrowed for a resting SELL; UI uses trades.
+    #[test]
+    fn hydrate_prefers_replay_when_balance_excludes_escrow() {
+        let up = "111";
+        let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
+        let spendable = 4.0;
+        let (pu, _, _) = hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0);
+        assert!((pu.shares - 10.0).abs() < 1e-6);
+        let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
+        assert!((pu.avg_entry - buy_cost / 10.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn hydrate_falls_back_to_balance_when_no_trades() {
+        let up = "111";
+        let trades: Vec<ClobTrade> = vec![];
+        let (pu, pd, _) = hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0);
+        assert!((pu.shares - 3.5).abs() < 1e-6);
+        assert!(pd.shares.abs() < 1e-9);
     }
 }

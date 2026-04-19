@@ -14,6 +14,7 @@
 
 mod app;
 mod config;
+mod fees;
 mod data_api;
 mod redeem;
 mod events;
@@ -28,6 +29,7 @@ use app::{
     clamp_prob, hydrate_positions_from_trades, open_orders_from_clob, AppEvent, AppState, Outcome,
     resolve_market_order, MIN_LIMIT_ORDER_SHARES,
 };
+use fees::take_profit_limit_price_crypto_after_fees;
 use config::Config;
 use crossterm::{
     event::{
@@ -843,7 +845,10 @@ fn spawn_order(
                         // Limit SELL: same downstream as manual limit — `place_order` snaps to
                         // `orderPriceMinTickSize` and builds amounts (maker/taker micros on tick).
                         let tp_px = clamp_prob(
-                            entry_px * (1.0 + take_profit_bps as f64 / 10_000.0),
+                            take_profit_limit_price_crypto_after_fees(
+                                entry_px,
+                                take_profit_bps,
+                            ),
                         );
                         if sell_shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
                             info!(
