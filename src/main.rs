@@ -9,8 +9,10 @@
 //!   6. Crossterm event task.
 //!   7. 1-Hz ticker for countdown.
 //!
-//! All four push into a single `mpsc<AppEvent>`; the main loop drains that,
-//! mutates `AppState`, and re-renders.
+//! All sources push into one `mpsc<AppEvent>`; the main loop drains that,
+//! mutates `AppState`, and re-renders. Feed-heavy paths throttle redraws (see
+//! `FEED_REDRAW_MIN`) so `Terminal::draw` does not run far above ~20 Hz — ratatui
+//! issue #1338 / FAQ: `draw` dominates CPU if called on every RTDS/CLOB message.
 
 mod app;
 mod config;
@@ -42,6 +44,7 @@ use crossterm::{
 use events::Action;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use tokio::sync::{mpsc, Mutex};
 use std::{
     collections::HashMap,
     io::stdout,
@@ -49,7 +52,7 @@ use std::{
         atomic::{AtomicBool, Ordering},
         Arc,
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 /// Set when we `execute!(PushKeyboardEnhancementFlags)` so `FocusGained` can pop/push to resync
@@ -62,7 +65,42 @@ fn keyboard_protocol_flags() -> KeyboardEnhancementFlags {
         | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES
 }
-use tokio::sync::{mpsc, Mutex};
+
+/// Minimum gap between `Terminal::draw` calls when the batch had no keyboard events.
+/// Caps redraw rate from Chainlink + CLOB (~20 Hz) without delaying key handling.
+const FEED_REDRAW_MIN: Duration = Duration::from_millis(50);
+
+/// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
+fn apply_app_event(
+    ev:     AppEvent,
+    state:  &mut AppState,
+    trading:&Arc<Mutex<TradingClient>>,
+    tx:     &mpsc::Sender<AppEvent>,
+    cfg:    &Config,
+) -> bool {
+    match ev {
+        AppEvent::Key(k) => {
+            let action = events::handle_key(state, k);
+            if matches!(action, Action::Quit) {
+                return true;
+            }
+            if matches!(action, Action::Claim) {
+                info!(
+                    key_code = ?k.code,
+                    modifiers = ?k.modifiers,
+                    "TUI: CTF redeem key pressed (dispatching redeem)"
+                );
+            }
+            dispatch_action(action, state, trading, tx, cfg);
+            false
+        }
+        e => {
+            state.apply(e);
+            false
+        }
+    }
+}
+
 use tracing::{debug, error, info, warn};
 use trading::{OrderArgs, OrderType, Side, TradingClient};
 
@@ -383,29 +421,20 @@ async fn main() -> Result<()> {
 
     let result: Result<()> = loop {
         term.draw(|f| ui::draw(f, &state))?;
+        let draw_finished_at = Instant::now();
 
         let Some(mut ev) = rx.recv().await else { break Ok(()) };
 
         let mut should_quit = false;
+        let mut had_key = false;
         let mut processed = 0usize;
         loop {
-            match ev {
-                AppEvent::Key(k) => {
-                    let action = events::handle_key(&mut state, k);
-                    if matches!(action, Action::Quit) {
-                        should_quit = true;
-                        break;
-                    }
-                    if matches!(action, Action::Claim) {
-                        info!(
-                            key_code = ?k.code,
-                            modifiers = ?k.modifiers,
-                            "TUI: CTF redeem key pressed (dispatching redeem)"
-                        );
-                    }
-                    dispatch_action(action, &state, &trading, &tx, &cfg);
-                }
-                e => state.apply(e),
+            if matches!(ev, AppEvent::Key(_)) {
+                had_key = true;
+            }
+            if apply_app_event(ev, &mut state, &trading, &tx, &cfg) {
+                should_quit = true;
+                break;
             }
             processed += 1;
             if processed >= MAX_EVENTS_PER_FRAME {
@@ -419,6 +448,43 @@ async fn main() -> Result<()> {
 
         if should_quit {
             break Ok(());
+        }
+
+        // Throttle feed-driven frames so high-frequency Price/Book does not call `draw` on each.
+        // `select!` wakes on `recv` during the wait so keys/feed are not blocked for the full gap.
+        if !had_key {
+            let deadline = draw_finished_at + FEED_REDRAW_MIN;
+            if Instant::now() < deadline {
+                tokio::select! {
+                    biased;
+                    maybe_ev = rx.recv() => {
+                        let Some(mut ev) = maybe_ev else { break Ok(()) };
+                        loop {
+                            if apply_app_event(ev, &mut state, &trading, &tx, &cfg) {
+                                should_quit = true;
+                                break;
+                            }
+                            match rx.try_recv() {
+                                Ok(next) => ev = next,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    _ = tokio::time::sleep_until(deadline.into()) => {}
+                }
+                if should_quit {
+                    break Ok(());
+                }
+            }
+            while let Ok(next) = rx.try_recv() {
+                if apply_app_event(next, &mut state, &trading, &tx, &cfg) {
+                    should_quit = true;
+                    break;
+                }
+            }
+            if should_quit {
+                break Ok(());
+            }
         }
     };
 
