@@ -17,7 +17,7 @@ use crate::gamma::ActiveMarket;
 use crate::trading::{ClobOpenOrder, ClobTrade, Side, OrderType};
 use tracing::debug;
 
-/// Minimum outcome shares for a limit (GTC) order — enforced in the UI before submit.
+/// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
 pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 
 // ── Public event enum ───────────────────────────────────────────────
@@ -486,7 +486,7 @@ pub fn hydrate_positions_from_trades(
     (position_up, position_down, fills_bootstrap)
 }
 
-fn clamp_prob(p: f64) -> f64 {
+pub(crate) fn clamp_prob(p: f64) -> f64 {
     p.clamp(0.01, 0.99)
 }
 
@@ -497,19 +497,21 @@ pub fn resolve_market_order(
     outcome: Outcome,
     side: Side,
     size: f64,
-    slippage_bps: u32,
+    buy_slippage_bps: u32,
+    sell_slippage_bps: u32,
 ) -> Option<(f64, f64, OrderType)> {
-    let slip = slippage_bps as f64 / 10_000.0;
     match side {
         Side::Buy => {
+            let slip = buy_slippage_bps as f64 / 10_000.0;
             let ask = state.best_ask(outcome)?;
-            // Widen ceiling so a thin or stale book still crosses (`MARKET_SLIPPAGE_BPS`).
+            // Widen ceiling so a thin or stale book still crosses (`MARKET_BUY_SLIPPAGE_BPS`).
             let price = clamp_prob(ask * (1.0 + slip));
             // `size` = USDC notional → shares at reference ask
             let shares = (size / ask).max(0.01);
             Some((shares, price, OrderType::Fak))
         }
         Side::Sell => {
+            let slip = sell_slippage_bps as f64 / 10_000.0;
             let bid = state.best_bid(outcome)?;
             let price = clamp_prob(bid * (1.0 - slip));
             // Dump **entire** tracked position (fills + CLOB sync). USDC field only sizes the
@@ -604,7 +606,7 @@ mod tests {
         state.position_up.shares = 7.25;
         // $1 ticket → would be 2 shares via USDC/bid; we still exit the full 7.25 sh.
         let (shares, price, _) =
-            resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0).unwrap();
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();
         assert!((shares - 7.25).abs() < 1e-9);
         assert!((price - 0.5).abs() < 1e-9);
     }
@@ -619,7 +621,7 @@ mod tests {
         });
         state.position_up = Position::default();
         let (shares, _, _) =
-            resolve_market_order(&state, Outcome::Up, Side::Sell, 10.0, 0).unwrap();
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 10.0, 0, 0).unwrap();
         assert!((shares - 20.0).abs() < 1e-9);
     }
 

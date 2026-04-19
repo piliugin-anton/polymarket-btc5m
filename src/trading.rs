@@ -100,8 +100,14 @@ impl Side {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)] // FOK/GTD not used by the bot yet; kept for parity with CLOB order types
-pub enum OrderType { Gtc, Fok, Fak, Gtd }
+pub enum OrderType {
+    #[allow(dead_code)] // parity with CLOB; limits use GTD
+    Gtc,
+    #[allow(dead_code)]
+    Fok,
+    Fak,
+    Gtd,
+}
 
 impl OrderType {
     fn as_str(self) -> &'static str { match self {
@@ -123,6 +129,9 @@ pub struct OrderArgs {
     /// BUY only: USDC notional the user requested. After share ticks, recomputed USDC can fall
     /// below this (e.g. $1 → $0.99); we bump shares until `maker` ≥ this (2-dec floor).
     pub buy_notional_usdc: Option<f64>,
+    /// EIP-712 / JSON `expiration`: UTC unix seconds. `0` for GTC / FOK / FAK. For GTD, must be
+    /// non-zero (see Polymarket GTD +60s security offset in order docs).
+    pub expiration_unix_secs: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -136,10 +145,34 @@ pub struct ApiCreds {
 pub struct PostOrderResponse {
     #[serde(default)] pub success:  bool,
     #[serde(default)] #[serde(rename = "orderID")]
+    #[allow(dead_code)]
     pub order_id: Option<String>,
     #[serde(default)] pub status:   Option<String>,
+    /// USDC leg for BUY, shares leg for SELL — 1e6 fixed decimals (see Polymarket `SendOrderResponse`).
+    #[serde(default, rename = "makingAmount")]
+    pub making_amount: Option<String>,
+    /// Shares leg for BUY, USDC leg for SELL — 1e6 fixed decimals.
+    #[serde(default, rename = "takingAmount")]
+    pub taking_amount: Option<String>,
     #[serde(default, rename = "errorMsg")]
     pub error:    Option<String>,
+}
+
+impl PostOrderResponse {
+    /// After a matched **BUY**: filled shares and average price from `makingAmount` / `takingAmount`.
+    pub fn matched_buy_fill_shares_and_avg_price(&self) -> Option<(f64, f64)> {
+        let mk = self.making_amount.as_ref()?.trim();
+        let tk = self.taking_amount.as_ref()?.trim();
+        if mk.is_empty() || tk.is_empty() {
+            return None;
+        }
+        let maker_usdc = mk.parse::<f64>().ok()? / 1_000_000.0;
+        let taker_sh = tk.parse::<f64>().ok()? / 1_000_000.0;
+        if taker_sh <= 1e-12 || !maker_usdc.is_finite() {
+            return None;
+        }
+        Some((taker_sh, maker_usdc / taker_sh))
+    }
 }
 
 /// `GET /fee-rate` — <https://docs.polymarket.com/api-reference/market-data/get-fee-rate>
@@ -531,11 +564,51 @@ impl TradingClient {
         Ok(fr.base_fee)
     }
 
+    /// `GET /balance-allowance/update` — asks CLOB to refresh its balance cache before a read.
+    /// Matches official `clob-client` `updateBalanceAllowance`; mitigates stale `0` balances
+    /// ([clob-client#128](https://github.com/Polymarket/clob-client/issues/128)).
+    async fn update_conditional_balance_allowance(&mut self, token_id: &str) -> Result<()> {
+        let creds = self.ensure_creds().await?;
+        let ts = chrono::Utc::now().timestamp();
+        let path = "/balance-allowance/update";
+        let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+            .context("parse /balance-allowance/update URL")?;
+        url.query_pairs_mut()
+            .append_pair("asset_type", "CONDITIONAL")
+            .append_pair("token_id", token_id)
+            .append_pair("signature_type", &(self.config.sig_type as u8).to_string());
+
+        let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+
+        let resp = self
+            .http
+            .get(url.as_str())
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
+            .send()
+            .await
+            .context("GET /balance-allowance/update")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "CLOB GET /balance-allowance/update failed: {} — {}",
+                status,
+                snip(&txt)
+            ));
+        }
+        Ok(())
+    }
+
     /// Conditional (outcome token) balance for `token_id`, in **human shares** (raw / 1e6).
     ///
     /// Uses L2 auth — same as `clob-client-v2` `getBalanceAllowance` with
     /// `asset_type: CONDITIONAL`.
     pub async fn fetch_conditional_balance_shares(&mut self, token_id: &str) -> Result<f64> {
+        let _ = self.update_conditional_balance_allowance(token_id).await;
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
         let path = "/balance-allowance";
@@ -720,6 +793,25 @@ impl TradingClient {
         let creds = self.ensure_creds().await?;
         let fee_bps = self.fetch_fee_rate_bps(&args.token_id).await?;
 
+        let expiration_u256 = match order_type {
+            OrderType::Gtd => {
+                if args.expiration_unix_secs == 0 {
+                    bail!("GTD order requires non-zero expiration_unix_secs");
+                }
+                U256::from(args.expiration_unix_secs)
+            }
+            _ => {
+                if args.expiration_unix_secs != 0 {
+                    bail!("expiration_unix_secs must be 0 for {:?}", order_type);
+                }
+                U256::ZERO
+            }
+        };
+        let expiration_wire = match order_type {
+            OrderType::Gtd => args.expiration_unix_secs.to_string(),
+            _ => "0".into(),
+        };
+
         // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
         let (maker_amount, taker_amount) = amounts_for(
             args.side,
@@ -735,32 +827,15 @@ impl TradingClient {
         let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
 
         let api_version = self.fetch_clob_order_version().await?;
+        if order_type == OrderType::Gtd && api_version != 1 {
+            bail!(
+                "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
+            );
+        }
         let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
 
         let verifying_v1 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V1 } else { CTF_EXCHANGE_V1 };
         let verifying_v2 = if args.neg_risk { NEG_RISK_CTF_EXCHANGE_V2 } else { CTF_EXCHANGE_V2 };
-
-        debug!(
-            token_id = %args.token_id,
-            side     = ?args.side,
-            price    = args.price,
-            size     = args.size,
-            neg_risk = args.neg_risk,
-            ?order_type,
-            clob_api_version = api_version,
-            exchange_v1 = verifying_v1,
-            exchange_v2 = verifying_v2,
-            maker_amount = %maker_amount,
-            taker_amount = %taker_amount,
-            salt,
-            ts_ms,
-            fee_bps,
-            sig_type = self.config.sig_type as u8,
-            funder   = %self.config.funder,
-            signer   = %self.signer.address(),
-            tick     = %args.tick_size,
-            "place_order: inputs + amounts (pre-sign)"
-        );
 
         const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
         const ZERO32: &str =
@@ -778,7 +853,7 @@ impl TradingClient {
                     tokenId: token_id_u256,
                     makerAmount: maker_amount,
                     takerAmount: taker_amount,
-                    expiration: U256::ZERO,
+                    expiration: expiration_u256,
                     nonce: U256::ZERO,
                     feeRateBps: U256::from(fee_bps),
                     side: args.side.as_u8(),
@@ -825,7 +900,7 @@ impl TradingClient {
                         maker_amount: order.makerAmount.to_string(),
                         taker_amount: order.takerAmount.to_string(),
                         side: args.side.as_str().to_string(),
-                        expiration: "0".into(),
+                        expiration: expiration_wire.clone(),
                         nonce: "0".into(),
                         fee_rate_bps: fee_bps.to_string(),
                         signature_type: self.config.sig_type as u8,
@@ -896,7 +971,7 @@ impl TradingClient {
                         maker_amount: order.makerAmount.to_string(),
                         taker_amount: order.takerAmount.to_string(),
                         side: args.side.as_str().to_string(),
-                        expiration: "0".into(),
+                        expiration: expiration_wire,
                         nonce: "0".into(),
                         signature_type: self.config.sig_type as u8,
                         signature: sig_hex,
@@ -916,12 +991,6 @@ impl TradingClient {
     }
 
     async fn post_order_http(&mut self, creds: &ApiCreds, body: String) -> Result<PostOrderResponse> {
-        debug!(
-            json_bytes = body.len(),
-            json_snip  = %snip(&body),
-            "place_order: POST body (snipped; see logs for full size)"
-        );
-
         let ts = chrono::Utc::now().timestamp();
         let path = "/order";
         let l2_sig = l2_hmac(&creds.secret, ts, "POST", path, &body)?;
@@ -940,23 +1009,11 @@ impl TradingClient {
 
         let status = resp.status();
         let txt    = resp.text().await?;
-        debug!(
-            status = %status,
-            response_snip = %snip(&txt),
-            "place_order: raw HTTP response"
-        );
         if !status.is_success() {
             return Err(anyhow!("CLOB POST /order failed: {} — {}", status, txt));
         }
         let out: PostOrderResponse = serde_json::from_str(&txt)
             .with_context(|| format!("decoding order response: {}", snip(&txt)))?;
-        debug!(
-            success = out.success,
-            order_id = ?out.order_id,
-            order_status = ?out.status,
-            error_msg = ?out.error,
-            "place_order: parsed JSON (check success/status — API can return 200 with success=false)"
-        );
         Ok(out)
     }
 

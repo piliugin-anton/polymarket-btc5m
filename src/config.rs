@@ -53,8 +53,13 @@ pub struct Config {
     pub sig_type: SignatureType,
     /// Default USDC ticket for **market BUY** (`DEFAULT_SIZE_USDC`). Market SELL uses full in-app position when known.
     pub default_size_usdc: f64,
-    /// Max fill slippage for market FAK orders, in basis points (widens buy ceiling / sell floor).
-    pub market_slippage_bps: u32,
+    /// Max fill slippage for market **buy** FAK orders (basis points; widens buy ceiling vs best ask).
+    pub market_buy_slippage_bps: u32,
+    /// Max fill slippage for market **sell** FAK orders (basis points; widens sell floor vs best bid).
+    pub market_sell_slippage_bps: u32,
+    /// After a successful **market BUY** (FAK), place a GTD limit **SELL** at this profit margin in bps
+    /// over the fill price (2000 = 20%). `0` disables.
+    pub market_buy_take_profit_bps: u32,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -91,10 +96,25 @@ impl Config {
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(5.0);
 
-        let market_slippage_bps = std::env::var("MARKET_SLIPPAGE_BPS")
+        // Per-side slippage; `MARKET_SLIPPAGE_BPS` sets both when the specific var is unset (legacy).
+        let legacy_slippage_bps = std::env::var("MARKET_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok());
+        let market_buy_slippage_bps = std::env::var("MARKET_BUY_SLIPPAGE_BPS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(200); // 2% default slippage tolerance on market orders
+            .or(legacy_slippage_bps)
+            .unwrap_or(200);
+        let market_sell_slippage_bps = std::env::var("MARKET_SELL_SLIPPAGE_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .or(legacy_slippage_bps)
+            .unwrap_or(200);
+
+        let market_buy_take_profit_bps = std::env::var("MARKET_BUY_TAKE_PROFIT_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
 
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
@@ -128,7 +148,9 @@ impl Config {
             signer_address,
             sig_type,
             default_size_usdc,
-            market_slippage_bps,
+            market_buy_slippage_bps,
+            market_sell_slippage_bps,
+            market_buy_take_profit_bps,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,

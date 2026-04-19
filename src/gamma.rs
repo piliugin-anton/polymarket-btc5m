@@ -17,7 +17,7 @@
 //! [`crate::config::POLYMARKET_CRYPTO_PRICE_URL`] (`openPrice`), then description
 //! parsing, then the app’s RTDS latch.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
 use serde::Deserialize;
 use tracing::debug;
@@ -45,6 +45,25 @@ pub struct ActiveMarket {
     /// UTC `Z` strings passed as `eventStartTime` / `endDate` to Polymarket crypto-price (debug / TUI).
     pub crypto_price_query_start_utc: String,
     pub crypto_price_query_end_utc:   String,
+}
+
+/// Signed CLOB `expiration` (UTC unix seconds) for a **GTD** limit that should stop resting **1
+/// second before** the 5m window ends (`window_end`).
+///
+/// Polymarket applies a **+60s security offset** on GTD: resting ends around `expiration - 60`.
+/// So we use `(window_end - 1s) + 60` as the signed field. See Polymarket “Create Order” → GTD.
+pub fn clob_gtd_expiration_secs_one_s_before_window_end(window_end: DateTime<Utc>) -> Result<u64> {
+    let target = window_end - Duration::seconds(1);
+    let now = Utc::now();
+    if target <= now {
+        bail!("too close to window end for a GTD limit (need the window to close >1s from now)");
+    }
+    let signed = target
+        .timestamp()
+        .checked_add(60)
+        .filter(|&s| s > now.timestamp())
+        .ok_or_else(|| anyhow!("could not compute Polymarket GTD expiration (time overflow or past)"))?;
+    Ok(signed as u64)
 }
 
 // ── Raw Gamma JSON shapes ───────────────────────────────────────────

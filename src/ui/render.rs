@@ -338,10 +338,12 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         Span::styled("size ", Style::default().fg(Color::DarkGray)),
         size_span,
         Span::raw(" "),
-        key("u", "buy UP"), sep(),
-        key("d", "buy DOWN"), sep(),
-        key("U", "sell UP"), sep(),
-        key("D", "sell DOWN"), sep(),
+        Span::raw("[u]"), Span::styled(" buy UP", Style::default().fg(Color::Green)), sep(),
+        Span::raw("[d]"), Span::styled(" buy ", Style::default().fg(Color::Green)),
+        Span::styled("DOWN", Style::default().fg(Color::Red)), sep(),
+        Span::raw("[U]"), Span::styled(" sell ", Style::default().fg(Color::Red)),
+        Span::styled("UP", Style::default().fg(Color::Green)), sep(),
+        Span::raw("[D]"), Span::styled(" sell DOWN", Style::default().fg(Color::Red)), sep(),
         key("l", "limit"), sep(),
         key("c", "cancel all"), sep(),
         key("x", "CTF redeem"), sep(),
@@ -368,31 +370,53 @@ fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
 fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
     outcome: Outcome, side: crate::trading::Side, field: LimitField)
 {
-    let area = centered(screen, 50, 8);
+    let area = centered(screen, 52, 10);
     f.render_widget(Clear, area);
+    // Darker fills so white/light-gray text and borders stay readable in any 16‑color theme.
+    let dialog_bg = match outcome {
+        Outcome::Up => Color::Rgb(10, 88, 48),
+        Outcome::Down => Color::Rgb(122, 26, 38),
+    };
+    let border_style = Style::default()
+        .fg(Color::Rgb(245, 250, 248))
+        .bg(dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let text_main = Style::default().fg(Color::Rgb(248, 252, 250)).bg(dialog_bg);
+    let text_muted = Style::default().fg(Color::Rgb(185, 198, 192)).bg(dialog_bg);
     let title = format!(" Limit {} {} ",
         match side { crate::trading::Side::Buy => "BUY", _ => "SELL" },
         outcome.as_str());
     let block = Block::default().borders(Borders::ALL).border_type(BorderType::Double)
-        .title(title)
-        .border_style(Style::default().fg(Color::Yellow));
+        .title(Span::styled(
+            title,
+            text_main.add_modifier(Modifier::BOLD),
+        ))
+        .border_style(border_style)
+        .style(Style::default().bg(dialog_bg).fg(Color::Rgb(248, 252, 250)));
     let inner = block.inner(area);
     f.render_widget(block, area);
 
     let rows = Layout::vertical([
         Constraint::Length(1), Constraint::Length(1),
         Constraint::Length(1), Constraint::Length(1),
+        Constraint::Length(1),
         Constraint::Min(0),
     ]).split(inner);
 
     let price_hl = matches!(field, LimitField::Price);
     let size_hl  = matches!(field, LimitField::Size);
+    let label_style = text_muted;
     let mk = |highlighted: bool, label: &str, val: &str| {
         let style = if highlighted {
-            Style::default().bg(Color::DarkGray).fg(Color::White).add_modifier(Modifier::BOLD)
-        } else { Style::default().fg(Color::Gray) };
+            Style::default()
+                .bg(Color::Rgb(28, 32, 34))
+                .fg(Color::Rgb(255, 255, 255))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            text_main.add_modifier(Modifier::BOLD)
+        };
         Line::from(vec![
-            Span::styled(format!(" {label:10} "), Style::default().fg(Color::DarkGray)),
+            Span::styled(format!(" {label:10} "), label_style),
             Span::styled(format!("[{val}]"), style),
         ])
     };
@@ -403,20 +427,31 @@ fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
         crate::trading::Side::Sell => "size = shares",
     };
     f.render_widget(
-        Paragraph::new(Span::styled(format!("   {size_hint}"), Style::default().fg(Color::DarkGray))),
+        Paragraph::new(Span::styled(format!("   {size_hint}"), label_style)),
         rows[2],
     );
 
     f.render_widget(
         Paragraph::new(Line::from(vec![
-            Span::styled("   tab ", Style::default().fg(Color::DarkGray)),
-            Span::raw("switch field   "),
-            Span::styled("enter ", Style::default().fg(Color::DarkGray)),
-            Span::raw("submit   "),
-            Span::styled("esc ", Style::default().fg(Color::DarkGray)),
-            Span::raw("cancel"),
+            Span::styled("   tab ", text_muted),
+            Span::styled("switch field   ", text_main),
+            Span::styled("enter ", text_muted),
+            Span::styled("submit   ", text_main),
+            Span::styled("esc ", text_muted),
+            Span::styled("cancel", text_main),
         ])),
         rows[3],
+    );
+    f.render_widget(
+        Paragraph::new(Line::from(vec![
+            Span::styled("   ←/→", text_muted),
+            Span::styled(" UP/DOWN ", text_main),
+            Span::styled("↑/↓", text_muted),
+            Span::styled(" buy/sell ", text_main),
+            Span::styled("u d U D", text_muted),
+            Span::styled(" quick", text_main),
+        ])),
+        rows[4],
     );
 }
 

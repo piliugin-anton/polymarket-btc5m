@@ -48,9 +48,8 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         // Cancel all
         KeyCode::Char('c') => Action::CancelAll,
 
-        // Open limit modal — pick an outcome+side by following up with one key
+        // Open limit modal — default BUY UP; change outcome/side inside modal (←/→, ↑/↓, u/d/U/D).
         KeyCode::Char('l') => {
-            // Default to BUY UP; user tabs through fields. Starts empty.
             state.limit_price_input.clear();
             state.limit_size_input = state.size_input.clone();
             state.input_mode = InputMode::LimitModal {
@@ -110,6 +109,31 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             Action::Claim
         }
         KeyCode::Esc => { state.input_mode = InputMode::Normal; Action::None }
+        // Same quick keys as normal mode: u/d buy UP/DOWN, U/D sell UP/DOWN
+        KeyCode::Char('u') => {
+            state.input_mode = InputMode::LimitModal {
+                outcome: Outcome::Up, side: Side::Buy, field,
+            };
+            Action::None
+        }
+        KeyCode::Char('d') => {
+            state.input_mode = InputMode::LimitModal {
+                outcome: Outcome::Down, side: Side::Buy, field,
+            };
+            Action::None
+        }
+        KeyCode::Char('U') => {
+            state.input_mode = InputMode::LimitModal {
+                outcome: Outcome::Up, side: Side::Sell, field,
+            };
+            Action::None
+        }
+        KeyCode::Char('D') => {
+            state.input_mode = InputMode::LimitModal {
+                outcome: Outcome::Down, side: Side::Sell, field,
+            };
+            Action::None
+        }
         KeyCode::Tab => {
             state.input_mode = InputMode::LimitModal {
                 outcome, side,

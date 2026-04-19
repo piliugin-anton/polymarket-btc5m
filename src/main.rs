@@ -25,7 +25,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use app::{
-    hydrate_positions_from_trades, open_orders_from_clob, AppEvent, AppState, Outcome,
+    clamp_prob, hydrate_positions_from_trades, open_orders_from_clob, AppEvent, AppState, Outcome,
     resolve_market_order, MIN_LIMIT_ORDER_SHARES,
 };
 use config::Config;
@@ -532,14 +532,31 @@ fn dispatch_action(
                 return;
             };
             let Some((shares, price, otype)) =
-                resolve_market_order(state, outcome, side, size_usdc, cfg.market_slippage_bps)
+                resolve_market_order(
+                    state,
+                    outcome,
+                    side,
+                    size_usdc,
+                    cfg.market_buy_slippage_bps,
+                    cfg.market_sell_slippage_bps,
+                )
             else {
                 forward_order_err(tx, "no book liquidity".into());
                 return;
             };
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
-                trading.clone(), tx.clone(), market, outcome, side, shares, price, otype, buy_notional,
+                trading.clone(),
+                tx.clone(),
+                market,
+                outcome,
+                side,
+                shares,
+                price,
+                otype,
+                buy_notional,
+                0,
+                cfg.market_buy_take_profit_bps,
             );
         }
         Action::PlaceLimit { outcome, side, price, size_usdc } => {
@@ -561,8 +578,26 @@ fn dispatch_action(
                 return;
             }
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
+            let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at)
+            {
+                Ok(s) => s,
+                Err(e) => {
+                    forward_order_err(tx, format!("limit: {e}"));
+                    return;
+                }
+            };
             spawn_order(
-                trading.clone(), tx.clone(), market, outcome, side, shares, price, OrderType::Gtc, buy_notional,
+                trading.clone(),
+                tx.clone(),
+                market,
+                outcome,
+                side,
+                shares,
+                price,
+                OrderType::Gtd,
+                buy_notional,
+                exp_secs,
+                0,
             );
         }
     }
@@ -601,6 +636,8 @@ fn spawn_order(
     price:    f64,
     otype:    OrderType,
     buy_notional_usdc: Option<f64>,
+    expiration_unix_secs: u64,
+    take_profit_bps: u32,
 ) {
     tokio::spawn(async move {
         let market_for_refresh = market.clone();
@@ -608,17 +645,6 @@ fn spawn_order(
             Outcome::Up   => market.up_token_id,
             Outcome::Down => market.down_token_id,
         };
-        debug!(
-            ?outcome,
-            ?side,
-            shares,
-            price,
-            ?otype,
-            slug = %market.slug,
-            neg_risk = market.neg_risk,
-            token_id = %token_id,
-            "spawn_order: calling TradingClient::place_order"
-        );
         let args = OrderArgs {
             token_id,
             side,
@@ -627,31 +653,79 @@ fn spawn_order(
             neg_risk: market.neg_risk,
             tick_size: market.tick_size.clone(),
             buy_notional_usdc,
+            expiration_unix_secs,
         };
         let mut cli = trading.lock().await;
         match cli.place_order(args, otype).await {
             Ok(resp) => {
-                let ok_ui = resp.success || resp.status.as_deref() == Some("matched");
-                debug!(
-                    success_flag = resp.success,
-                    status = ?resp.status,
-                    order_id = ?resp.order_id,
-                    error = ?resp.error,
-                    ok_ui,
-                    "spawn_order: place_order returned Ok (verify ok_ui for TUI ack)"
-                );
+                // HTTP 200 may still have `success: false`; resting limits often use `status: "live"`.
+                let ok_ui = resp.success
+                    || resp.status.as_ref().is_some_and(|s| {
+                        s.eq_ignore_ascii_case("matched")
+                            || s.eq_ignore_ascii_case("live")
+                            || s.eq_ignore_ascii_case("open")
+                    });
                 if ok_ui {
                     let _ = tx.send(AppEvent::OrderAck {
                         side, outcome, qty: shares, price,
                     }).await;
-                    spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh);
+                    spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh.clone());
+
+                    if take_profit_bps > 0
+                        && matches!(side, Side::Buy)
+                        && otype == OrderType::Fak
+                    {
+                        let fill = resp.matched_buy_fill_shares_and_avg_price().or_else(|| {
+                            resp.status.as_deref().and_then(|s| {
+                                s.eq_ignore_ascii_case("matched").then_some((shares, price))
+                            })
+                        });
+                        let Some((sell_shares, entry_px)) = fill else {
+                            return;
+                        };
+                        let tp_px = clamp_prob(
+                            entry_px * (1.0 + take_profit_bps as f64 / 10_000.0),
+                        );
+                        if sell_shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+                            let _ = tx
+                                .send(AppEvent::StatusInfo(format!(
+                                    "take-profit skipped: fill {sell_shares:.2} sh < min {:.0} sh",
+                                    MIN_LIMIT_ORDER_SHARES
+                                )))
+                                .await;
+                        } else {
+                            let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(
+                                market_for_refresh.closes_at,
+                            ) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    let _ = tx
+                                        .send(AppEvent::OrderErr(format!("take-profit limit: {e}")))
+                                        .await;
+                                    return;
+                                }
+                            };
+                            spawn_order(
+                                trading.clone(),
+                                tx.clone(),
+                                market_for_refresh,
+                                outcome,
+                                Side::Sell,
+                                sell_shares,
+                                tp_px,
+                                OrderType::Gtd,
+                                None,
+                                exp_secs,
+                                0,
+                            );
+                        }
+                    }
                 } else {
                     let msg = resp.error.unwrap_or_else(|| format!("status={:?}", resp.status));
                     let _ = tx.send(AppEvent::OrderErr(msg)).await;
                 }
             }
             Err(e) => {
-                debug!(error = %e, "spawn_order: place_order returned Err");
                 let _ = tx.send(AppEvent::OrderErr(e.to_string())).await;
             }
         }

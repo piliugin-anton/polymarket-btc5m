@@ -3,8 +3,9 @@
 A Rust TUI for trading Polymarket's 5-minute **Bitcoin Up or Down** prediction
 markets. Colors the live Chainlink BTC/USD price green/red against each
 window's opening "Price to Beat", shows both sides of the order book, your
-current UP/DOWN positions with unrealized PnL, and lets you fire market or
-limit orders with one keystroke.
+current UP/DOWN positions with unrealized PnL, and lets you fire **FAK**
+market orders or **GTD** limit orders that auto-expire just before the
+current 5m window closes — all from single-key actions.
 
 ## Design at a glance
 
@@ -210,8 +211,10 @@ Limit modal:
 | ↑ / ↓   | flip side (BUY ↔ SELL)                 |
 | `Tab`   | switch price / size field              |
 | digits / `.` | edit current field                |
-| `Enter` | submit as GTC limit order              |
+| `Enter` | submit as **GTD** limit order |
 | `Esc`   | cancel modal                           |
+
+GTD expiration is chosen so the order stops resting about **one second before** the active market’s `closes_at`. The CLOB expects a unix `expiration` field with Polymarket’s **+60s** security buffer on top of that instant (see [Create order → GTD](https://docs.polymarket.com/developers/CLOB/orders/create-order)). **CLOB API signing version must be 1** (EIP-712 includes `expiration`); if `/version` returns `2`, GTD placement is rejected until the client supports it.
 
 Size edit mode:
 
@@ -260,8 +263,8 @@ behaviour:
 1. Start with `DEFAULT_SIZE_USDC=1.0` or `0.5`. Orders below ~$1 on
    Polymarket are often rejected by the CLOB minimum-order-size check —
    useful dry-run signal.
-2. Keep `MARKET_SLIPPAGE_BPS` conservative; the FAK type won't fill worse
-   than the visible best level, but consider an FOK for zero slippage.
+2. Tune `MARKET_BUY_SLIPPAGE_BPS` / `MARKET_SELL_SLIPPAGE_BPS` (use `0` for no
+   cushion); legacy `MARKET_SLIPPAGE_BPS` still sets either side if unset.
 3. Never check your private key into source control. The `.env.example`
    file ships with zeros specifically so that `cp .env.example .env` fails
    loudly if you forget to edit.
