@@ -35,6 +35,9 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     if let InputMode::LimitModal { outcome, side, field } = s.input_mode {
         draw_limit_modal(f, area, s, outcome, side, field);
     }
+    if let Some(ref err) = s.error_dialog {
+        draw_error_dialog(f, area, err);
+    }
 }
 
 // ── Header (BTC left, Balance right) ────────────────────────────────
@@ -365,6 +368,39 @@ fn key(k: &str, label: &str) -> Span<'static> {
     Span::from(format!("[{k}] {label}"))
 }
 fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
+
+// ── Error dialog (top layer; Enter dismisses in main) ───────────────
+fn draw_error_dialog(f: &mut Frame, screen: Rect, message: &str) {
+    let max_inner_w = screen.width.saturating_sub(6).max(24);
+    let box_w = (max_inner_w + 4).min(screen.width);
+    let box_h = (screen.height.saturating_sub(4).min(22)).max(7);
+    let area = centered(screen, box_w, box_h);
+    f.render_widget(Clear, area);
+    let dialog_bg = Color::Rgb(48, 24, 28);
+    let border_style = Style::default()
+        .fg(Color::Rgb(255, 180, 170))
+        .bg(dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let text_style = Style::default().fg(Color::Rgb(255, 235, 235)).bg(dialog_bg);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Double)
+        .title(Span::styled(" Error ", text_style.add_modifier(Modifier::BOLD)))
+        .border_style(border_style)
+        .style(Style::default().bg(dialog_bg));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let hint = Line::from(vec![
+        Span::styled(" enter ", Style::default().fg(Color::Rgb(180, 180, 190)).bg(dialog_bg)),
+        Span::styled("close", Style::default().fg(Color::Rgb(248, 248, 252)).bg(dialog_bg)),
+    ]);
+    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
+    let p = Paragraph::new(message)
+        .style(text_style)
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, rows[0]);
+    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), rows[1]);
+}
 
 // ── Limit modal ─────────────────────────────────────────────────────
 fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,

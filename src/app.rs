@@ -42,7 +42,10 @@ pub enum AppEvent {
     BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
+    /// Non-blocking status line only (no modal).
     OrderErr(String),
+    /// Order placement / cancel failures: centered modal + status line (Enter dismisses).
+    OrderErrModal(String),
     /// Status line update without the `✗` prefix (e.g. claim hint).
     StatusInfo(String),
 }
@@ -160,6 +163,9 @@ pub struct AppState {
     pub limit_size_input:  String,
 
     pub input_mode:        InputMode,
+
+    /// When set, a centered error dialog is drawn on top; Enter clears it.
+    pub error_dialog:      Option<String>,
 }
 
 impl AppState {
@@ -179,6 +185,7 @@ impl AppState {
             limit_price_input: String::new(),
             limit_size_input:  String::new(),
             input_mode: InputMode::Normal,
+            error_dialog: None,
         }
     }
 
@@ -284,6 +291,7 @@ impl AppState {
                 // We keep realized_pnl but zero out live positions for the new market.
                 // Return to normal keys (u/d/…) — otherwise `s` / limit modal survives a roll.
                 self.input_mode = InputMode::Normal;
+                self.error_dialog = None;
                 self.status_line = format!("New market: {}", m.question);
                 self.latched_price_to_beat = None;
                 self.market = Some(m);
@@ -332,6 +340,10 @@ impl AppState {
                     side_str(side), outcome.as_str());
             }
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
+            AppEvent::OrderErrModal(e) => {
+                self.status_line = format!("✗ {e}");
+                self.error_dialog = Some(e);
+            },
             AppEvent::StatusInfo(msg) => self.status_line = msg,
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }

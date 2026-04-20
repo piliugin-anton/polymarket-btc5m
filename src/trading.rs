@@ -1519,8 +1519,14 @@ impl TradingClient {
             .header("POLY_SIGNATURE",  l2_sig)
             .send()
             .await?;
-        if !resp.status().is_success() {
-            return Err(anyhow!("cancel-all failed: {}", resp.status()));
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        if !status.is_success() {
+            let tail = body.trim();
+            if tail.is_empty() {
+                return Err(anyhow!("cancel-all failed: {status}"));
+            }
+            return Err(anyhow!("cancel-all failed: {status} — {tail}"));
         }
         Ok(())
     }

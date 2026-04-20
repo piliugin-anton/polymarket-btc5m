@@ -81,6 +81,17 @@ fn apply_app_event(
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
+            if state.error_dialog.is_some() {
+                // Modal: only Enter dismisses; every other key (incl. Ctrl-C/Esc) is swallowed.
+                let dismiss = matches!(
+                    k.code,
+                    KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
+                );
+                if dismiss {
+                    state.error_dialog = None;
+                }
+                return false;
+            }
             let action = events::handle_key(state, k);
             if matches!(action, Action::Quit) {
                 return true;
@@ -640,7 +651,7 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
 fn forward_order_err(tx: &mpsc::Sender<AppEvent>, msg: String) {
     let tx = tx.clone();
     tokio::spawn(async move {
-        let _ = tx.send(AppEvent::OrderErr(msg)).await;
+        let _ = tx.send(AppEvent::OrderErrModal(msg)).await;
     });
 }
 
@@ -707,12 +718,16 @@ fn dispatch_action(
             tokio::spawn(async move {
                 match t.lock().await.cancel_all().await {
                     Ok(_) => {
-                        let _ = tx.send(AppEvent::OrderErr("all open orders cancelled".into())).await;
+                        let _ = tx
+                            .send(AppEvent::StatusInfo("all open orders cancelled".into()))
+                            .await;
                         if let Some(m) = market {
                             spawn_open_orders_refresh(t.clone(), tx.clone(), m);
                         }
                     }
-                    Err(e) => { let _ = tx.send(AppEvent::OrderErr(format!("cancel failed: {e}"))).await; }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::OrderErrModal(e.to_string())).await;
+                    }
                 }
             });
         }
@@ -1009,7 +1024,7 @@ fn spawn_order(
                                 Err(e) => {
                                     warn!(error = %e, "take-profit: skipped — GTD expiration computation failed");
                                     let _ = tx
-                                        .send(AppEvent::OrderErr(format!("take-profit limit: {e}")))
+                                        .send(AppEvent::OrderErrModal(format!("take-profit limit: {e}")))
                                         .await;
                                     return;
                                 }
@@ -1059,7 +1074,7 @@ fn spawn_order(
                                         "take-profit: skipped — conditional balance not ready in time"
                                     );
                                     let _ = tx
-                                        .send(AppEvent::OrderErr(format!("take-profit: {e}")))
+                                        .send(AppEvent::OrderErrModal(format!("take-profit: {e}")))
                                         .await;
                                 }
                             }
@@ -1090,7 +1105,7 @@ fn spawn_order(
                             "CLOB order rejected (HTTP OK, error in response body)"
                         );
                     }
-                    let _ = tx.send(AppEvent::OrderErr(msg)).await;
+                    let _ = tx.send(AppEvent::OrderErrModal(msg)).await;
                 }
             }
             Err(e) => {
@@ -1131,7 +1146,7 @@ fn spawn_order(
                         _ => {}
                     }
                 }
-                let _ = tx.send(AppEvent::OrderErr(e.to_string())).await;
+                let _ = tx.send(AppEvent::OrderErrModal(e.to_string())).await;
             }
         }
     });
