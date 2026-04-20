@@ -185,7 +185,7 @@ layer (headers, proxy, TLS).
 
 ```sh
 git clone <your-fork>
-cd btc5m-bot
+cd polymarket-btc5m
 cp .env.example .env
 # ...edit .env with your keys
 cargo build --release
@@ -194,7 +194,7 @@ cargo build --release
 ### Run
 
 ```sh
-RUST_LOG=btc5m_bot=debug ./target/release/btc5m-bot
+RUST_LOG=btc5m_bot=debug ./target/release/polymarket-btc5m
 ```
 
 ## Key bindings

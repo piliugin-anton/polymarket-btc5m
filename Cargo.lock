@@ -721,40 +721,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "btc5m-bot"
-version = "0.1.0"
-dependencies = [
- "alloy-dyn-abi",
- "alloy-primitives",
- "alloy-signer",
- "alloy-signer-local",
- "alloy-sol-types",
- "anyhow",
- "base64",
- "chrono",
- "crossterm 0.29.0",
- "dotenvy",
- "futures-util",
- "hex",
- "hmac",
- "rand 0.9.4",
- "ratatui",
- "reqwest",
- "serde",
- "serde_json",
- "sha2",
- "socket2",
- "thiserror 2.0.18",
- "tokio",
- "tokio-socks",
- "tokio-tungstenite",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
-]
-
-[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2275,6 +2241,40 @@ checksum = "f950b2377845cebe5cf8b5165cb3cc1a5e0fa5cfa3e1f7f55707d8fd82e0a7b7"
 dependencies = [
  "der",
  "spki",
+]
+
+[[package]]
+name = "polymarket-btc5m"
+version = "0.1.0"
+dependencies = [
+ "alloy-dyn-abi",
+ "alloy-primitives",
+ "alloy-signer",
+ "alloy-signer-local",
+ "alloy-sol-types",
+ "anyhow",
+ "base64",
+ "chrono",
+ "crossterm 0.29.0",
+ "dotenvy",
+ "futures-util",
+ "hex",
+ "hmac",
+ "rand 0.9.4",
+ "ratatui",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "socket2",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-socks",
+ "tokio-tungstenite",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
 ]
 
 [[package]]
