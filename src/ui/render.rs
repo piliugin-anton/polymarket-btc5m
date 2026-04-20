@@ -373,7 +373,7 @@ fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
 fn draw_error_dialog(f: &mut Frame, screen: Rect, message: &str) {
     let max_inner_w = screen.width.saturating_sub(6).max(24);
     let box_w = (max_inner_w + 4).min(screen.width);
-    let box_h = (screen.height.saturating_sub(4).min(22)).max(7);
+    let box_h = (screen.height.saturating_sub(4).min(22)).max(7).saturating_sub(2);
     let area = centered(screen, box_w, box_h);
     f.render_widget(Clear, area);
     let dialog_bg = Color::Rgb(48, 24, 28);

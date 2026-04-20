@@ -1490,7 +1490,9 @@ impl TradingClient {
         let status = resp.status();
         let txt    = resp.text().await?;
         if !status.is_success() {
-            return Err(anyhow!("CLOB POST /order failed: {} — {}", status, txt));
+            let detail = extract_clob_error_text(&txt)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(anyhow!("CLOB POST /order: {detail}"));
         }
         if matches!(order_type, OrderType::Fak | OrderType::Gtd) {
             debug!(
@@ -1522,11 +1524,9 @@ impl TradingClient {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
         if !status.is_success() {
-            let tail = body.trim();
-            if tail.is_empty() {
-                return Err(anyhow!("cancel-all failed: {status}"));
-            }
-            return Err(anyhow!("cancel-all failed: {status} — {tail}"));
+            let detail = extract_clob_error_text(&body)
+                .unwrap_or_else(|| format!("HTTP {status}"));
+            return Err(anyhow!("cancel-all: {detail}"));
         }
         Ok(())
     }
@@ -1776,11 +1776,56 @@ pub struct ClobAuthDebug {
     pub signature:   String,
 }
 
+/// User-facing message from CLOB JSON (`error` or `errorMsg`). Avoids putting full response bodies in the TUI.
+fn extract_clob_error_text(body: &str) -> Option<String> {
+    let trimmed = body.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let v: serde_json::Value = serde_json::from_str(trimmed).ok()?;
+    let s = v
+        .get("error")
+        .or_else(|| v.get("errorMsg"))
+        .and_then(|x| x.as_str())?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
 /// Shorten long response bodies for log output.
 fn snip(s: &str) -> String {
     let one_line: String = s.chars().filter(|&c| c != '\n' && c != '\r').collect();
     if one_line.chars().count() <= 200 { one_line }
     else { one_line.chars().take(200).collect::<String>() + "…" }
+}
+
+#[cfg(test)]
+mod clob_error_text_tests {
+    use super::extract_clob_error_text;
+
+    #[test]
+    fn parses_error_field() {
+        assert_eq!(
+            extract_clob_error_text(r#"{"error":"insufficient balance"}"#),
+            Some("insufficient balance".into())
+        );
+    }
+
+    #[test]
+    fn parses_error_msg_alias() {
+        assert_eq!(
+            extract_clob_error_text(r#"{"errorMsg":"invalid price"}"#),
+            Some("invalid price".into())
+        );
+    }
+
+    #[test]
+    fn non_json_yields_none() {
+        assert_eq!(extract_clob_error_text("not json"), None);
+    }
 }
 
 #[cfg(test)]
