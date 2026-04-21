@@ -363,6 +363,7 @@ async fn main() -> Result<()> {
                         position_up,
                         position_down,
                         fills_bootstrap,
+                        refresh_status_line: true,
                     })
                     .await;
 
@@ -387,6 +388,55 @@ async fn main() -> Result<()> {
                     }
                     match cli.fetch_open_orders_for_market(&cond2).await {
                         Ok(rows) => {
+                            // Open orders alone do not tell us what filled; replay trades like the
+                            // initial market load so Fills + Positions track resting matches.
+                            let (escrow_up, escrow_down) =
+                                escrow_sell_shares_from_clob_orders(&rows, &up2, &down2);
+                            let up_bal = cli
+                                .fetch_conditional_balance_shares(&up2)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    debug!(error = %e, token = %up2, "poll: UP conditional balance failed");
+                                    0.0
+                                });
+                            let down_bal = cli
+                                .fetch_conditional_balance_shares(&down2)
+                                .await
+                                .unwrap_or_else(|e| {
+                                    debug!(error = %e, token = %down2, "poll: DOWN conditional balance failed");
+                                    0.0
+                                });
+                            let trades = match cli.fetch_trades_for_market(&cond2).await {
+                                Ok(t) => t,
+                                Err(e) => {
+                                    debug!(
+                                        error = %e,
+                                        market = %cond2,
+                                        "poll: /data/trades failed; fills/positions stale until next tick"
+                                    );
+                                    vec![]
+                                }
+                            };
+                            let (position_up, position_down, fills_bootstrap) =
+                                hydrate_positions_from_trades(
+                                    &trades,
+                                    &up2,
+                                    &down2,
+                                    up_bal,
+                                    down_bal,
+                                    escrow_up,
+                                    escrow_down,
+                                    None,
+                                    None,
+                                );
+                            let _ = txp2
+                                .send(AppEvent::PositionsLoaded {
+                                    position_up,
+                                    position_down,
+                                    fills_bootstrap,
+                                    refresh_status_line: false,
+                                })
+                                .await;
                             let orders = open_orders_from_clob(rows, &up2, &down2);
                             let _ = txp2.send(AppEvent::OpenOrdersLoaded { orders }).await;
                         }
@@ -943,9 +993,33 @@ fn spawn_order(
                             || s.eq_ignore_ascii_case("open")
                     });
                 if ok_ui {
-                    let _ = tx.send(AppEvent::OrderAck {
-                        side, outcome, qty: shares, price,
-                    }).await;
+                    let ack = if otype == OrderType::Fak {
+                        resp.fak_fill_for_position_ack(side, shares, price)
+                    } else {
+                        resp.fill_for_position_ack(side, shares, price, otype)
+                    };
+                    if let Some((ack_qty, ack_price)) = ack
+                    {
+                        let _ = tx
+                            .send(AppEvent::OrderAck {
+                                side,
+                                outcome,
+                                qty: ack_qty,
+                                price: ack_price,
+                            })
+                            .await;
+                    } else {
+                        let _ = tx
+                            .send(AppEvent::StatusInfo(format!(
+                                "{} {} limit resting (no fill yet) — see Open Orders",
+                                match side {
+                                    crate::trading::Side::Buy => "BUY",
+                                    crate::trading::Side::Sell => "SELL",
+                                },
+                                outcome.as_str(),
+                            )))
+                            .await;
+                    }
                     spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh.clone());
 
                     if matches!(side, Side::Buy | Side::Sell) {

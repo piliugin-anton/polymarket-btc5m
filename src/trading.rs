@@ -178,6 +178,21 @@ impl PostOrderResponse {
         Some((taker_sh, maker_usdc / taker_sh))
     }
 
+    /// After a matched **SELL**: `makingAmount` is shares sold, `takingAmount` is USDC received.
+    pub fn matched_sell_fill_shares_and_avg_price(&self) -> Option<(f64, f64)> {
+        let mk = self.making_amount.as_ref()?.trim();
+        let tk = self.taking_amount.as_ref()?.trim();
+        if mk.is_empty() || tk.is_empty() {
+            return None;
+        }
+        let sell_sh = mk.parse::<f64>().ok()?;
+        let usdc = tk.parse::<f64>().ok()?;
+        if sell_sh <= 1e-12 || !usdc.is_finite() {
+            return None;
+        }
+        Some((sell_sh, usdc / sell_sh))
+    }
+
     /// If parsed shares are nonsense vs the submitted order (wrong field order, partial parse),
     /// fall back to request-sized estimates.
     fn parsed_buy_fill_plausible(parsed_sh: f64, req_shares: f64) -> bool {
@@ -223,6 +238,68 @@ impl PostOrderResponse {
             _ if self.success => Some((req_shares, req_limit_price, false)),
             _ => None,
         }
+    }
+
+    /// `(qty, avg_price)` to apply to [`crate::app::AppState`] **only for shares that actually
+    /// matched**. Resting limits (`live` / `open`) with no amounts must return `None` so the
+    /// Positions panel does not treat unfilled size as inventory.
+    pub fn fill_for_position_ack(
+        &self,
+        side: Side,
+        req_shares: f64,
+        req_price: f64,
+        order_type: OrderType,
+    ) -> Option<(f64, f64)> {
+        let from_api = match side {
+            Side::Buy => self.matched_buy_fill_shares_and_avg_price()
+                .filter(|(sh, _)| Self::parsed_buy_fill_plausible(*sh, req_shares)),
+            Side::Sell => self.matched_sell_fill_shares_and_avg_price()
+                .filter(|(sh, _)| Self::parsed_buy_fill_plausible(*sh, req_shares)),
+        };
+        if let Some(pair) = from_api {
+            return Some(pair);
+        }
+
+        let st = self.status.as_deref().map(|s| s.to_ascii_lowercase());
+        if matches!(st.as_deref(), Some("live") | Some("open")) {
+            return None;
+        }
+
+        if matches!(st.as_deref(), Some("matched") | Some("delayed")) {
+            return Some((req_shares, req_price));
+        }
+
+        if self.success && matches!(order_type, OrderType::Fak | OrderType::Fok) {
+            return Some((req_shares, req_price));
+        }
+
+        None
+    }
+
+    /// Like [`Self::fill_for_position_ack`], but for **FAK/FOK** prefer exchange-reported
+    /// `makingAmount` / `takingAmount` even when they diverge from the submitted size (rounding,
+    /// USDC-notional estimate vs actual fill). Still rejects obviously swapped fields.
+    pub fn fak_fill_for_position_ack(
+        &self,
+        side: Side,
+        req_shares: f64,
+        req_price: f64,
+    ) -> Option<(f64, f64)> {
+        let from_api = match side {
+            Side::Buy => self.matched_buy_fill_shares_and_avg_price(),
+            Side::Sell => self.matched_sell_fill_shares_and_avg_price(),
+        };
+        if let Some((sh, px)) = from_api {
+            if sh.is_finite()
+                && sh > 0.0
+                && px.is_finite()
+                && px > 0.0
+                && !(req_shares >= 0.05 && sh / req_shares < 1e-5)
+            {
+                return Some((sh, px));
+            }
+        }
+        self.fill_for_position_ack(side, req_shares, req_price, OrderType::Fak)
     }
 }
 
@@ -2097,6 +2174,99 @@ mod take_profit_fill_tests {
         assert!((o.0 - 10.0).abs() < 1e-9);
         assert!((o.1 - 0.55).abs() < 1e-9);
         assert!(!o.2);
+    }
+}
+
+#[cfg(test)]
+mod fill_for_position_ack_tests {
+    use super::{OrderType, PostOrderResponse, Side};
+
+    fn r(
+        success: bool,
+        status: Option<&str>,
+        making: Option<&str>,
+        taking: Option<&str>,
+    ) -> PostOrderResponse {
+        PostOrderResponse {
+            success,
+            order_id: None,
+            status: status.map(String::from),
+            making_amount: making.map(String::from),
+            taking_amount: taking.map(String::from),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn resting_limit_does_not_fake_position() {
+        let p = r(true, Some("live"), None, None);
+        assert!(p.fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Gtd).is_none());
+        let p = r(true, Some("open"), None, None);
+        assert!(p.fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd).is_none());
+    }
+
+    #[test]
+    fn matched_without_amounts_uses_submitted_size() {
+        let p = r(true, Some("matched"), None, None);
+        let (q, px) = p.fill_for_position_ack(Side::Buy, 12.0, 0.48, OrderType::Gtd).unwrap();
+        assert!((q - 12.0).abs() < 1e-9);
+        assert!((px - 0.48).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fak_success_without_status_still_updates_position() {
+        let p = PostOrderResponse {
+            success: true,
+            order_id: None,
+            status: None,
+            making_amount: None,
+            taking_amount: None,
+            error: None,
+        };
+        let (q, px) = p.fill_for_position_ack(Side::Buy, 4.0, 0.6, OrderType::Fak).unwrap();
+        assert!((q - 4.0).abs() < 1e-9);
+        assert!((px - 0.6).abs() < 1e-9);
+    }
+
+    #[test]
+    fn partial_fill_amounts_preferred_for_sell() {
+        let p = r(true, Some("live"), Some("2.0"), Some("0.9"));
+        let (q, px) = p.fill_for_position_ack(Side::Sell, 10.0, 0.5, OrderType::Gtd).unwrap();
+        assert!((q - 2.0).abs() < 1e-9);
+        assert!((px - 0.45).abs() < 1e-9);
+    }
+
+    /// Small but real `takingAmount` can fail `parsed_buy_fill_plausible` vs a large request; FAK path
+    /// still uses the exchange-reported shares.
+    #[test]
+    fn fak_buy_prefers_api_over_request_when_plausible_rejects_small_fill() {
+        let p = r(true, Some("matched"), Some("0.00025"), Some("0.0005"));
+        let strict = p.fill_for_position_ack(Side::Buy, 10.0, 0.5, OrderType::Fak).unwrap();
+        assert!((strict.0 - 10.0).abs() < 1e-9);
+        let loose = p.fak_fill_for_position_ack(Side::Buy, 10.0, 0.5).unwrap();
+        assert!((loose.0 - 0.0005).abs() < 1e-12);
+        assert!((loose.1 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fak_buy_uses_exact_taking_amount_vs_rough_request() {
+        let p = r(
+            true,
+            Some("matched"),
+            Some("5.04435025"),
+            Some("10.087"),
+        );
+        let (q, px) = p.fak_fill_for_position_ack(Side::Buy, 10.0, 0.5).unwrap();
+        assert!((q - 10.087).abs() < 1e-9);
+        assert!((px - 5.04435025 / 10.087).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fak_sell_uses_exact_making_amount() {
+        let p = r(true, Some("matched"), Some("10.087"), Some("5.04"));
+        let (q, px) = p.fak_fill_for_position_ack(Side::Sell, 10.0, 0.5).unwrap();
+        assert!((q - 10.087).abs() < 1e-9);
+        assert!((px - 5.04 / 10.087).abs() < 1e-9);
     }
 }
 

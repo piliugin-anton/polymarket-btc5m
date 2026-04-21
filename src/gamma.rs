@@ -1,8 +1,11 @@
 //! Gamma API client.
 //!
 //! Used exclusively for market *discovery*: the app’s Gamma poll task calls into
-//! this no-auth REST API (**60&nbsp;s** while the window is open, **1&nbsp;s** after
-//! `closes_at` until the next market appears; requests are mutex-serialized) to find the
+//! this no-auth REST API — **60&nbsp;s** while the window is open; **after** `closes_at` the
+//! discovery task polls only **`/markets/slug/btc-updown-5m-{start+300}`** (next window) once per
+//! second until the slug resolves (see [`crate::feeds::market_discovery_gamma`]) — no broad search.
+//! Requests are mutex-serialized. The initial lookup still uses a multi-slug search around
+//! “now” via [`GammaClient::find_current_btc_5m`]. Used to find the
 //! currently-active "Bitcoin Up or Down - 5m" market and extract
 //! the UP / DOWN token IDs, the tick size, neg_risk flag, and the "Price to Beat".
 //!
@@ -213,6 +216,46 @@ impl GammaClient {
                 )
             })?;
 
+        self.active_market_from_raw_with_crypto(market).await
+    }
+
+    /// `GET /markets/slug/btc-updown-5m-{window_start_ts}` only — for fast roll polling.
+    ///
+    /// Returns `Ok(None)` on 404 or if Gamma marks the market closed (not ready yet).
+    pub async fn try_fetch_btc_5m_by_window_start_ts(
+        &self,
+        window_start_ts: i64,
+    ) -> Result<Option<ActiveMarket>> {
+        let slug = format!("btc-updown-5m-{window_start_ts}");
+        let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
+        debug!(%url, "gamma: fetch next window by slug");
+
+        let resp = self
+            .http
+            .get(&url)
+            .send()
+            .await
+            .with_context(|| format!("gamma GET {url} failed"))?;
+
+        if resp.status() == StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+
+        let m: RawMarket = resp
+            .error_for_status()
+            .with_context(|| format!("gamma GET {url} bad status"))?
+            .json()
+            .await
+            .with_context(|| format!("gamma GET {url} decode failed"))?;
+
+        if m.closed {
+            return Ok(None);
+        }
+
+        self.active_market_from_raw_with_crypto(&m).await.map(Some)
+    }
+
+    async fn active_market_from_raw_with_crypto(&self, market: &RawMarket) -> Result<ActiveMarket> {
         let mut m = active_market_from_raw_market(market, None)?;
         let (win_start, win_end) = utc_five_minute_window_bounds(&m.slug, m.opens_at);
         m.opens_at = win_start;

@@ -1,7 +1,9 @@
 //! BTC 5m market discovery via **Gamma REST** (`find_current_btc_5m`).
 //!
-//! While the current 5m window is open we poll slowly; **after `closes_at`** we poll
-//! every second until Gamma returns a new window (then back to slow poll).
+//! While the current 5m window is open we poll slowly. **After `closes_at`** we only hit
+//! **`GET /markets/slug/btc-updown-5m-{previous_closes_at_unix}`** (the next 5m window, +300s from
+//! the last start) once per second until that slug returns 200 — no multi-slug search (faster
+//! than [`GammaClient::find_current_btc_5m`]). Then we return to the slow in-window poll.
 //! [`GammaClient`] is behind [`tokio::sync::Mutex`] so only one Gamma request runs at a time.
 //!
 //! The per-market order book still uses [`crate::feeds::clob_ws`] on a separate connection.
@@ -43,6 +45,40 @@ async fn try_roll_market(
     current_slug:   &mut Option<String>,
     last_window_end: &mut Option<DateTime<Utc>>,
 ) -> bool {
+    let after_close = last_window_end.is_some_and(|end| Utc::now() >= end);
+
+    // After the window ends, the next market always uses slug start = previous `closes_at`
+    // (5m step). Poll that single slug every second — avoids slow multi-candidate `find_current_btc_5m`.
+    if after_close {
+        if let Some(prev_end) = *last_window_end {
+            let next_window_start_ts = prev_end.timestamp();
+            loop {
+                let result = {
+                    let client = gamma.lock().await;
+                    client
+                        .try_fetch_btc_5m_by_window_start_ts(next_window_start_ts)
+                        .await
+                };
+
+                match result {
+                    Ok(Some(m)) => {
+                        *last_window_end = Some(m.closes_at);
+                        return apply_resolved_market(m, current_slug, market_tx).await;
+                    }
+                    Ok(None) => {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    Err(e) => {
+                        let _ = tx
+                            .send(AppEvent::OrderErr(format!("gamma: {e}")))
+                            .await;
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                }
+            }
+        }
+    }
+
     let result = {
         let client = gamma.lock().await;
         client.find_current_btc_5m().await

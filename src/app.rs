@@ -33,8 +33,10 @@ pub enum AppEvent {
     PositionsLoaded {
         position_up:   Position,
         position_down: Position,
-        /// Newest first, capped before send — merged into `fills` (session panel).
+        /// Capped before send — merged into `fills` and sorted by match time (newest first).
         fills_bootstrap: Vec<Fill>,
+        /// When false (background poll), keep the current status line (order hints, errors).
+        refresh_status_line: bool,
     },
     /// Resting orders for the active market (`GET /data/orders`).
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
@@ -141,6 +143,11 @@ pub struct AppState {
     pub position_down:  Position,
     pub realized_pnl:   f64,
 
+    /// Net long shares on UP token from FAK/ack path + resync on `PositionsLoaded` (for market SELL sizing).
+    pub fak_net_up:     f64,
+    /// Net long shares on DOWN token (same).
+    pub fak_net_down:   f64,
+
     pub fills:          VecDeque<Fill>,
     /// Resting limit orders on the active market (from CLOB).
     pub open_orders:    Vec<OpenOrderRow>,
@@ -174,7 +181,10 @@ impl AppState {
             market: None, btc_price: None, btc_price_ts: None,
             book_up: None, book_down: None,
             position_up: Default::default(), position_down: Default::default(),
-            realized_pnl: 0.0, fills: VecDeque::with_capacity(64),
+            realized_pnl: 0.0,
+            fak_net_up: 0.0,
+            fak_net_down: 0.0,
+            fills: VecDeque::with_capacity(64),
             open_orders: Vec::new(),
             status_line: "Waiting for market data…".into(),
             collateral_cash_usdc: None,
@@ -239,6 +249,13 @@ impl AppState {
         match outcome { Outcome::Up => &mut self.position_up, Outcome::Down => &mut self.position_down }
     }
 
+    fn fak_net_mut(&mut self, outcome: Outcome) -> &mut f64 {
+        match outcome {
+            Outcome::Up => &mut self.fak_net_up,
+            Outcome::Down => &mut self.fak_net_down,
+        }
+    }
+
     pub fn unrealized_pnl(&self, outcome: Outcome) -> f64 {
         let p = self.position(outcome);
         match self.mark(outcome) {
@@ -298,29 +315,36 @@ impl AppState {
                 self.book_up = None; self.book_down = None;
                 self.position_up = Default::default();
                 self.position_down = Default::default();
+                self.fak_net_up = 0.0;
+                self.fak_net_down = 0.0;
                 self.open_orders.clear();
             }
             AppEvent::PositionsLoaded {
                 position_up,
                 position_down,
                 fills_bootstrap,
+                refresh_status_line,
             } => {
                 self.position_up = position_up;
                 self.position_down = position_down;
                 self.fills.clear();
                 for f in fills_bootstrap {
-                    self.fills.push_front(f);
-                    if self.fills.len() > 64 {
-                        self.fills.pop_back();
-                    }
+                    self.fills.push_back(f);
                 }
-                self.status_line = format!(
-                    "Positions from CLOB — UP {:.2} @ {:.3} / DOWN {:.2} @ {:.3}",
-                    self.position_up.shares,
-                    self.position_up.avg_entry,
-                    self.position_down.shares,
-                    self.position_down.avg_entry,
-                );
+                trim_fills_to_cap(&mut self.fills, 64);
+                let nu = net_shares_from_fills(&self.fills, Outcome::Up).max(0.0);
+                let nd = net_shares_from_fills(&self.fills, Outcome::Down).max(0.0);
+                self.fak_net_up = self.position_up.shares.max(nu);
+                self.fak_net_down = self.position_down.shares.max(nd);
+                if refresh_status_line {
+                    self.status_line = format!(
+                        "Positions from CLOB — UP {:.2} @ {:.3} / DOWN {:.2} @ {:.3}",
+                        self.position_up.shares,
+                        self.position_up.avg_entry,
+                        self.position_down.shares,
+                        self.position_down.avg_entry,
+                    );
+                }
             }
             AppEvent::OpenOrdersLoaded { orders } => {
                 self.open_orders = orders;
@@ -332,10 +356,17 @@ impl AppState {
             AppEvent::OrderAck { side, outcome, qty, price } => {
                 let realized = self.position_mut(outcome).apply_fill(side, qty, price);
                 self.realized_pnl += realized;
-                self.fills.push_front(Fill {
+                match side {
+                    Side::Buy => *self.fak_net_mut(outcome) += qty,
+                    Side::Sell => {
+                        let v = self.fak_net_mut(outcome);
+                        *v = (*v - qty).max(0.0);
+                    }
+                }
+                self.fills.push_back(Fill {
                     ts: Utc::now(), side, outcome, qty, price, realized,
                 });
-                if self.fills.len() > 64 { self.fills.pop_back(); }
+                trim_fills_to_cap(&mut self.fills, 64);
                 self.status_line = format!("{} {qty:.2} {} @ {price:.3} ✓",
                     side_str(side), outcome.as_str());
             }
@@ -351,6 +382,20 @@ impl AppState {
 }
 
 fn side_str(s: Side) -> &'static str { match s { Side::Buy => "BUY", Side::Sell => "SELL" } }
+
+/// `VecDeque` front = latest `Fill::ts` (newest match time first).
+fn sort_fills_by_ts_desc(fills: &mut VecDeque<Fill>) {
+    let mut v: Vec<_> = fills.drain(..).collect();
+    v.sort_unstable_by(|a, b| b.ts.cmp(&a.ts));
+    fills.extend(v);
+}
+
+fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
+    sort_fills_by_ts_desc(fills);
+    while fills.len() > cap {
+        fills.pop_back();
+    }
+}
 
 fn parse_trade_timestamp(s: &str) -> DateTime<Utc> {
     let s = s.trim();
@@ -492,8 +537,12 @@ fn merge_chain_balance(
         return Position::default();
     }
 
+    // Trade replay can lag on-chain / POST rounding (e.g. buy fill vs USDC-notional estimate).
+    // Prefer the larger of replay and spendable+escrow so market SELL can flatten fully.
     let shares = if replay_ok {
-        replay.shares
+        replay
+            .shares
+            .max(if inventory_fallback > 1e-12 { inventory_fallback } else { 0.0 })
     } else if inventory_fallback > 1e-12 {
         inventory_fallback
     } else if data_shares > 1e-12 {
@@ -601,6 +650,21 @@ pub(crate) fn clamp_prob(p: f64) -> f64 {
     p.clamp(0.01, 0.99)
 }
 
+/// Net long shares for `outcome` from the session fill log (order of entries does not matter).
+pub fn net_shares_from_fills(fills: &VecDeque<Fill>, outcome: Outcome) -> f64 {
+    let mut net = 0.0f64;
+    for f in fills.iter() {
+        if f.outcome != outcome {
+            continue;
+        }
+        match f.side {
+            Side::Buy => net += f.qty,
+            Side::Sell => net -= f.qty,
+        }
+    }
+    net
+}
+
 /// Derive the OrderArgs + order_type we'd submit for a given user intent,
 /// given the current book.
 pub fn resolve_market_order(
@@ -627,11 +691,18 @@ pub fn resolve_market_order(
             let bid = state.best_bid(outcome)?;
             // Floor below best bid (`MARKET_SELL_SLIPPAGE_BPS`; `0` = no cushion).
             let price = clamp_prob(bid * (1.0 - slip));
-            // Dump **entire** tracked position (fills + CLOB sync). USDC field only sizes the
-            // order when we have no inventory in-app (e.g. before balance sync).
+            // Dump **entire** inventory: position (replay ∪ balance in merge) and fill-implied net,
+            // so we do not leave dust when VWAP state rounds below actual fills / wallet.
             let held = state.position(outcome).shares.max(0.0);
+            let fill_net = net_shares_from_fills(&state.fills, outcome).max(0.0);
+            let fak_net = match outcome {
+                Outcome::Up => state.fak_net_up,
+                Outcome::Down => state.fak_net_down,
+            }
+            .max(0.0);
             let want = (size / bid).max(0.01);
-            let shares = if held > 1e-9 { held } else { want };
+            let inventory = held.max(fill_net).max(fak_net);
+            let shares = if inventory > 1e-9 { inventory } else { want };
             if !shares.is_finite() || shares <= 0.0 {
                 return None;
             }
@@ -748,6 +819,43 @@ mod tests {
     }
 
     #[test]
+    fn market_sell_uses_fill_net_when_larger_than_position() {
+        let mut state = AppState::new(5.0);
+        state.book_up = Some(BookSnapshot {
+            asset_id: "1".into(),
+            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
+            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+        });
+        state.position_up.shares = 10.0;
+        state.fills.push_back(Fill {
+            ts: Utc::now(),
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            qty: 10.09,
+            price: 0.5,
+            realized: 0.0,
+        });
+        let (shares, _, _) =
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();
+        assert!((shares - 10.09).abs() < 1e-9);
+    }
+
+    #[test]
+    fn market_sell_uses_fak_net_when_larger_than_position_and_fills() {
+        let mut state = AppState::new(5.0);
+        state.book_up = Some(BookSnapshot {
+            asset_id: "1".into(),
+            bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
+            asks: vec![BookLevel { price: 0.51, size: 1000.0 }],
+        });
+        state.position_up.shares = 10.0;
+        state.fak_net_up = 10.11;
+        let (shares, _, _) =
+            resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();
+        assert!((shares - 10.11).abs() < 1e-9);
+    }
+
+    #[test]
     fn hydrate_sell_realized_in_fill() {
         let up = "111";
         let trades = vec![
@@ -777,6 +885,17 @@ mod tests {
         assert!((pu.shares - 10.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         assert!((pu.avg_entry - buy_cost / 10.0).abs() < 1e-6);
+    }
+
+    /// On-chain / allowance balance can slightly exceed summed trade sizes (rounding); size for exit uses the max.
+    #[test]
+    fn hydrate_replay_combined_with_higher_chain_inventory() {
+        let up = "111";
+        let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
+        let chain = 10.09;
+        let (pu, _, _) =
+            hydrate_positions_from_trades(&trades, up, "222", chain, 0.0, 0.0, 0.0, None, None);
+        assert!((pu.shares - 10.09).abs() < 1e-6);
     }
 
     #[test]
