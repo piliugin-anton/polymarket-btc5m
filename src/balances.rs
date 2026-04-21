@@ -17,7 +17,6 @@
 //! proxy-aware client from [`crate::net`].
 
 use std::collections::{HashMap, HashSet};
-use std::time::Duration;
 
 use alloy_primitives::{address, keccak256, Address, B256, U256};
 use alloy_sol_types::{sol, SolCall};
@@ -69,12 +68,11 @@ sol! {
 }
 
 /// HTTP client for Polygon RPC only — does not use `POLYMARKET_PROXY`.
+///
+/// Same HTTP/2 + keep-alive pooled connection as [`crate::net::reqwest_client`]; see
+/// [`crate::net::polygon_rpc_reqwest_client`].
 pub fn polygon_rpc_http_client() -> Result<Client> {
-    Client::builder()
-        .user_agent("polymarket-btc5m/0.1")
-        .timeout(Duration::from_secs(25))
-        .build()
-        .context("build direct Polygon RPC HTTP client")
+    crate::net::polygon_rpc_reqwest_client()
 }
 
 fn parent_collection_id() -> B256 {

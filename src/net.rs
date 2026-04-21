@@ -62,32 +62,47 @@ pub fn proxy_env() -> Option<String> {
     std::env::var("POLYMARKET_PROXY").ok().filter(|s| !s.is_empty())
 }
 
-/// Build a shared `reqwest::Client` with proxy support if configured.
+/// Shared HTTP/2 + TCP keep-alive + idle pool settings for long-lived HTTPS clients (JSON-RPC, REST).
 ///
-/// * **HTTP/2 only:** TLS ALPN is set to `h2` so all requests use one multiplexed connection per
-///   host where the server supports HTTP/2 (Polymarket APIs do). If TLS fails with “no protocol”,
-///   the endpoint may be HTTP/1-only — remove `http2_prior_knowledge` in that case.
-/// * **Pool:** `pool_idle_timeout(None)` keeps idle sockets in the pool; TCP keepalive below
-///   catches dead peers.
-/// * **HTTP/2 PING:** periodic pings while idle keep the HTTP/2 connection from going stale.
-pub fn reqwest_client() -> Result<reqwest::Client> {
-    use std::time::Duration;
-    let mut b = reqwest::Client::builder()
+/// * **HTTP/2:** `http2_prior_knowledge` — multiplexed requests per host when the server speaks `h2`.
+///   If TLS fails with “no protocol”, the origin may be HTTP/1-only — drop `http2_prior_knowledge` for that host.
+/// * **Pool:** `pool_idle_timeout(None)` keeps idle sockets in the pool.
+/// * **HTTP/2 PING** + **TCP keepalive** reduce stale connections.
+fn reqwest_shared_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .user_agent("polymarket-btc5m/0.1")
-        .timeout(Duration::from_secs(15))
+        .timeout(timeout)
         .http2_prior_knowledge()
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .http2_keep_alive_timeout(Duration::from_secs(10))
+        .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+        .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)
         .pool_idle_timeout(None)
-        .tcp_keepalive(Duration::from_secs(30))
-        .tcp_keepalive_interval(Duration::from_secs(15))
-        .tcp_keepalive_retries(3u32);
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .tcp_keepalive_interval(std::time::Duration::from_secs(15))
+        .tcp_keepalive_retries(3u32)
+}
+
+/// Build a shared `reqwest::Client` with proxy support if configured (`POLYMARKET_PROXY`).
+///
+/// Same pool / HTTP/2 behavior as [`polygon_rpc_reqwest_client`], plus optional proxy.
+pub fn reqwest_client() -> Result<reqwest::Client> {
+    use std::time::Duration;
+    let mut b = reqwest_shared_builder(Duration::from_secs(15));
     if let Some(p) = proxy_env() {
         let proxy = reqwest::Proxy::all(&p).context("invalid POLYMARKET_PROXY for reqwest")?;
         b = b.proxy(proxy);
     }
     b.build().context("build reqwest client")
+}
+
+/// `reqwest` client for `POLYGON_RPC_URL` only — **no** `POLYMARKET_PROXY`.
+///
+/// Reuses one keep-alive HTTP/2 connection (per RPC host) across periodic `eth_call` / JSON-RPC posts,
+/// matching [`reqwest_client`] pool settings with a longer timeout for slow RPCs.
+pub fn polygon_rpc_reqwest_client() -> Result<reqwest::Client> {
+    reqwest_shared_builder(std::time::Duration::from_secs(25))
+        .build()
+        .context("build Polygon RPC HTTP client")
 }
 
 /// Open a WebSocket connection, routing through `POLYMARKET_PROXY` if set.
