@@ -1322,6 +1322,16 @@ impl TradingClient {
                 args.buy_notional_usdc,
                 order_type,
             );
+            if maker_amount.is_zero() || taker_amount.is_zero() {
+                bail!(
+                    "order amounts invalid (both must be > 0): maker={maker_amount} taker={taker_amount} \
+                     side={} size={} price={} order_type={}",
+                    args.side.as_str(),
+                    args.size,
+                    args.price,
+                    order_type.as_str(),
+                );
+            }
 
             // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
             let ts_ms = chrono::Utc::now().timestamp_millis();
@@ -1920,7 +1930,21 @@ fn amounts_for(
             if raw_maker <= 0.0 || !raw_maker.is_finite() {
                 return (U256::ZERO, U256::ZERO);
             }
-            let raw_taker = round_down_f64(raw_maker * raw_price, USDC_DECIMALS);
+            let product = raw_maker * raw_price;
+            if product <= 0.0 || !product.is_finite() {
+                return (U256::ZERO, U256::ZERO);
+            }
+            // `round_down` to cents can wipe sub-cent notionals (e.g. 0.5 shares × $0.01 → $0.005 → $0.00).
+            // CLOB rejects with "maker and taker amounts must be higher than 0".
+            let mut raw_taker = round_down_f64(product, USDC_DECIMALS);
+            if raw_taker <= 0.0 {
+                raw_taker = round_up_f64(product, USDC_DECIMALS);
+            }
+            // `usdc_human_to_wire_micros` maps to whole cents; e.g. $0.004 rounds to 0¢.
+            let cents_wire = (raw_taker * 100.0).round() as i64;
+            if cents_wire == 0 && raw_taker > 0.0 {
+                raw_taker = 0.01;
+            }
             (
                 share_human_to_wire_micros(raw_maker),
                 usdc_human_to_wire_micros(raw_taker),
@@ -2386,5 +2410,27 @@ mod limit_gtd_buy_amounts_tests {
         let (mk, tk) = amounts_for(Side::Buy, 20.0, 0.40, "0.01", None, OrderType::Gtd);
         assert!(!mk.is_zero() && !tk.is_zero());
         assert_eq!(buy_implied_price_micros(mk, tk) % 10_000, 0);
+    }
+}
+
+#[cfg(test)]
+mod fak_market_sell_amounts_tests {
+    use super::{amounts_for, OrderType, Side};
+    use alloy_primitives::U256;
+
+    /// Sub-cent `price × shares` used to yield `takerAmount=0` on the wire (CLOB: amounts must be > 0).
+    #[test]
+    fn fak_sell_half_share_at_one_cent_rounds_taker_to_one_cent() {
+        let (mk, tk) = amounts_for(Side::Sell, 0.5, 0.01, "0.01", None, OrderType::Fak);
+        assert!(!mk.is_zero() && !tk.is_zero());
+        assert_eq!(tk, U256::from(10_000u64), "taker should be $0.01 in 1e6 micros");
+    }
+
+    #[test]
+    fn fak_sell_four_mils_usdc_rounds_to_one_cent() {
+        // 0.04 × $0.10 = $0.004 → 0¢ if rounded naively; must still be non-zero.
+        let (mk, tk) = amounts_for(Side::Sell, 0.04, 0.10, "0.01", None, OrderType::Fak);
+        assert!(!mk.is_zero() && !tk.is_zero());
+        assert_eq!(tk, U256::from(10_000u64));
     }
 }
