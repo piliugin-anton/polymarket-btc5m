@@ -386,6 +386,7 @@ async fn main() -> Result<()> {
             let up2 = m.up_token_id.clone();
             let down2 = m.down_token_id.clone();
             let cond2 = m.condition_id.clone();
+            let user_poll = data_api_user;
             orders_poll = Some(tokio::spawn(async move {
                 let mut interval = tokio::time::interval(Duration::from_secs(5));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -400,6 +401,33 @@ async fn main() -> Result<()> {
                         Ok(rows) => {
                             // Open orders alone do not tell us what filled; replay trades like the
                             // initial market load so Fills + Positions track resting matches.
+                            let (data_api_up, data_api_down) = match net::reqwest_client() {
+                                Ok(http) => match crate::data_api::fetch_positions_for_market(
+                                    &http,
+                                    user_poll,
+                                    &cond2,
+                                )
+                                .await
+                                {
+                                    Ok(api_rows) => crate::data_api::positions_size_avg_for_tokens(
+                                        &api_rows,
+                                        &up2,
+                                        &down2,
+                                    ),
+                                    Err(e) => {
+                                        debug!(
+                                            error = %e,
+                                            market = %cond2,
+                                            "poll: data-api GET /positions (market) failed"
+                                        );
+                                        (None, None)
+                                    }
+                                }
+                                Err(e) => {
+                                    debug!(error = %e, "poll: reqwest client for data-api positions");
+                                    (None, None)
+                                }
+                            };
                             let (escrow_up, escrow_down) =
                                 escrow_sell_shares_from_clob_orders(&rows, &up2, &down2);
                             let up_bal = cli
@@ -436,8 +464,8 @@ async fn main() -> Result<()> {
                                     down_bal,
                                     escrow_up,
                                     escrow_down,
-                                    None,
-                                    None,
+                                    data_api_up,
+                                    data_api_down,
                                 );
                             let _ = txp2
                                 .send(AppEvent::PositionsLoaded {
