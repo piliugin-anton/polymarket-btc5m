@@ -84,7 +84,9 @@ struct RawEvent {
     slug:      String,
     #[serde(default, rename = "startDate")] start_date: Option<String>,
     #[serde(default, rename = "endDate")]   end_date:   Option<String>,
-    #[serde(default)] markets:   Vec<RawMarket>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    markets: Vec<RawMarket>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -292,16 +294,6 @@ fn floor_utc_to_five_minutes(t: DateTime<Utc>) -> DateTime<Utc> {
 fn gamma_market_window_start(m: &RawMarket) -> Option<DateTime<Utc>> {
     parse_ts(m.event_start_time.as_deref())
         .or_else(|| parse_ts(m.start_date.as_deref()))
-}
-
-/// Maps a Gamma `RawEvent` + its first open market to [`ActiveMarket`].
-fn active_market_from_raw_event(event: &RawEvent) -> Result<ActiveMarket> {
-    let m = event
-        .markets
-        .iter()
-        .find(|m| !m.closed)
-        .ok_or_else(|| anyhow!("event has no open markets"))?;
-    active_market_from_raw_market(m, Some(event))
 }
 
 fn active_market_from_raw_market(m: &RawMarket, event: Option<&RawEvent>) -> Result<ActiveMarket> {
