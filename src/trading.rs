@@ -600,11 +600,6 @@ impl FillWaitRegistry {
         rx
     }
 
-    pub async fn dispatch_from_ws_text(&self, txt: &str) {
-        let values = parse_user_channel_values(txt);
-        self.dispatch_trades_in_values(&values).await;
-    }
-
     /// Forward user-channel `trade` events only (ignores `order` payloads).
     pub async fn dispatch_trades_in_values(&self, values: &[serde_json::Value]) {
         for v in values {
@@ -2806,7 +2801,7 @@ mod fak_market_sell_amounts_tests {
 
 #[cfg(test)]
 mod fill_wait_registry_tests {
-    use super::FillWaitRegistry;
+    use super::{parse_user_channel_values, FillWaitRegistry};
 
     #[tokio::test]
     async fn dispatch_ws_trade_notifies_taker_order_waiter() {
@@ -2816,7 +2811,8 @@ mod fill_wait_registry_tests {
         let sample = format!(
             r#"{{"event_type":"trade","taker_order_id":"{oid}","size":"10","status":"MATCHED","asset_id":"52114319501245915516"}}"#
         );
-        r.dispatch_from_ws_text(&sample).await;
+        let values = parse_user_channel_values(&sample);
+        r.dispatch_trades_in_values(&values).await;
         let fill = rx.await.expect("oneshot");
         assert!((fill.size_shares - 10.0).abs() < 1e-9);
         assert_eq!(fill.status, "MATCHED");
