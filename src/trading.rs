@@ -1238,10 +1238,16 @@ impl TradingClient {
         Ok((cash, cashout))
     }
 
-    /// All trades for `condition_id` (Gamma `conditionId` / CLOB `market`), paginated like TS `getTrades`.
+    /// Trades for the authenticated account in `condition_id` (Gamma `conditionId` / CLOB `market`),
+    /// paginated like TS `getTrades`.
+    ///
+    /// **`maker_address` is required** for correct scoping: with only `market`, the CLOB may return
+    /// market-wide fills; replaying those produces phantom positions and trade rows (see Polymarket
+    /// `TradeParams.maker_address` / py-clob `add_query_trade_params`).
     pub async fn fetch_trades_for_market(&self, condition_id: &str) -> Result<Vec<ClobTrade>> {
         let creds = self.ensure_creds().await?;
         let path = "/data/trades";
+        let maker = format!("{:#x}", self.signer.address());
         let mut cursor = TRADES_INITIAL_CURSOR.to_string();
         let mut out = Vec::new();
         loop {
@@ -1249,6 +1255,7 @@ impl TradingClient {
             let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
                 .context("parse /data/trades URL")?;
             url.query_pairs_mut()
+                .append_pair("maker_address", &maker)
                 .append_pair("market", condition_id)
                 .append_pair("next_cursor", &cursor);
             let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
