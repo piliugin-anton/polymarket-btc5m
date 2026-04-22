@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
+use std::time::{Duration, Instant};
 
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
@@ -20,6 +21,16 @@ use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
 pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
+
+/// How long an [`AppState::order_error_toast`] stays visible.
+pub const ORDER_ERROR_TOAST_TTL: Duration = Duration::from_secs(10);
+
+/// Non-modal order error notification (see [`ORDER_ERROR_TOAST_TTL`]).
+#[derive(Debug, Clone)]
+pub struct OrderErrorToast {
+    pub message: String,
+    pub until:   Instant,
+}
 
 // ── Public event enum ───────────────────────────────────────────────
 
@@ -46,7 +57,7 @@ pub enum AppEvent {
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
     /// Non-blocking status line only (no modal).
     OrderErr(String),
-    /// Order placement / cancel failures: centered modal + status line (Enter dismisses).
+    /// Order placement / cancel failures: bottom-right toast + status line (auto-dismiss).
     OrderErrModal(String),
     /// Status line update without the `✗` prefix (e.g. claim hint).
     StatusInfo(String),
@@ -171,8 +182,8 @@ pub struct AppState {
 
     pub input_mode:        InputMode,
 
-    /// When set, a centered error dialog is drawn on top; Enter clears it.
-    pub error_dialog:      Option<String>,
+    /// When set, a bottom-right toast is drawn; keys are not blocked. Expires after [`ORDER_ERROR_TOAST_TTL`].
+    pub order_error_toast: Option<OrderErrorToast>,
 }
 
 impl AppState {
@@ -195,7 +206,7 @@ impl AppState {
             limit_price_input: String::new(),
             limit_size_input:  String::new(),
             input_mode: InputMode::Normal,
-            error_dialog: None,
+            order_error_toast: None,
         }
     }
 
@@ -282,7 +293,15 @@ impl AppState {
     // ── Mutations ───────────────────────────────────────────────────
     pub fn apply(&mut self, ev: AppEvent) {
         match ev {
-            AppEvent::Tick => {}
+            AppEvent::Tick => {
+                if self
+                    .order_error_toast
+                    .as_ref()
+                    .is_some_and(|t| Instant::now() >= t.until)
+                {
+                    self.order_error_toast = None;
+                }
+            }
             AppEvent::Price(p) => {
                 self.btc_price    = Some(p.price);
                 self.btc_price_ts = chrono::DateTime::<Utc>::from_timestamp_millis(p.timestamp_ms as i64);
@@ -308,7 +327,7 @@ impl AppState {
                 // We keep realized_pnl but zero out live positions for the new market.
                 // Return to normal keys (u/d/…) — otherwise `s` / limit modal survives a roll.
                 self.input_mode = InputMode::Normal;
-                self.error_dialog = None;
+                self.order_error_toast = None;
                 self.status_line = format!("New market: {}", m.question);
                 self.latched_price_to_beat = None;
                 self.market = Some(m);
@@ -373,8 +392,11 @@ impl AppState {
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
             AppEvent::OrderErrModal(e) => {
                 self.status_line = format!("✗ {e}");
-                self.error_dialog = Some(e);
-            },
+                self.order_error_toast = Some(OrderErrorToast {
+                    message: e,
+                    until:   Instant::now() + ORDER_ERROR_TOAST_TTL,
+                });
+            }
             AppEvent::StatusInfo(msg) => self.status_line = msg,
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }

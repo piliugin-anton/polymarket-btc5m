@@ -81,17 +81,6 @@ fn apply_app_event(
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
-            if state.error_dialog.is_some() {
-                // Modal: only Enter dismisses; every other key (incl. Ctrl-C/Esc) is swallowed.
-                let dismiss = matches!(
-                    k.code,
-                    KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n')
-                );
-                if dismiss {
-                    state.error_dialog = None;
-                }
-                return false;
-            }
             let action = events::handle_key(state, k);
             if matches!(action, Action::Quit) {
                 return true;

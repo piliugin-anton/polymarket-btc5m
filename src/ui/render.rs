@@ -14,6 +14,8 @@ use ratatui::{
     widgets::{Block, Borders, Paragraph, Row, Table, Wrap, BorderType, Cell, Clear},
 };
 
+use std::time::Instant;
+
 use crate::app::{AppState, InputMode, LimitField, Outcome};
 
 pub fn draw(f: &mut Frame, s: &AppState) {
@@ -35,8 +37,10 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     if let InputMode::LimitModal { outcome, side, field } = s.input_mode {
         draw_limit_modal(f, area, s, outcome, side, field);
     }
-    if let Some(ref err) = s.error_dialog {
-        draw_error_dialog(f, area, err);
+    if let Some(ref t) = s.order_error_toast {
+        if Instant::now() < t.until {
+            draw_order_error_toast(f, area, t.message.as_str());
+        }
     }
 }
 
@@ -369,12 +373,19 @@ fn key(k: &str, label: &str) -> Span<'static> {
 }
 fn sep() -> Span<'static> { Span::styled("  ", Style::default()) }
 
-// ── Error dialog (top layer; Enter dismisses in main) ───────────────
-fn draw_error_dialog(f: &mut Frame, screen: Rect, message: &str) {
-    let max_inner_w = screen.width.saturating_sub(6).max(24);
-    let box_w = (max_inner_w + 4).min(screen.width);
-    let box_h = (screen.height.saturating_sub(4).min(22)).max(7).saturating_sub(2);
-    let area = centered(screen, box_w, box_h);
+// ── Order error toast (bottom-right; non-blocking) ───────────────────
+fn draw_order_error_toast(f: &mut Frame, screen: Rect, message: &str) {
+    let margin = 1u16;
+    let max_box_w = screen.width.saturating_sub(margin * 2).min(50).max(24);
+    let inner_w = (max_box_w as usize).saturating_sub(2).max(8);
+    let nchars = message.chars().count();
+    let nlines = nchars
+        .saturating_add(inner_w.saturating_sub(1))
+        / inner_w
+        .max(1);
+    let content_lines = (nlines as u16).max(1).min(5);
+    let box_h = (2u16 + content_lines).min(screen.height.saturating_sub(margin * 2));
+    let area = bottom_right_rect(screen, max_box_w, box_h, margin);
     f.render_widget(Clear, area);
     let dialog_bg = Color::Rgb(48, 24, 28);
     let border_style = Style::default()
@@ -384,22 +395,16 @@ fn draw_error_dialog(f: &mut Frame, screen: Rect, message: &str) {
     let text_style = Style::default().fg(Color::Rgb(255, 235, 235)).bg(dialog_bg);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
-        .title(Span::styled(" Error ", text_style.add_modifier(Modifier::BOLD)))
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(" Order error ", text_style.add_modifier(Modifier::BOLD)))
         .border_style(border_style)
         .style(Style::default().bg(dialog_bg));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let hint = Line::from(vec![
-        Span::styled(" enter ", Style::default().fg(Color::Rgb(180, 180, 190)).bg(dialog_bg)),
-        Span::styled("close", Style::default().fg(Color::Rgb(248, 248, 252)).bg(dialog_bg)),
-    ]);
-    let rows = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).split(inner);
     let p = Paragraph::new(message)
         .style(text_style)
         .wrap(Wrap { trim: true });
-    f.render_widget(p, rows[0]);
-    f.render_widget(Paragraph::new(hint).alignment(Alignment::Center), rows[1]);
+    f.render_widget(p, inner);
 }
 
 // ── Limit modal ─────────────────────────────────────────────────────
@@ -496,6 +501,13 @@ fn centered(area: Rect, w: u16, h: u16) -> Rect {
     let x = area.x + area.width.saturating_sub(w) / 2;
     let y = area.y + area.height.saturating_sub(h) / 2;
     Rect { x, y, width: w.min(area.width), height: h.min(area.height) }
+}
+fn bottom_right_rect(screen: Rect, w: u16, h: u16, margin: u16) -> Rect {
+    let w = w.min(screen.width.saturating_sub(margin * 2).max(1));
+    let h = h.min(screen.height.saturating_sub(margin * 2).max(1));
+    let x = screen.x + screen.width.saturating_sub(w + margin);
+    let y = screen.y + screen.height.saturating_sub(h + margin);
+    Rect { x, y, width: w, height: h }
 }
 fn fmt_money(v: f64) -> String {
     // e.g. 67_432.51
