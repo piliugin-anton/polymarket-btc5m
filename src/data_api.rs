@@ -145,6 +145,9 @@ pub fn positions_size_avg_for_tokens(
 
 // ── Top holders (`GET /holders`) — sentiment proxy (sums are capped at API `limit` per outcome) ──
 
+/// Per-outcome holder rows to request (Polymarket allows up to 20; we use 5).
+pub const HOLDERS_REQUEST_LIMIT: u32 = 5;
+
 #[derive(Debug, Clone, Deserialize)]
 struct MetaHolder {
     token:   String,
@@ -157,9 +160,8 @@ struct HolderRow {
     amount: f64,
 }
 
-/// `GET /holders?market=<conditionId>&limit=20` — sums [`HolderRow::amount`] per outcome token.
-///
-/// Polymarket caps `limit` at 20 per token; totals are **top-holder** sums, not full open interest.
+/// `GET /holders?market=<conditionId>&limit=[`HOLDERS_REQUEST_LIMIT`]` — sums [`HolderRow::amount`]
+/// per outcome token. Totals are **top-N holder** sums (not full open interest).
 pub async fn fetch_top_holders_amount_sums(
     http: &reqwest::Client,
     market_condition_id: &str,
@@ -167,8 +169,9 @@ pub async fn fetch_top_holders_amount_sums(
     down_token_id: &str,
 ) -> Result<(f64, f64)> {
     let url = format!(
-        "{DATA_API_HOST}/holders?market={}&limit=20",
-        market_condition_id
+        "{DATA_API_HOST}/holders?market={}&limit={}",
+        market_condition_id,
+        HOLDERS_REQUEST_LIMIT
     );
     let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
     let status = resp.status();
