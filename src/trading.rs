@@ -1082,8 +1082,10 @@ impl TradingClient {
         min_executable: f64,
         buy_order_id: Option<&str>,
     ) -> Result<f64> {
-        const MAX_ATTEMPTS: u32 = 40;
-        const DELAY_MS: u64 = 250;
+        /// Shorter interval than legacy 250ms: take-profit should post as soon as CLOB/balance agree.
+        const DELAY_MS: u64 = 100;
+        /// Worst-case wall time if every iteration sleeps once (~10s, same ballpark as 40×250ms).
+        const MAX_ATTEMPTS: u32 = 100;
         if !want_shares.is_finite() || want_shares <= 0.0 {
             return self.fetch_conditional_balance_shares_impl(token_id, true).await;
         }
@@ -1094,24 +1096,35 @@ impl TradingClient {
         let require_trade_for_order = buy_order_id.is_some_and(|s| !s.trim().is_empty());
 
         for attempt in 0..MAX_ATTEMPTS {
-            let bal = self.fetch_conditional_balance_shares_impl(token_id, true).await?;
-            let trades = self.fetch_trades_for_market(condition_id).await?;
-            let order_fill = match buy_order_id {
-                Some(oid) if !oid.trim().is_empty() => {
-                    buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
+            // When we must see the BUY `orderID` in `/data/trades`, polling balance every tick only
+            // adds an extra RTT. Fetch trades first; once the fill row exists, read balance once.
+            // Otherwise: one round-trip via parallel balance + trades.
+            let (bal, trades, order_fill) = if require_trade_for_order {
+                let trades = self.fetch_trades_for_market(condition_id).await?;
+                let order_fill = match buy_order_id {
+                    Some(oid) if !oid.trim().is_empty() => {
+                        buy_fill_shares_from_trades_for_order(&trades, oid, token_id)
+                    }
+                    _ => None,
+                };
+                if order_fill.is_none() {
+                    tracing::debug!(
+                        attempt,
+                        buy_order_id = ?buy_order_id,
+                        "take-profit: waiting for BUY orderID to appear in /data/trades"
+                    );
+                    tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
+                    continue;
                 }
-                _ => None,
+                let bal = self.fetch_conditional_balance_shares_impl(token_id, true).await?;
+                (bal, trades, order_fill)
+            } else {
+                let (bal, trades) = tokio::try_join!(
+                    self.fetch_conditional_balance_shares_impl(token_id, true),
+                    self.fetch_trades_for_market(condition_id),
+                )?;
+                (bal, trades, None)
             };
-
-            if require_trade_for_order && order_fill.is_none() {
-                tracing::debug!(
-                    attempt,
-                    buy_order_id = ?buy_order_id,
-                    "take-profit: waiting for BUY orderID to appear in /data/trades"
-                );
-                tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
-                continue;
-            }
 
             let need_for_cap = order_fill
                 .map(|f| want_shares.min(f))
@@ -1157,7 +1170,6 @@ impl TradingClient {
             tokio::time::sleep(std::time::Duration::from_millis(DELAY_MS)).await;
         }
 
-        let bal = self.fetch_conditional_balance_shares(token_id).await?;
         let trades = self.fetch_trades_for_market(condition_id).await?;
         let order_fill = match buy_order_id {
             Some(oid) if !oid.trim().is_empty() => {
@@ -1172,6 +1184,7 @@ impl TradingClient {
                 u64::from(MAX_ATTEMPTS) * DELAY_MS
             ));
         }
+        let bal = self.fetch_conditional_balance_shares(token_id).await?;
         let need_for_cap = order_fill
             .map(|f| want_shares.min(f))
             .unwrap_or(want_shares);
