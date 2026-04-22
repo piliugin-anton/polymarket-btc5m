@@ -88,10 +88,22 @@ fn draw_balance_panel(f: &mut Frame, area: Rect, s: &AppState) {
 
 fn draw_wizard(f: &mut Frame, s: &AppState) {
     let area = f.area();
+    let wizard_title = match s.ui_phase {
+        UiPhase::WizardLoading => " Select market — Polymarket ".to_string(),
+        UiPhase::WizardPickAsset | UiPhase::WizardPickTimeframe => {
+            let sym = s
+                .wizard_rows
+                .get(s.wizard_list_idx)
+                .map(|r| r.asset.label)
+                .unwrap_or("…");
+            format!(" Select market - {sym} ")
+        }
+        UiPhase::Trading => " Select market — Polymarket ".to_string(),
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
-        .title(" Select market — Polymarket ");
+        .title(wizard_title.as_str());
     f.render_widget(Clear, area);
     let inner = block.inner(area);
     f.render_widget(block, area);
