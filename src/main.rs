@@ -16,6 +16,7 @@
 
 mod app;
 mod balances;
+mod bridge_deposit;
 mod config;
 mod fees;
 mod data_api;
@@ -783,6 +784,38 @@ fn dispatch_action(
         Action::ForceMarketRoll  => { /* market watcher polls every 10s; r is a no-op for now */ }
         Action::Claim => {
             spawn_claim(tx.clone(), cfg.clone());
+        }
+        Action::FetchSolanaDeposit => {
+            let tx = tx.clone();
+            let funder = cfg.funder;
+            tokio::spawn(async move {
+                let client = match net::reqwest_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SolanaDepositFailed(e.to_string())).await;
+                        return;
+                    }
+                };
+                match bridge_deposit::fetch_svm_deposit_address(&client, funder).await {
+                    Ok(svm) => {
+                        let pay_url = bridge_deposit::solana_pay_transfer_url(
+                            &svm,
+                            bridge_deposit::SOLANA_MAINNET_USDC_MINT,
+                        );
+                        let qr_unicode = bridge_deposit::svm_address_qr_unicode(&pay_url)
+                            .unwrap_or_else(|e| format!("(QR error: {e})"));
+                        let _ = tx
+                            .send(AppEvent::SolanaDepositFetched {
+                                svm_address: svm,
+                                qr_unicode,
+                            })
+                            .await;
+                    }
+                    Err(e) => {
+                        let _ = tx.send(AppEvent::SolanaDepositFailed(e.to_string())).await;
+                    }
+                }
+            });
         }
         Action::CancelAll        => {
             let t  = trading.clone();

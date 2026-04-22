@@ -61,6 +61,9 @@ pub enum AppEvent {
     OrderErrModal(String),
     /// Status line update without the `✗` prefix (e.g. claim hint).
     StatusInfo(String),
+    /// `POST https://bridge.polymarket.com/deposit` → Solana (`svm`) address + terminal QR art.
+    SolanaDepositFetched { svm_address: String, qr_unicode: String },
+    SolanaDepositFailed(String),
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
@@ -140,6 +143,14 @@ pub enum InputMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LimitField { Price, Size }
 
+/// Center-screen Polymarket Bridge Solana USDC deposit dialog (`f` key).
+#[derive(Debug, Clone)]
+pub enum DepositModalPhase {
+    Loading,
+    Ready { svm_address: String, qr_unicode: String },
+    Failed(String),
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub market:         Option<ActiveMarket>,
@@ -184,6 +195,9 @@ pub struct AppState {
 
     /// When set, a bottom-right toast is drawn; keys are not blocked. Expires after [`ORDER_ERROR_TOAST_TTL`].
     pub order_error_toast: Option<OrderErrorToast>,
+
+    /// `f` — Solana USDC deposit address + QR (Bridge API).
+    pub deposit_modal: Option<DepositModalPhase>,
 }
 
 impl AppState {
@@ -207,6 +221,7 @@ impl AppState {
             limit_size_input:  String::new(),
             input_mode: InputMode::Normal,
             order_error_toast: None,
+            deposit_modal: None,
         }
     }
 
@@ -326,6 +341,7 @@ impl AppState {
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
                 // Return to normal keys (u/d/…) — otherwise `s` / limit modal survives a roll.
+                // Deposit modal (`f`) stays open across rolls.
                 self.input_mode = InputMode::Normal;
                 self.order_error_toast = None;
                 self.status_line = format!("New market: {}", m.question);
@@ -398,6 +414,19 @@ impl AppState {
                 });
             }
             AppEvent::StatusInfo(msg) => self.status_line = msg,
+            AppEvent::SolanaDepositFetched { svm_address, qr_unicode } => {
+                if matches!(self.deposit_modal, Some(DepositModalPhase::Loading)) {
+                    self.deposit_modal = Some(DepositModalPhase::Ready {
+                        svm_address,
+                        qr_unicode,
+                    });
+                }
+            }
+            AppEvent::SolanaDepositFailed(msg) => {
+                if matches!(self.deposit_modal, Some(DepositModalPhase::Loading)) {
+                    self.deposit_modal = Some(DepositModalPhase::Failed(msg));
+                }
+            }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
     }

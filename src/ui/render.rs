@@ -16,7 +16,8 @@ use ratatui::{
 
 use std::time::Instant;
 
-use crate::app::{AppState, InputMode, LimitField, Outcome};
+use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome};
+use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
     let area = f.area();
@@ -36,6 +37,9 @@ pub fn draw(f: &mut Frame, s: &AppState) {
 
     if let InputMode::LimitModal { outcome, side, field } = s.input_mode {
         draw_limit_modal(f, area, s, outcome, side, field);
+    }
+    if let Some(ref phase) = s.deposit_modal {
+        draw_deposit_modal(f, area, phase);
     }
     if let Some(ref t) = s.order_error_toast {
         if Instant::now() < t.until {
@@ -354,6 +358,7 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("l", "limit"), sep(),
         key("c", "cancel all"), sep(),
         key("x", "redeem all"), sep(),
+        key("f", "SOL USDC dep"), sep(),
         key("s", "resize"), sep(),
         key("q", "quit"),
     ]);
@@ -494,6 +499,240 @@ fn draw_limit_modal(f: &mut Frame, screen: Rect, s: &AppState,
         ])),
         rows[4],
     );
+}
+
+// ── Solana USDC deposit modal (`f`) ─────────────────────────────────
+fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
+    let dialog_bg = Color::Rgb(18, 42, 82);
+    let border_style = Style::default()
+        .fg(Color::Rgb(160, 210, 255))
+        .bg(dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let text_main = Style::default().fg(Color::Rgb(235, 244, 255)).bg(dialog_bg);
+    let text_muted = Style::default().fg(Color::Rgb(150, 175, 215)).bg(dialog_bg);
+    let text_warn = Style::default().fg(Color::Rgb(255, 220, 140)).bg(dialog_bg);
+
+    match phase {
+        DepositModalPhase::Loading => {
+            let area = centered(screen, 52, 7);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(" Solana USDC deposit ", text_main.add_modifier(Modifier::BOLD)))
+                .border_style(border_style)
+                .style(Style::default().bg(dialog_bg));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let lines = vec![
+                Line::from(""),
+                Line::from(Span::styled(
+                    "Requesting deposit address from bridge…",
+                    text_muted,
+                )),
+            ];
+            f.render_widget(
+                Paragraph::new(lines).alignment(Alignment::Center),
+                inner,
+            );
+        }
+        DepositModalPhase::Failed(msg) => {
+            let inner_w = (screen.width.saturating_sub(8).min(58).max(40)) as usize;
+            let wrapped = wrap_deposit_error(msg, inner_w);
+            let n = wrapped.len().max(1) as u16;
+            let h = (6 + n).min(screen.height.saturating_sub(2)).max(8);
+            let w = (inner_w as u16) + 4;
+            let area = centered(screen, w, h);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .title(Span::styled(" Solana deposit — error ", text_warn.add_modifier(Modifier::BOLD)))
+                .border_style(border_style)
+                .style(Style::default().bg(dialog_bg));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+            let mut lines: Vec<Line> = vec![Line::from("")];
+            for line in wrapped {
+                lines.push(Line::from(Span::styled(line, text_main)));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("esc  close", text_muted)));
+            f.render_widget(
+                Paragraph::new(lines)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
+                inner,
+            );
+        }
+        DepositModalPhase::Ready { svm_address, qr_unicode } => {
+            let qr_lines: Vec<&str> = qr_unicode.lines().collect();
+            let qr_h = qr_lines.len().max(1) as u16;
+            let qr_w = qr_lines
+                .iter()
+                .map(|l| l.chars().count())
+                .max()
+                .unwrap_or(20) as u16;
+            // Header copy must fit narrow widths; inner width ≈ w − 2 (borders).
+            let w = (qr_w + 8)
+                .max(58)
+                .max(44 + 6 + 4)
+                .min(screen.width.saturating_sub(4));
+            let inner_w = w.saturating_sub(2).max(12) as usize;
+            let mint_with_label = format!("Mint: {SOLANA_MAINNET_USDC_MINT}");
+            let send_hint = "Send USDC from Solana to the address below or scan the QR.";
+            let header_wrapped_lines: u16 = (word_wrap_line_count("Network: Solana (SPL)", inner_w)
+                + word_wrap_line_count("Token: USDC only (Solana SPL)", inner_w)
+                + word_wrap_line_count(&mint_with_label, inner_w)
+                + word_wrap_line_count(send_hint, inner_w)
+                + 1)
+                .max(5) as u16; // trailing blank
+            let head_h = header_wrapped_lines;
+            let foot_h = 3u16;
+            let h = (head_h + qr_h + foot_h + 2)
+                .min(screen.height.saturating_sub(2))
+                .max(12);
+            let area = centered(screen, w, h);
+            f.render_widget(Clear, area);
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Double)
+                .title(Span::styled(
+                    " Solana blockchain — USDC deposit ",
+                    text_main.add_modifier(Modifier::BOLD),
+                ))
+                .border_style(border_style)
+                .style(Style::default().bg(dialog_bg));
+            let inner = block.inner(area);
+            f.render_widget(block, area);
+
+            let chunks = Layout::vertical([
+                Constraint::Length(head_h),
+                Constraint::Length(qr_h),
+                Constraint::Length(foot_h),
+                Constraint::Min(0),
+            ])
+            .split(inner);
+
+            let mint_style = Style::default()
+                .fg(Color::Rgb(190, 230, 255))
+                .bg(dialog_bg);
+            let header: Vec<Line> = [
+                Line::from(vec![
+                    Span::styled("Network: ", text_muted),
+                    Span::styled("Solana (SPL)", text_warn.add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Token: ", text_muted),
+                    Span::styled("USDC only (Solana SPL)", text_main.add_modifier(Modifier::BOLD)),
+                ]),
+                Line::from(vec![
+                    Span::styled("Mint: ", text_muted),
+                    Span::styled(SOLANA_MAINNET_USDC_MINT, mint_style),
+                ]),
+                Line::from(Span::styled(send_hint, text_muted)),
+                Line::from(""),
+            ]
+            .into_iter()
+            .collect();
+            f.render_widget(
+                Paragraph::new(header)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: true }),
+                chunks[0],
+            );
+
+            let qr_spans: Vec<Line> = qr_lines
+                .iter()
+                .map(|l| {
+                    Line::from(Span::styled(
+                        *l,
+                        Style::default()
+                            .fg(Color::Rgb(240, 248, 255))
+                            .bg(dialog_bg),
+                    ))
+                })
+                .collect();
+            f.render_widget(
+                Paragraph::new(qr_spans).alignment(Alignment::Center),
+                chunks[1],
+            );
+
+            let footer = vec![
+                Line::from(Span::styled(svm_address.as_str(), text_main.add_modifier(Modifier::BOLD))),
+                Line::from(""),
+                Line::from(vec![
+                    Span::styled("esc ", text_muted),
+                    Span::styled("close  ", text_main),
+                    Span::styled("f ", text_muted),
+                    Span::styled("refresh", text_main),
+                ]),
+            ];
+            f.render_widget(
+                Paragraph::new(footer)
+                    .alignment(Alignment::Center)
+                    .wrap(Wrap { trim: false }),
+                chunks[2],
+            );
+        }
+    }
+}
+
+/// Word-wrap for layout height (long tokens split by character width, like ratatui `Wrap`).
+fn wrap_deposit_words_to_lines(text: &str, width: usize) -> Vec<String> {
+    let w = width.max(1);
+    let mut out: Vec<String> = Vec::new();
+    for raw in text.split_whitespace() {
+        let wl = raw.chars().count();
+        if wl > w {
+            for chunk in raw.chars().collect::<Vec<char>>().chunks(w) {
+                out.push(chunk.iter().collect());
+            }
+            continue;
+        }
+        if out.is_empty() {
+            out.push(raw.to_string());
+            continue;
+        }
+        let last = out.last_mut().unwrap();
+        if last.chars().count() + 1 + wl <= w {
+            last.push(' ');
+            last.push_str(raw);
+        } else {
+            out.push(raw.to_string());
+        }
+    }
+    if out.is_empty() {
+        vec![String::new()]
+    } else {
+        out
+    }
+}
+
+fn word_wrap_line_count(text: &str, width: usize) -> usize {
+    wrap_deposit_words_to_lines(text, width).len().max(1)
+}
+
+fn wrap_deposit_error(msg: &str, width: usize) -> Vec<String> {
+    let w = width.max(12);
+    let mut out = Vec::new();
+    for raw in msg.split_whitespace() {
+        if out.is_empty() {
+            out.push(raw.to_string());
+            continue;
+        }
+        let last = out.last_mut().unwrap();
+        if last.chars().count() + 1 + raw.chars().count() <= w {
+            last.push(' ');
+            last.push_str(raw);
+        } else {
+            out.push(raw.to_string());
+        }
+    }
+    if out.is_empty() {
+        out.push(if msg.is_empty() { "Unknown error".into() } else { msg.to_string() });
+    }
+    out
 }
 
 // ── helpers ─────────────────────────────────────────────────────────

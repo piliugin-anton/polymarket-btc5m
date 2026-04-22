@@ -5,7 +5,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
 
-use crate::app::{AppState, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
+use crate::app::{AppState, DepositModalPhase, InputMode, LimitField, Outcome, MIN_LIMIT_ORDER_SHARES};
 use crate::trading::Side;
 
 #[derive(Debug)]
@@ -20,6 +20,8 @@ pub enum Action {
     ForceMarketRoll,
     /// Hint for claiming resolved positions (Data API claimable positive). Redeem is on-chain / Portfolio, not CLOB HTTP.
     Claim,
+    /// `POST` Polymarket Bridge `/deposit` for `POLYMARKET_FUNDER` → Solana address + QR.
+    FetchSolanaDeposit,
 }
 
 /// When the [Kitty keyboard protocol](https://sw.kovidgoyal.net/kitty/keyboard-protocol/) is
@@ -57,6 +59,10 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
     // Ctrl-C / Ctrl-Q always quits
     if k.modifiers.contains(KeyModifiers::CONTROL) && matches!(k.code, KeyCode::Char('c') | KeyCode::Char('q')) {
         return Action::Quit;
+    }
+
+    if state.deposit_modal.is_some() {
+        return deposit_modal_key(state, k);
     }
 
     match state.input_mode {
@@ -105,6 +111,32 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         // CTF redeem via relayer (Safe) — see `spawn_claim` + `redeem`
         KeyCode::Char('x') | KeyCode::Char('X') => Action::Claim,
 
+        // Polymarket Bridge — Solana USDC deposit address + QR
+        KeyCode::Char('f') => {
+            state.deposit_modal = Some(DepositModalPhase::Loading);
+            Action::FetchSolanaDeposit
+        }
+
+        _ => Action::None,
+    }
+}
+
+fn deposit_modal_key(state: &mut AppState, k: KeyEvent) -> Action {
+    if k.kind == KeyEventKind::Repeat {
+        return Action::None;
+    }
+    match k.code {
+        KeyCode::Esc => {
+            state.deposit_modal = None;
+            Action::None
+        }
+        KeyCode::Char('f') => {
+            if matches!(state.deposit_modal, Some(DepositModalPhase::Loading)) {
+                return Action::None;
+            }
+            state.deposit_modal = Some(DepositModalPhase::Loading);
+            Action::FetchSolanaDeposit
+        }
         _ => Action::None,
     }
 }

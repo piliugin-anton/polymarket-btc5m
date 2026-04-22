@@ -48,6 +48,7 @@ tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 alloy-dyn-abi = { version = "0.8", features = ["eip712", "std"] }
 hex               = "0.4"
+qrcode            = "0.14"
 
 [profile.release]
 lto              = "thin"
