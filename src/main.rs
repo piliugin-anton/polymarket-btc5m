@@ -261,9 +261,11 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
+        let mut holders_poll: Option<tokio::task::JoinHandle<()>> = None;
         while let Some(m) = market_rx.recv().await {
             if let Some(h) = book_handle.take() { h.abort(); }
             if let Some(h) = orders_poll.take() { h.abort(); }
+            if let Some(h) = holders_poll.take() { h.abort(); }
             let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
             book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
             let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
@@ -470,6 +472,47 @@ async fn main() -> Result<()> {
                         }
                         Err(e) => {
                             debug!(error = %e, market = %cond2, "poll /data/orders failed");
+                        }
+                    }
+                    interval.tick().await;
+                }
+            }));
+
+            let tx_holders = tx_for_books.clone();
+            let cond_h = m.condition_id.clone();
+            let up_h = m.up_token_id.clone();
+            let down_h = m.down_token_id.clone();
+            holders_poll = Some(tokio::spawn(async move {
+                let http = match net::reqwest_client() {
+                    Ok(h) => h,
+                    Err(e) => {
+                        debug!(error = %e, "top holders poll: reqwest client unavailable");
+                        return;
+                    }
+                };
+                // Public GET /holders — 1 Hz is typically fine; back off if you see HTTP 429.
+                let mut interval = tokio::time::interval(Duration::from_secs(1));
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    match crate::data_api::fetch_top_holders_amount_sums(
+                        &http,
+                        &cond_h,
+                        &up_h,
+                        &down_h,
+                    )
+                    .await
+                    {
+                        Ok((up_sum, down_sum)) => {
+                            let _ = tx_holders
+                                .send(AppEvent::TopHoldersSentiment { up_sum, down_sum })
+                                .await;
+                        }
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                market = %cond_h,
+                                "data-api GET /holders failed"
+                            );
                         }
                     }
                     interval.tick().await;

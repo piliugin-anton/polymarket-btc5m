@@ -1244,10 +1244,15 @@ impl TradingClient {
     /// **`maker_address` is required** for correct scoping: with only `market`, the CLOB may return
     /// market-wide fills; replaying those produces phantom positions and trade rows (see Polymarket
     /// `TradeParams.maker_address` / py-clob `add_query_trade_params`).
+    ///
+    /// Use [`Config::funder`] (EIP-712 `Order.maker`), not the EOA [`PrivateKeySigner::address`]:
+    /// for `POLY_GNOSIS_SAFE` / `POLY_PROXY` the signer and funder differ; the CLOB indexes fills by
+    /// the maker address that actually holds/clears the trade (matches official clients’
+    /// `get_trades(TradeParams(maker_address=…))` with the proxy/funder).
     pub async fn fetch_trades_for_market(&self, condition_id: &str) -> Result<Vec<ClobTrade>> {
         let creds = self.ensure_creds().await?;
         let path = "/data/trades";
-        let maker = format!("{:#x}", self.signer.address());
+        let maker = format!("{:#x}", self.config.funder);
         let mut cursor = TRADES_INITIAL_CURSOR.to_string();
         let mut out = Vec::new();
         loop {

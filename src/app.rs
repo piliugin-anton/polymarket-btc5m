@@ -53,6 +53,8 @@ pub enum AppEvent {
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
     /// USDC.e cash + claimable from on-chain reads (Multicall3); neg-risk redeemable sums still use Data API.
     BalancePanelLoaded { cash_usdc: f64, claimable_usdc: f64 },
+    /// `GET /holders` — sum of top holders' outcome amounts per side (fallback for header Sentiment when CLOB mids missing).
+    TopHoldersSentiment { up_sum: f64, down_sum: f64 },
     Key(crossterm::event::KeyEvent),
     OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
     /// Non-blocking status line only (no modal).
@@ -198,6 +200,10 @@ pub struct AppState {
 
     /// `f` — Solana USDC deposit address + QR (Bridge API).
     pub deposit_modal: Option<DepositModalPhase>,
+
+    /// Top-holder amount sums from Data API `/holders` (header Sentiment fallback if book mids unavailable).
+    pub top_holders_up_sum:   Option<f64>,
+    pub top_holders_down_sum: Option<f64>,
 }
 
 impl AppState {
@@ -222,6 +228,8 @@ impl AppState {
             input_mode: InputMode::Normal,
             order_error_toast: None,
             deposit_modal: None,
+            top_holders_up_sum: None,
+            top_holders_down_sum: None,
         }
     }
 
@@ -353,6 +361,8 @@ impl AppState {
                 self.fak_net_up = 0.0;
                 self.fak_net_down = 0.0;
                 self.open_orders.clear();
+                self.top_holders_up_sum = None;
+                self.top_holders_down_sum = None;
             }
             AppEvent::PositionsLoaded {
                 position_up,
@@ -387,6 +397,10 @@ impl AppState {
             AppEvent::BalancePanelLoaded { cash_usdc, claimable_usdc } => {
                 self.collateral_cash_usdc = Some(cash_usdc);
                 self.collateral_claimable_usdc = Some(claimable_usdc);
+            }
+            AppEvent::TopHoldersSentiment { up_sum, down_sum } => {
+                self.top_holders_up_sum = Some(up_sum);
+                self.top_holders_down_sum = Some(down_sum);
             }
             AppEvent::OrderAck { side, outcome, qty, price } => {
                 let realized = self.position_mut(outcome).apply_fill(side, qty, price);

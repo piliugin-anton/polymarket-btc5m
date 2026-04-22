@@ -142,3 +142,56 @@ pub fn positions_size_avg_for_tokens(
     }
     (up, down)
 }
+
+// ── Top holders (`GET /holders`) — sentiment proxy (sums are capped at API `limit` per outcome) ──
+
+#[derive(Debug, Clone, Deserialize)]
+struct MetaHolder {
+    token:   String,
+    holders: Vec<HolderRow>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct HolderRow {
+    #[serde(default)]
+    amount: f64,
+}
+
+/// `GET /holders?market=<conditionId>&limit=20` — sums [`HolderRow::amount`] per outcome token.
+///
+/// Polymarket caps `limit` at 20 per token; totals are **top-holder** sums, not full open interest.
+pub async fn fetch_top_holders_amount_sums(
+    http: &reqwest::Client,
+    market_condition_id: &str,
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Result<(f64, f64)> {
+    let url = format!(
+        "{DATA_API_HOST}/holders?market={}&limit=20",
+        market_condition_id
+    );
+    let resp = http.get(&url).send().await.with_context(|| format!("GET {url}"))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!("data-api GET /holders failed: {} — {}", status, txt.trim());
+    }
+    let meta: Vec<MetaHolder> =
+        serde_json::from_str(&txt).with_context(|| format!("decode /holders: {}", txt.trim()))?;
+    let mut up_sum = 0.0f64;
+    let mut down_sum = 0.0f64;
+    for block in meta {
+        let chunk: f64 = block
+            .holders
+            .iter()
+            .map(|h| h.amount)
+            .filter(|a| a.is_finite())
+            .sum();
+        if clob_asset_ids_match(&block.token, up_token_id) {
+            up_sum += chunk;
+        } else if clob_asset_ids_match(&block.token, down_token_id) {
+            down_sum += chunk;
+        }
+    }
+    Ok((up_sum, down_sum))
+}

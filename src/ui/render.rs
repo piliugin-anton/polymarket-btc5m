@@ -113,19 +113,60 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         _ => "—".into(),
     };
 
+    // Sentiment: prefer CLOB mid (live book) over top-holder sums — `/holders` can stay skewed
+    // to one side (whale positions) and misread as "mood" vs current order book.
+    const SENT_EPS: f64 = 1e-6;
+    let m_up = s.mark(Outcome::Up);
+    let m_down = s.mark(Outcome::Down);
+    let sentiment_spans: Vec<Span> = match (m_up, m_down) {
+        (Some(m_u), Some(m_d)) if m_u > m_d + SENT_EPS => vec![
+            Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("▲", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ],
+        (Some(m_u), Some(m_d)) if m_d > m_u + SENT_EPS => vec![
+            Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("▼", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ],
+        (Some(_), Some(_)) => vec![
+            Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("·", Style::default().fg(Color::DarkGray)),
+        ],
+        _ => match (s.top_holders_up_sum, s.top_holders_down_sum) {
+            (Some(u), Some(d)) if u > d + SENT_EPS => vec![
+                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("▲", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            ],
+            (Some(u), Some(d)) if d > u + SENT_EPS => vec![
+                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("▼", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            ],
+            (Some(_), Some(_)) => vec![
+                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("·", Style::default().fg(Color::DarkGray)),
+            ],
+            _ => vec![
+                Span::styled("Sentiment: ", Style::default().fg(Color::DarkGray)),
+                Span::styled("—", Style::default().fg(Color::DarkGray)),
+            ],
+        },
+    };
+
     let cd = s.countdown_secs()
         .map(|c| format!("{:02}:{:02}", c / 60, c % 60))
         .unwrap_or_else(|| "—".into());
 
-    // Line 1: big coloured price
-    let line1 = Line::from(vec![
+    // Line 1: price + oracle arrow + delta, then sentiment (CLOB mid, else top-holders) at end
+    let mut line1_parts: Vec<Span> = vec![
         Span::styled("BTC/USD (Chainlink)  ", Style::default().fg(Color::DarkGray)),
         Span::styled(price_cell, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(arrow, Style::default().fg(colour).add_modifier(Modifier::BOLD)),
         Span::raw("  "),
         Span::styled(delta, Style::default().fg(colour)),
-    ]);
+        Span::raw("  "),
+    ];
+    line1_parts.extend(sentiment_spans);
+    let line1 = Line::from(line1_parts);
     // Line 2: price to beat + countdown + market
     let line2 = Line::from(vec![
         Span::styled(target, Style::default().fg(Color::Yellow)),
