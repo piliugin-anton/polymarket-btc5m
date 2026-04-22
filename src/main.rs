@@ -31,7 +31,7 @@ mod ui;
 use anyhow::{Context, Result};
 use app::{
     clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
-    open_orders_from_clob, AppEvent, AppState, Outcome, resolve_market_order, MIN_LIMIT_ORDER_SHARES,
+    AppEvent, AppState, Outcome, resolve_market_order, MIN_LIMIT_ORDER_SHARES,
 };
 use fees::take_profit_limit_price_crypto_after_fees;
 use config::Config;
@@ -83,6 +83,7 @@ fn apply_app_event(
     trading:&Arc<TradingClient>,
     tx:     &mpsc::Sender<AppEvent>,
     cfg:    &Config,
+    user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
@@ -97,7 +98,7 @@ fn apply_app_event(
                     "TUI: CTF redeem key pressed (dispatching redeem)"
                 );
             }
-            dispatch_action(action, state, trading, tx, cfg);
+            dispatch_action(action, state, trading, tx, cfg, user_open_ledger);
             false
         }
         e => {
@@ -262,6 +263,11 @@ async fn main() -> Result<()> {
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
     let data_api_user = cfg.funder;
+    let user_open_ledger = std::sync::Arc::new(feeds::clob_user_ws::UserOpenOrdersLedger::new());
+    let user_trade_sync = std::sync::Arc::new(feeds::user_trade_sync::UserTradeSync::new());
+    // Supervisor moves a clone; `user_open_ledger` / `user_trade_sync` stay in `main` for TUI.
+    let user_open_ledger_for_supervisor = user_open_ledger.clone();
+    let user_trade_sync_for_supervisor = user_trade_sync.clone();
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
@@ -269,18 +275,30 @@ async fn main() -> Result<()> {
 
         // User WS: one long-lived connection; market switches via watch + dynamic subscribe
         // (Polymarket WSS `operation`: subscribe / unsubscribe on `markets`).
-        let (user_market_tx, user_market_rx) = tokio::sync::watch::channel(String::new());
+        let (user_market_tx, user_market_rx) = tokio::sync::watch::channel(feeds::clob_user_ws::UserWsMarket::default());
+        let ledger_user_ws = user_open_ledger_for_supervisor.clone();
+        let uts = user_trade_sync_for_supervisor.clone();
         let _user_ws = feeds::clob_user_ws::spawn(
             trading_for_positions.fill_wait_registry(),
             trading_for_positions.clone(),
             user_market_rx,
+            tx_for_books.clone(),
+            ledger_user_ws,
+            uts,
         );
 
         while let Some(m) = market_rx.recv().await {
             if let Some(h) = book_handle.take() { h.abort(); }
             if let Some(h) = orders_poll.take() { h.abort(); }
             if let Some(h) = holders_poll.take() { h.abort(); }
-            let _ = user_market_tx.send(m.condition_id.clone());
+            let uwm = feeds::clob_user_ws::UserWsMarket {
+                condition_id:  m.condition_id.clone(),
+                up_token_id:   m.up_token_id.clone(),
+                down_token_id: m.down_token_id.clone(),
+            };
+            user_open_ledger_for_supervisor.roll_market(&uwm).await;
+            user_trade_sync_for_supervisor.on_market_roll();
+            let _ = user_market_tx.send(uwm);
             let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
             book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
             let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
@@ -301,6 +319,7 @@ async fn main() -> Result<()> {
             let down_id = m.down_token_id.clone();
             let condition_id = m.condition_id.clone();
             let user_addr = data_api_user;
+            let open_ledger_pos = user_open_ledger_for_supervisor.clone();
             tokio::spawn(async move {
                 let (data_api_up, data_api_down) = match net::reqwest_client() {
                     Ok(http) => match crate::data_api::fetch_positions_for_market(
@@ -384,114 +403,124 @@ async fn main() -> Result<()> {
                     })
                     .await;
 
-                let oo = open_orders_from_clob(oo_raw, &up_id, &down_id);
-                let _ = txp.send(AppEvent::OpenOrdersLoaded { orders: oo }).await;
+                let ui_orders = open_ledger_pos
+                    .replace_from_rest(&condition_id, &up_id, &down_id, oo_raw)
+                    .await;
+                let _ = txp
+                    .send(AppEvent::OpenOrdersLoaded { orders: ui_orders })
+                    .await;
             });
 
-            let t2 = trading_for_positions.clone();
-            let txp2 = tx_for_books.clone();
-            let up2 = m.up_token_id.clone();
-            let down2 = m.down_token_id.clone();
-            let cond2 = m.condition_id.clone();
-            let user_poll = data_api_user;
-            orders_poll = Some(tokio::spawn(async move {
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                interval.tick().await;
-                loop {
-                    let cli = t2.clone();
-                    if cli.ensure_creds().await.is_err() {
-                        interval.tick().await;
-                        continue;
-                    }
-                    match cli.fetch_open_orders_for_market(&cond2).await {
-                        Ok(rows) => {
-                            // Open orders alone do not tell us what filled; replay trades like the
-                            // initial market load so Fills + Positions track resting matches.
-                            let (data_api_up, data_api_down) = match net::reqwest_client() {
-                                Ok(http) => match crate::data_api::fetch_positions_for_market(
-                                    &http,
-                                    user_poll,
-                                    &cond2,
-                                )
-                                .await
-                                {
-                                    Ok(api_rows) => crate::data_api::positions_size_avg_for_tokens(
-                                        &api_rows,
-                                        &up2,
-                                        &down2,
-                                    ),
-                                    Err(e) => {
-                                        debug!(
-                                            error = %e,
-                                            market = %cond2,
-                                            "poll: data-api GET /positions (market) failed"
-                                        );
-                                        (None, None)
-                                    }
-                                }
-                                Err(e) => {
-                                    debug!(error = %e, "poll: reqwest client for data-api positions");
-                                    (None, None)
-                                }
-                            };
-                            let (escrow_up, escrow_down) =
-                                escrow_sell_shares_from_clob_orders(&rows, &up2, &down2);
-                            let up_bal = cli
-                                .fetch_conditional_balance_shares(&up2)
-                                .await
-                                .unwrap_or_else(|e| {
-                                    debug!(error = %e, token = %up2, "poll: UP conditional balance failed");
-                                    0.0
-                                });
-                            let down_bal = cli
-                                .fetch_conditional_balance_shares(&down2)
-                                .await
-                                .unwrap_or_else(|e| {
-                                    debug!(error = %e, token = %down2, "poll: DOWN conditional balance failed");
-                                    0.0
-                                });
-                            let trades = match cli.fetch_trades_for_market(&cond2).await {
-                                Ok(t) => t,
-                                Err(e) => {
-                                    debug!(
-                                        error = %e,
-                                        market = %cond2,
-                                        "poll: /data/trades failed; fills/positions stale until next tick"
-                                    );
-                                    vec![]
-                                }
-                            };
-                            let (position_up, position_down, fills_bootstrap) =
-                                hydrate_positions_from_trades(
-                                    &trades,
-                                    &up2,
-                                    &down2,
-                                    up_bal,
-                                    down_bal,
-                                    escrow_up,
-                                    escrow_down,
-                                    data_api_up,
-                                    data_api_down,
-                                );
-                            let _ = txp2
-                                .send(AppEvent::PositionsLoaded {
-                                    position_up,
-                                    position_down,
-                                    fills_bootstrap,
-                                    refresh_status_line: false,
-                                })
-                                .await;
-                            let orders = open_orders_from_clob(rows, &up2, &down2);
-                            let _ = txp2.send(AppEvent::OpenOrdersLoaded { orders }).await;
-                        }
-                        Err(e) => {
-                            debug!(error = %e, market = %cond2, "poll /data/orders failed");
-                        }
-                    }
-                    interval.tick().await;
-                }
-            }));
+            // Periodic open-orders + full positions replay (5s) — disabled: parallel L2/REST
+            // traffic was fighting the authenticated CLOB user WebSocket. Live user-channel docs:
+            // https://docs.polymarket.com/developers/CLOB/websocket/user-channel
+            //
+            // Current sync path: one-shot load on `MarketRoll` (above) + `spawn_open_orders_refresh`
+            // after each place/cancel. User WS still drives `FillWaitRegistry` (trade events).
+            //
+            // `orders_poll` left unused so the block is easy to restore.
+            // let t2 = trading_for_positions.clone();
+            // let txp2 = tx_for_books.clone();
+            // let up2 = m.up_token_id.clone();
+            // let down2 = m.down_token_id.clone();
+            // let cond2 = m.condition_id.clone();
+            // let user_poll = data_api_user;
+            // orders_poll = Some(tokio::spawn(async move {
+            //     let mut interval = tokio::time::interval(Duration::from_secs(5));
+            //     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            //     interval.tick().await;
+            //     loop {
+            //         let cli = t2.clone();
+            //         if cli.ensure_creds().await.is_err() {
+            //             interval.tick().await;
+            //             continue;
+            //         }
+            //         match cli.fetch_open_orders_for_market(&cond2).await {
+            //             Ok(rows) => {
+            //                 let (data_api_up, data_api_down) = match net::reqwest_client() {
+            //                     Ok(http) => match crate::data_api::fetch_positions_for_market(
+            //                         &http,
+            //                         user_poll,
+            //                         &cond2,
+            //                     )
+            //                     .await
+            //                     {
+            //                         Ok(api_rows) => crate::data_api::positions_size_avg_for_tokens(
+            //                             &api_rows,
+            //                             &up2,
+            //                             &down2,
+            //                         ),
+            //                         Err(e) => {
+            //                             debug!(
+            //                                 error = %e,
+            //                                 market = %cond2,
+            //                                 "poll: data-api GET /positions (market) failed"
+            //                             );
+            //                             (None, None)
+            //                         }
+            //                     }
+            //                     Err(e) => {
+            //                         debug!(error = %e, "poll: reqwest client for data-api positions");
+            //                         (None, None)
+            //                     }
+            //                 };
+            //                 let (escrow_up, escrow_down) =
+            //                     escrow_sell_shares_from_clob_orders(&rows, &up2, &down2);
+            //                 let up_bal = cli
+            //                     .fetch_conditional_balance_shares(&up2)
+            //                     .await
+            //                     .unwrap_or_else(|e| {
+            //                         debug!(error = %e, token = %up2, "poll: UP conditional balance failed");
+            //                         0.0
+            //                     });
+            //                 let down_bal = cli
+            //                     .fetch_conditional_balance_shares(&down2)
+            //                     .await
+            //                     .unwrap_or_else(|e| {
+            //                         debug!(error = %e, token = %down2, "poll: DOWN conditional balance failed");
+            //                         0.0
+            //                     });
+            //                 let trades = match cli.fetch_trades_for_market(&cond2).await {
+            //                     Ok(t) => t,
+            //                     Err(e) => {
+            //                         debug!(
+            //                             error = %e,
+            //                             market = %cond2,
+            //                             "poll: /data/trades failed; fills/positions stale until next tick"
+            //                         );
+            //                         vec![]
+            //                     }
+            //                 };
+            //                 let (position_up, position_down, fills_bootstrap) =
+            //                     hydrate_positions_from_trades(
+            //                         &trades,
+            //                         &up2,
+            //                         &down2,
+            //                         up_bal,
+            //                         down_bal,
+            //                         escrow_up,
+            //                         escrow_down,
+            //                         data_api_up,
+            //                         data_api_down,
+            //                     );
+            //                 let _ = txp2
+            //                     .send(AppEvent::PositionsLoaded {
+            //                         position_up,
+            //                         position_down,
+            //                         fills_bootstrap,
+            //                         refresh_status_line: false,
+            //                     })
+            //                     .await;
+            //                 let orders = open_orders_from_clob(rows, &up2, &down2);
+            //                 let _ = txp2.send(AppEvent::OpenOrdersLoaded { orders }).await;
+            //             }
+            //             Err(e) => {
+            //                 debug!(error = %e, market = %cond2, "poll /data/orders failed");
+            //             }
+            //         }
+            //         interval.tick().await;
+            //     }
+            // }));
 
             let tx_holders = tx_for_books.clone();
             let cond_h = m.condition_id.clone();
@@ -559,7 +588,7 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
-    let mut state = AppState::new(cfg.default_size_usdc);
+    let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
 
     // ── main loop ────────────────────────────────────────────────────
     /// Drain coalesced feed events in one frame so a burst of book updates
@@ -579,7 +608,7 @@ async fn main() -> Result<()> {
             if matches!(ev, AppEvent::Key(_)) {
                 had_key = true;
             }
-            if apply_app_event(ev, &mut state, &trading, &tx, &cfg) {
+            if apply_app_event(ev, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
                 should_quit = true;
                 break;
             }
@@ -607,7 +636,7 @@ async fn main() -> Result<()> {
                     maybe_ev = rx.recv() => {
                         let Some(mut ev) = maybe_ev else { break Ok(()) };
                         loop {
-                            if apply_app_event(ev, &mut state, &trading, &tx, &cfg) {
+                            if apply_app_event(ev, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
                                 should_quit = true;
                                 break;
                             }
@@ -624,7 +653,7 @@ async fn main() -> Result<()> {
                 }
             }
             while let Ok(next) = rx.try_recv() {
-                if apply_app_event(next, &mut state, &trading, &tx, &cfg) {
+                if apply_app_event(next, &mut state, &trading, &tx, &cfg, &user_open_ledger) {
                     should_quit = true;
                     break;
                 }
@@ -834,6 +863,7 @@ fn dispatch_action(
     trading: &Arc<TradingClient>,
     tx:      &mpsc::Sender<AppEvent>,
     cfg:     &Config,
+    user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
 ) {
     match action {
         Action::None => {}
@@ -878,6 +908,7 @@ fn dispatch_action(
         Action::CancelAll        => {
             let t  = trading.clone();
             let tx = tx.clone();
+            let open_ledger = user_open_ledger.clone();
             let market = state.market.clone();
             tokio::spawn(async move {
                 match t.cancel_all().await {
@@ -886,7 +917,12 @@ fn dispatch_action(
                             .send(AppEvent::StatusInfo("all open orders cancelled".into()))
                             .await;
                         if let Some(m) = market {
-                            spawn_open_orders_refresh(t.clone(), tx.clone(), m);
+                            spawn_open_orders_refresh(
+                                t.clone(),
+                                tx.clone(),
+                                m,
+                                open_ledger,
+                            );
                         }
                     }
                     Err(e) => {
@@ -916,6 +952,7 @@ fn dispatch_action(
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
                 trading.clone(),
+                user_open_ledger.clone(),
                 tx.clone(),
                 market,
                 outcome,
@@ -961,6 +998,7 @@ fn dispatch_action(
             };
             spawn_order(
                 trading.clone(),
+                user_open_ledger.clone(),
                 tx.clone(),
                 market,
                 outcome,
@@ -978,9 +1016,10 @@ fn dispatch_action(
 }
 
 fn spawn_open_orders_refresh(
-    trading: Arc<TradingClient>,
-    tx: mpsc::Sender<AppEvent>,
-    market: gamma::ActiveMarket,
+    trading:      Arc<TradingClient>,
+    tx:           mpsc::Sender<AppEvent>,
+    market:       gamma::ActiveMarket,
+    open_ledger:  std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
 ) {
     let condition_id = market.condition_id.clone();
     let up_id = market.up_token_id.clone();
@@ -994,7 +1033,9 @@ fn spawn_open_orders_refresh(
         let Ok(rows) = cli.fetch_open_orders_for_market(&condition_id).await else {
             return;
         };
-        let orders = open_orders_from_clob(rows, &up_id, &down_id);
+        let orders = open_ledger
+            .replace_from_rest(&condition_id, &up_id, &down_id, rows)
+            .await;
         let _ = tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
     });
 }
@@ -1002,6 +1043,7 @@ fn spawn_open_orders_refresh(
 #[allow(clippy::too_many_arguments)]
 fn spawn_order(
     trading:  Arc<TradingClient>,
+    user_open_ledger: std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     tx:       mpsc::Sender<AppEvent>,
     market:   gamma::ActiveMarket,
     outcome:  Outcome,
@@ -1125,6 +1167,7 @@ fn spawn_order(
                                 outcome,
                                 qty: ack_qty,
                                 price: ack_price,
+                                clob_order_id: resp.order_id.clone(),
                             })
                             .await;
                     } else {
@@ -1139,7 +1182,12 @@ fn spawn_order(
                             )))
                             .await;
                     }
-                    spawn_open_orders_refresh(trading.clone(), tx.clone(), market_for_refresh.clone());
+                    spawn_open_orders_refresh(
+                        trading.clone(),
+                        tx.clone(),
+                        market_for_refresh.clone(),
+                        user_open_ledger.clone(),
+                    );
 
                     if matches!(side, Side::Buy | Side::Sell) {
                         let cli = trading.clone();
@@ -1288,6 +1336,7 @@ fn spawn_order(
                             );
                             spawn_order(
                                 trading.clone(),
+                                user_open_ledger.clone(),
                                 tx.clone(),
                                 market_for_refresh,
                                 outcome,

@@ -275,11 +275,19 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crossterm::event::{KeyEvent, KeyModifiers};
+
+    use crate::feeds::user_trade_sync::UserTradeSync;
+
+    fn test_state() -> AppState {
+        AppState::new(5.0, Arc::new(UserTradeSync::new()))
+    }
 
     #[test]
     fn uppercase_without_caps_in_protocol_state_maps_to_lowercase() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         let ev = KeyEvent::new_with_kind_and_state(
             KeyCode::Char('U'),
             KeyModifiers::NONE,
@@ -294,7 +302,7 @@ mod tests {
 
     #[test]
     fn uppercase_with_caps_lock_unchanged() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         let ev = KeyEvent::new_with_kind_and_state(
             KeyCode::Char('U'),
             KeyModifiers::NONE,
@@ -309,14 +317,14 @@ mod tests {
 
     #[test]
     fn normal_mode_ignores_key_repeat() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         let ev = KeyEvent::new_with_kind(KeyCode::Char('u'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert!(matches!(handle_key(&mut state, ev), Action::None));
     }
 
     #[test]
     fn edit_size_accepts_enter_release() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         state.input_mode = InputMode::EditSize;
         let ev = KeyEvent::new_with_kind(KeyCode::Enter, KeyModifiers::NONE, KeyEventKind::Release);
         assert!(matches!(handle_key(&mut state, ev), Action::None));

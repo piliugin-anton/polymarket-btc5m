@@ -11,6 +11,7 @@
 
 use chrono::{DateTime, Utc};
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
@@ -49,6 +50,16 @@ pub enum AppEvent {
         /// When false (background poll), keep the current status line (order hints, errors).
         refresh_status_line: bool,
     },
+    /// CLOB user-channel `event_type: trade` — P&L / fills (paired with `OrderAck` de-dupe).
+    UserChannelFill {
+        clob_trade_id:  String,
+        order_leg_id:   String,
+        side:             Side,
+        outcome:        Outcome,
+        qty:              f64,
+        price:            f64,
+        ts:               DateTime<Utc>,
+    },
     /// Resting orders for the active market (`GET /data/orders`).
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
     /// USDC.e cash + claimable from on-chain reads (Multicall3); neg-risk redeemable sums still use Data API.
@@ -56,7 +67,8 @@ pub enum AppEvent {
     /// `GET /holders` — per-`proxyWallet` sums: if a wallet holds both outcomes, only the larger leg counts; then summed per side (Sentiment).
     TopHoldersSentiment { up_sum: f64, down_sum: f64 },
     Key(crossterm::event::KeyEvent),
-    OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64 },
+    /// `clob_order_id` is Polymarket `orderID` from the POST /order body — for fill de-dupe vs user WS.
+    OrderAck { side: Side, outcome: Outcome, qty: f64, price: f64, clob_order_id: Option<String> },
     /// Non-blocking status line only (no modal).
     OrderErr(String),
     /// Order placement / cancel failures: bottom-right toast + status line (auto-dismiss).
@@ -127,12 +139,14 @@ pub struct OpenOrderRow {
 
 #[derive(Debug, Clone)]
 pub struct Fill {
-    pub ts:      DateTime<Utc>,
-    pub side:    Side,
-    pub outcome: Outcome,
-    pub qty:     f64,
-    pub price:   f64,
-    pub realized: f64, // only non-zero when the fill closes part of a position
+    pub ts:            DateTime<Utc>,
+    pub side:          Side,
+    pub outcome:       Outcome,
+    pub qty:           f64,
+    pub price:         f64,
+    pub realized:      f64, // only non-zero when the fill closes part of a position
+    /// CLOB `Trade.id` from REST or user WebSocket (for de-dupe only; not shown in the TUI).
+    pub clob_trade_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -204,10 +218,13 @@ pub struct AppState {
     /// Net UP vs DOWN after per-wallet “max of UP/DOWN position” (see `fetch_top_holders_amount_sums`); header Sentiment.
     pub top_holders_up_sum:   Option<f64>,
     pub top_holders_down_sum: Option<f64>,
+
+    /// Deduplication between `OrderAck` and user-channel `trade` (see `feeds::user_trade_sync`).
+    pub user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
 }
 
 impl AppState {
-    pub fn new(default_size_usdc: f64) -> Self {
+    pub fn new(default_size_usdc: f64, user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>) -> Self {
         Self {
             market: None, btc_price: None, btc_price_ts: None,
             book_up: None, book_down: None,
@@ -230,6 +247,7 @@ impl AppState {
             deposit_modal: None,
             top_holders_up_sum: None,
             top_holders_down_sum: None,
+            user_trade_sync,
         }
     }
 
@@ -373,9 +391,16 @@ impl AppState {
                 self.position_up = position_up;
                 self.position_down = position_down;
                 self.fills.clear();
+                let mut seen_seed: Vec<String> = Vec::new();
                 for f in fills_bootstrap {
+                    if let Some(ref tid) = f.clob_trade_id {
+                        if !tid.is_empty() {
+                            seen_seed.push(tid.clone());
+                        }
+                    }
                     self.fills.push_back(f);
                 }
+                self.user_trade_sync.seed_seen_from_hydration(seen_seed);
                 trim_fills_to_cap(&mut self.fills, 64);
                 let nu = net_shares_from_fills(&self.fills, Outcome::Up).max(0.0);
                 let nd = net_shares_from_fills(&self.fills, Outcome::Down).max(0.0);
@@ -402,7 +427,15 @@ impl AppState {
                 self.top_holders_up_sum = Some(up_sum);
                 self.top_holders_down_sum = Some(down_sum);
             }
-            AppEvent::OrderAck { side, outcome, qty, price } => {
+            AppEvent::UserChannelFill {
+                clob_trade_id,
+                order_leg_id,
+                side,
+                outcome,
+                qty,
+                price,
+                ts,
+            } => {
                 let realized = self.position_mut(outcome).apply_fill(side, qty, price);
                 self.realized_pnl += realized;
                 match side {
@@ -413,9 +446,55 @@ impl AppState {
                     }
                 }
                 self.fills.push_back(Fill {
-                    ts: Utc::now(), side, outcome, qty, price, realized,
+                    ts,
+                    side,
+                    outcome,
+                    qty,
+                    price,
+                    realized,
+                    clob_trade_id: if clob_trade_id.is_empty() {
+                        None
+                    } else {
+                        Some(clob_trade_id.clone())
+                    },
                 });
                 trim_fills_to_cap(&mut self.fills, 64);
+                self.user_trade_sync
+                    .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price);
+                self.status_line = format!("{} {qty:.2} {} @ {price:.3} (WSS trade)",
+                    side_str(side), outcome.as_str());
+            }
+            AppEvent::OrderAck { side, outcome, qty, price, clob_order_id } => {
+                let mut do_pnl = true;
+                if let Some(ref oid) = clob_order_id {
+                    if !self.user_trade_sync.before_order_ack_apply(oid, qty, price) {
+                        do_pnl = false;
+                    }
+                }
+                if do_pnl {
+                    let realized = self.position_mut(outcome).apply_fill(side, qty, price);
+                    self.realized_pnl += realized;
+                    match side {
+                        Side::Buy => *self.fak_net_mut(outcome) += qty,
+                        Side::Sell => {
+                            let v = self.fak_net_mut(outcome);
+                            *v = (*v - qty).max(0.0);
+                        }
+                    }
+                    self.fills.push_back(Fill {
+                        ts:            Utc::now(),
+                        side,
+                        outcome,
+                        qty,
+                        price,
+                        realized,
+                        clob_trade_id: None,
+                    });
+                    trim_fills_to_cap(&mut self.fills, 64);
+                    if let Some(oid) = clob_order_id {
+                        self.user_trade_sync.after_order_ack_applied(&oid, qty, price);
+                    }
+                }
                 self.status_line = format!("{} {qty:.2} {} @ {price:.3} ✓",
                     side_str(side), outcome.as_str());
             }
@@ -700,6 +779,7 @@ pub fn hydrate_positions_from_trades(
             qty,
             price,
             realized,
+            clob_trade_id: Some(t.id.clone()),
         });
     }
 
@@ -779,9 +859,16 @@ pub fn resolve_market_order(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
     use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
+    use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::trading::{ClobOpenOrder, ClobTrade};
+
+    fn test_state() -> AppState {
+        AppState::new(5.0, Arc::new(UserTradeSync::new()))
+    }
 
     fn trade(
         id: &str,
@@ -855,7 +942,7 @@ mod tests {
 
     #[test]
     fn market_sell_sells_full_tracked_position_ignores_small_usdc_ticket() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         state.book_up = Some(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
@@ -871,7 +958,7 @@ mod tests {
 
     #[test]
     fn market_sell_without_position_uses_usdc_over_bid() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         state.book_up = Some(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
@@ -885,7 +972,7 @@ mod tests {
 
     #[test]
     fn market_sell_uses_fill_net_when_larger_than_position() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         state.book_up = Some(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],
@@ -899,6 +986,7 @@ mod tests {
             qty: 10.09,
             price: 0.5,
             realized: 0.0,
+            clob_trade_id: None,
         });
         let (shares, _, _) =
             resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();
@@ -907,7 +995,7 @@ mod tests {
 
     #[test]
     fn market_sell_uses_fak_net_when_larger_than_position_and_fills() {
-        let mut state = AppState::new(5.0);
+        let mut state = test_state();
         state.book_up = Some(BookSnapshot {
             asset_id: "1".into(),
             bids: vec![BookLevel { price: 0.5, size: 1000.0 }],

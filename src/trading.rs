@@ -10,6 +10,7 @@
 //! `timestamp + method + path + body` using the base64-decoded `secret`).
 
 use anyhow::{anyhow, bail, Context, Result};
+use chrono::{DateTime, Utc};
 use alloy_primitives::{Address, U256, B256, hex};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
@@ -385,8 +386,7 @@ struct OrdersPage {
 const TRADES_INITIAL_CURSOR: &str = "MA==";
 const TRADES_END_CURSOR: &str = "LTE=";
 
-#[cfg(test)]
-fn parse_clob_side_str(s: &str) -> Option<Side> {
+pub(crate) fn parse_clob_side_str(s: &str) -> Option<Side> {
     match s.trim().to_ascii_uppercase().as_str() {
         "BUY" => Some(Side::Buy),
         "SELL" => Some(Side::Sell),
@@ -414,15 +414,16 @@ pub fn clob_asset_ids_match(a: &str, b: &str) -> bool {
     }
 }
 
-fn norm_order_id_fragment(s: &str) -> String {
+/// Normalizes a CLOB order id for map keys and comparisons (strips a leading `0x`, lowercases).
+pub fn norm_order_id_key(s: &str) -> String {
     s.trim().trim_start_matches("0x").to_ascii_lowercase()
 }
 
 /// Compare Polymarket order ids from `orderID` / `taker_order_id` / `maker_orders.order_id`.
 #[cfg(test)]
 fn order_ids_match(a: &str, b: &str) -> bool {
-    let a = norm_order_id_fragment(a);
-    let b = norm_order_id_fragment(b);
+    let a = norm_order_id_key(a);
+    let b = norm_order_id_key(b);
     !a.is_empty() && a == b
 }
 
@@ -432,6 +433,150 @@ pub struct UserTradeFill {
     pub size_shares: f64,
     pub status: String,
     pub asset_id: String,
+}
+
+/// One JSON value or a batch array from the CLOB user WebSocket.
+pub fn parse_user_channel_values(txt: &str) -> Vec<serde_json::Value> {
+    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(txt) {
+        return arr;
+    }
+    if let Ok(one) = serde_json::from_str::<serde_json::Value>(txt) {
+        return vec![one];
+    }
+    vec![]
+}
+
+/// CLOB `trade` user-channel payload, mapped to P&L data (one row per your fill / leg).
+#[derive(Debug, Clone)]
+pub struct UserChannelTradeFill {
+    /// `Trade.id` (same namespace as `GET /data/trades`) — for de-dupe vs REST and OrderAck.
+    pub clob_trade_id: String,
+    /// `taker_order_id` or, when you are the maker, the maker's `order_id` for this leg.
+    pub order_leg_id:  String,
+    pub asset_id:      String,
+    pub side:          Side,
+    pub qty:           f64,
+    pub price:         f64,
+    pub match_ts:      DateTime<Utc>,
+}
+
+/// Parse a user-channel `event_type: trade` object for [`UserChannelTradeFill`].
+/// Returns `None` for `FAILED`, missing ids, or non-trades.
+pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannelTradeFill> {
+    let et = v
+        .get("event_type")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("type").and_then(|x| x.as_str()));
+    if !et.is_some_and(|s| s.eq_ignore_ascii_case("trade")) {
+        return None;
+    }
+    if v
+        .get("status")
+        .and_then(|s| s.as_str())
+        .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
+    {
+        return None;
+    }
+    let clob_trade_id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("trade_id").and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let asset_id = v
+        .get("asset_id")
+        .or_else(|| v.get("assetId"))?
+        .as_str()?
+        .trim()
+        .to_string();
+    if asset_id.is_empty() {
+        return None;
+    }
+    let side = parse_clob_side_str(v.get("side").and_then(|s| s.as_str())?)?;
+    let price: f64 = v.get("price").and_then(|s| s.as_str())?.parse().ok()?;
+    if !price.is_finite() || price <= 0.0 {
+        return None;
+    }
+    let trader_side = v
+        .get("trader_side")
+        .or_else(|| v.get("traderSide"))
+        .and_then(|s| s.as_str())
+        .map(|s| s.trim().to_ascii_uppercase());
+    let taker = v
+        .get("taker_order_id")
+        .or_else(|| v.get("takerOrderId"))
+        .and_then(|s| s.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (order_leg_id, qty) = if matches!(trader_side.as_deref(), Some("MAKER") | Some("M")) {
+        let arr = v.get("maker_orders").or_else(|| v.get("makerOrders"))?.as_array()?;
+        let m0 = arr.first()?;
+        let oid = m0
+            .get("order_id")
+            .or_else(|| m0.get("orderId"))?
+            .as_str()?
+            .trim();
+        if oid.is_empty() {
+            return None;
+        }
+        let am = m0
+            .get("matched_amount")
+            .or_else(|| m0.get("matchedAmount"))?
+            .as_str()?;
+        let q: f64 = am.parse().ok()?;
+        if !q.is_finite() || q <= 0.0 {
+            return None;
+        }
+        (oid.to_string(), q)
+    } else {
+        // TAKER (default) or missing trader_side: use top-level size + taker order id.
+        let tid = taker?.to_string();
+        let szs = v.get("size").and_then(|s| s.as_str())?;
+        let q: f64 = szs.parse().ok()?;
+        if !q.is_finite() || q <= 0.0 {
+            return None;
+        }
+        (tid, q)
+    };
+    if order_leg_id.is_empty() {
+        return None;
+    }
+    let ts = parse_user_trade_timestamp(v);
+    Some(UserChannelTradeFill {
+        clob_trade_id,
+        order_leg_id,
+        asset_id,
+        side,
+        qty,
+        price,
+        match_ts: ts,
+    })
+}
+
+fn parse_user_trade_timestamp(v: &serde_json::Value) -> DateTime<Utc> {
+    let s = v
+        .get("match_time")
+        .or_else(|| v.get("matchTime"))
+        .and_then(|s| s.as_str())
+        .or_else(|| v.get("last_update").and_then(|s| s.as_str()))
+        .or_else(|| v.get("lastUpdate").and_then(|s| s.as_str()))
+        .or_else(|| v.get("timestamp").and_then(|s| s.as_str()));
+    if let Some(st) = s {
+        if let Ok(n) = st.trim().parse::<i64>() {
+            if n > 1_000_000_000_000 {
+                if let Some(dt) = DateTime::from_timestamp_millis(n) {
+                    return dt;
+                }
+            } else if let Some(dt) = DateTime::from_timestamp(n, 0) {
+                return dt;
+            }
+        }
+        if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(st.trim()) {
+            return dt.with_timezone(&Utc);
+        }
+    }
+    Utc::now()
 }
 
 /// Lets tasks wait for a user-channel `trade` that references a given order id (taker or maker leg).
@@ -448,7 +593,7 @@ impl FillWaitRegistry {
 
     pub async fn register_buy_fill_waiter(&self, order_id: &str) -> oneshot::Receiver<UserTradeFill> {
         let (tx, rx) = oneshot::channel();
-        let key = norm_order_id_fragment(order_id);
+        let key = norm_order_id_key(order_id);
         if !key.is_empty() {
             self.pending.lock().await.entry(key).or_default().push(tx);
         }
@@ -456,19 +601,16 @@ impl FillWaitRegistry {
     }
 
     pub async fn dispatch_from_ws_text(&self, txt: &str) {
-        let values: Vec<serde_json::Value> =
-            if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(txt) {
-                arr
-            } else if let Ok(one) = serde_json::from_str::<serde_json::Value>(txt) {
-                vec![one]
-            } else {
-                return;
-            };
+        let values = parse_user_channel_values(txt);
+        self.dispatch_trades_in_values(&values).await;
+    }
+
+    /// Forward user-channel `trade` events only (ignores `order` payloads).
+    pub async fn dispatch_trades_in_values(&self, values: &[serde_json::Value]) {
         for v in values {
-            if !Self::is_trade_event(&v) {
-                continue;
+            if Self::is_trade_event(v) {
+                self.dispatch_trade_value(v).await;
             }
-            self.dispatch_trade_value(&v).await;
         }
     }
 
@@ -502,7 +644,7 @@ impl FillWaitRegistry {
             if let Some(s) = v.get("size").and_then(|x| x.as_str()) {
                 if let Ok(sz) = s.parse::<f64>() {
                     if sz.is_finite() && sz > 0.0 {
-                        legs.push((norm_order_id_fragment(tid), sz));
+                        legs.push((norm_order_id_key(tid), sz));
                     }
                 }
             }
@@ -521,7 +663,7 @@ impl FillWaitRegistry {
                 if let (Some(o), Some(a)) = (oid, amt) {
                     if let Ok(sz) = a.parse::<f64>() {
                         if sz.is_finite() && sz > 0.0 {
-                            legs.push((norm_order_id_fragment(o), sz));
+                            legs.push((norm_order_id_key(o), sz));
                         }
                     }
                 }

@@ -1,35 +1,248 @@
 //! Polymarket CLOB **user** WebSocket (`/ws/user`) — authenticated `trade` / `order` events.
 //!
 //! Subscription uses `auth` + `markets` (condition IDs). See
-//! <https://docs.polymarket.com/market-data/websocket/user-channel.md>.
+//! <https://docs.polymarket.com/developers/CLOB/websocket/user-channel> .
 //!
 //! After the initial authenticated subscribe, **market changes** use dynamic
 //! `{"markets":[…], "operation":"subscribe"|"unsubscribe"}` so the socket stays open.
 //!
-//! **`trade`** payloads are forwarded to [`crate::trading::FillWaitRegistry`] so take-profit can
-//! refine size from the push stream (often ahead of `GET /data/trades` indexing).
+//! - **`trade`** → [`FillWaitRegistry`] (take-profit fill wait)
+//! - **`order`** (PLACEMENT / UPDATE / CANCELLATION) → in-memory open-order ledger, then
+//!   `AppEvent::OpenOrdersLoaded` (same as `GET /data/orders` snapshot path)
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
+use serde_json::Value;
 use tokio::net::TcpStream;
+use tokio::sync::mpsc;
 use tokio::sync::watch;
-use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
+use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
+use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
 use crate::config::CLOB_WS_USER_URL;
+use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
-use crate::trading::{ApiCreds, FillWaitRegistry, TradingClient};
+use crate::trading::{
+    clob_asset_ids_match, parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
+};
 
 type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
+
+/// `watch` payload for the user channel: CLOB `market` = Gamma `conditionId` + outcome token ids.
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
+pub struct UserWsMarket {
+    pub condition_id:  String,
+    pub up_token_id:   String,
+    pub down_token_id: String,
+}
+
+/// OPEN orders mirror for the active market, merged from `GET /data/orders` and user `order` WS
+/// events (see [Polymarket user channel](https://docs.polymarket.com/developers/CLOB/websocket/user-channel)).
+pub struct UserOpenOrdersLedger {
+    inner: Mutex<LedgerInner>,
+}
+
+struct LedgerInner {
+    market: String,
+    up:     String,
+    down:   String,
+    by_id:  HashMap<String, ClobOpenOrder>,
+}
+
+impl UserOpenOrdersLedger {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(LedgerInner {
+                market: String::new(),
+                up:     String::new(),
+                down:   String::new(),
+                by_id:  HashMap::new(),
+            }),
+        }
+    }
+
+    /// Call in the market supervisor **before** `user_market_tx.send` and the REST snapshot, so
+    /// incoming WS messages for the *previous* `market` are ignored and the ledger is empty until
+    /// [`Self::replace_from_rest`].
+    pub async fn roll_market(&self, m: &UserWsMarket) {
+        let mut g = self.inner.lock().await;
+        g.market = m.condition_id.clone();
+        g.up = m.up_token_id.clone();
+        g.down = m.down_token_id.clone();
+        g.by_id.clear();
+    }
+
+    /// Full replace from `GET /data/orders` (e.g. initial market load, `spawn_open_orders_refresh`).
+    pub async fn replace_from_rest(
+        &self,
+        market: &str,
+        up: &str,
+        down: &str,
+        rows: Vec<ClobOpenOrder>,
+    ) -> Vec<OpenOrderRow> {
+        let mut g = self.inner.lock().await;
+        g.market = market.to_string();
+        g.up = up.to_string();
+        g.down = down.to_string();
+        g.by_id.clear();
+        for o in rows {
+            let k = norm_order_id_key(&o.id);
+            if !k.is_empty() {
+                g.by_id.insert(k, o);
+            }
+        }
+        open_orders_from_clob(
+            g.by_id.values().cloned().collect(),
+            g.up.as_str(),
+            g.down.as_str(),
+        )
+    }
+
+    /// Apply CLOB `order` events; returns new UI rows if anything changed.
+    async fn apply_order_values(&self, values: &[Value]) -> Option<Vec<OpenOrderRow>> {
+        let mut changed = false;
+        for v in values {
+            if !is_order_event(v) {
+                continue;
+            }
+            if self.apply_one_order_value(v).await {
+                changed = true;
+            }
+        }
+        if !changed {
+            return None;
+        }
+        let g = self.inner.lock().await;
+        if g.market.is_empty() || (g.up.is_empty() && g.down.is_empty()) {
+            return None;
+        }
+        Some(open_orders_from_clob(
+            g.by_id.values().cloned().collect(),
+            g.up.as_str(),
+            g.down.as_str(),
+        ))
+    }
+
+    async fn apply_one_order_value(&self, v: &Value) -> bool {
+        let mut g = self.inner.lock().await;
+        let mkt = v
+            .get("market")
+            .and_then(|x| x.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        if let Some(ev) = mkt {
+            if !markets_eq(ev, g.market.as_str()) {
+                return false;
+            }
+        } else if let Some(a) = jstr2(v, "asset_id", "assetId") {
+            if !g.up.is_empty() && !clob_asset_ids_match(a, g.up.as_str()) && !clob_asset_ids_match(a, g.down.as_str()) {
+                return false;
+            }
+        }
+        let raw_id = v
+            .get("id")
+            .and_then(|x| x.as_str())
+            .or_else(|| v.get("order_id").and_then(|x| x.as_str()));
+        let key = match raw_id {
+            Some(s) => {
+                let k = norm_order_id_key(s);
+                if k.is_empty() {
+                    return false;
+                }
+                k
+            }
+            None => return false,
+        };
+        let kind = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .map(|s| s.trim().to_ascii_uppercase());
+        if matches!(
+            kind.as_deref(),
+            Some("CANCELLATION" | "CANCELED" | "CANCELLED" | "EXPIRED")
+        ) {
+            return g.by_id.remove(&key).is_some();
+        }
+        if let Some(row) = clob_order_from_user_ws_order_value(v) {
+            let k2 = norm_order_id_key(&row.id);
+            if k2.is_empty() {
+                return false;
+            }
+            let remove = {
+                let orig = row.original_size.parse::<f64>().unwrap_or(f64::NAN);
+                let matched = row.size_matched.parse::<f64>().unwrap_or(0.0);
+                orig.is_finite() && (orig - matched) <= 1e-9
+            };
+            if remove {
+                return g.by_id.remove(&k2).is_some();
+            }
+            g.by_id.insert(k2, row);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+fn is_order_event(v: &Value) -> bool {
+    v.get("event_type")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("eventType").and_then(|x| x.as_str()))
+        .is_some_and(|s| s.eq_ignore_ascii_case("order"))
+}
+
+fn markets_eq(a: &str, b: &str) -> bool {
+    fn norm_m(s: &str) -> String {
+        s.trim()
+            .trim_start_matches("0x")
+            .to_ascii_lowercase()
+    }
+    !a.is_empty() && !b.is_empty() && norm_m(a) == norm_m(b)
+}
+
+fn jstr2<'a>(v: &'a Value, a: &str, b: &str) -> Option<&'a str> {
+    v.get(a)
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get(b).and_then(|x| x.as_str()))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+/// Build a [`ClobOpenOrder`]-compatible row from a user-channel `order` message.
+fn clob_order_from_user_ws_order_value(v: &Value) -> Option<ClobOpenOrder> {
+    let id = jstr2(v, "id", "orderId")?.to_string();
+    let asset_id = jstr2(v, "asset_id", "assetId")?.to_string();
+    let side = v.get("side").and_then(|x| x.as_str())?.trim().to_string();
+    let price = v.get("price").and_then(|x| x.as_str())?.trim().to_string();
+    if price.is_empty() {
+        return None;
+    }
+    let original_size = jstr2(v, "original_size", "originalSize")?.to_string();
+    let size_matched = jstr2(v, "size_matched", "sizeMatched").unwrap_or("0").to_string();
+    Some(ClobOpenOrder {
+        id,
+        asset_id,
+        side,
+        price,
+        original_size,
+        size_matched,
+    })
+}
 
 pub fn spawn(
     fill_registry: Arc<FillWaitRegistry>,
     trading: Arc<TradingClient>,
-    mut market_watch: watch::Receiver<String>,
+    mut market_watch: watch::Receiver<UserWsMarket>,
+    app_tx: mpsc::Sender<AppEvent>,
+    open_ledger: Arc<UserOpenOrdersLedger>,
+    user_trade_sync: Arc<UserTradeSync>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -57,6 +270,9 @@ pub fn spawn(
                 &creds,
                 &fill_registry,
                 &mut market_watch,
+                &app_tx,
+                &open_ledger,
+                user_trade_sync.as_ref(),
             )
             .await
             {
@@ -67,10 +283,10 @@ pub fn spawn(
     })
 }
 
-async fn wait_nonempty_market(rx: &mut watch::Receiver<String>) -> Result<String> {
+async fn wait_nonempty_market(rx: &mut watch::Receiver<UserWsMarket>) -> Result<UserWsMarket> {
     loop {
         let v = rx.borrow().clone();
-        if !v.is_empty() {
+        if !v.condition_id.is_empty() {
             return Ok(v);
         }
         rx.changed()
@@ -81,7 +297,7 @@ async fn wait_nonempty_market(rx: &mut watch::Receiver<String>) -> Result<String
 
 async fn send_initial_user_sub(
     ws: &mut UserWsStream,
-    creds: &ApiCreds,
+    creds: &crate::trading::ApiCreds,
     condition_id: &str,
 ) -> Result<()> {
     let sub = serde_json::json!({
@@ -116,9 +332,12 @@ async fn send_market_operation(
 
 async fn run_session(
     ws: &mut UserWsStream,
-    creds: &ApiCreds,
+    creds: &crate::trading::ApiCreds,
     registry: &FillWaitRegistry,
-    market_watch: &mut watch::Receiver<String>,
+    market_watch: &mut watch::Receiver<UserWsMarket>,
+    app_tx: &mpsc::Sender<AppEvent>,
+    open_ledger: &UserOpenOrdersLedger,
+    user_trade_sync: &UserTradeSync,
 ) -> Result<()> {
     let mut current_sub: Option<String> = None;
     let mut ping = tokio::time::interval(Duration::from_secs(10));
@@ -127,7 +346,8 @@ async fn run_session(
     let mut logged_first = false;
 
     loop {
-        let desired = wait_nonempty_market(market_watch).await?;
+        let ctx = wait_nonempty_market(market_watch).await?;
+        let desired = ctx.condition_id.clone();
         if current_sub.as_deref() != Some(desired.as_str()) {
             if let Some(ref old_id) = current_sub {
                 send_market_operation(ws, old_id, "unsubscribe").await?;
@@ -178,8 +398,88 @@ async fn run_session(
                     debug!(len = txt.len(), %snip, "CLOB user WS first payload");
                     logged_first = true;
                 }
-                registry.dispatch_from_ws_text(&txt).await;
+                let values = parse_user_channel_values(&txt);
+                registry.dispatch_trades_in_values(&values).await;
+                let ctxm = market_watch.borrow().clone();
+                if !ctxm.condition_id.is_empty() {
+                    for v in &values {
+                        if let Some(f) = try_parse_user_channel_trade(v) {
+                            if !clob_asset_ids_match(&f.asset_id, &ctxm.up_token_id)
+                                && !clob_asset_ids_match(&f.asset_id, &ctxm.down_token_id)
+                            {
+                                continue;
+                            }
+                            if !user_trade_sync.before_ws_user_fill_apply(
+                                &f.clob_trade_id,
+                                &f.order_leg_id,
+                                f.qty,
+                                f.price,
+                            ) {
+                                continue;
+                            }
+                            let outcome = if clob_asset_ids_match(&f.asset_id, &ctxm.up_token_id) {
+                                Outcome::Up
+                            } else {
+                                Outcome::Down
+                            };
+                            let _ = app_tx
+                                .send(AppEvent::UserChannelFill {
+                                    clob_trade_id: f.clob_trade_id,
+                                    order_leg_id:  f.order_leg_id,
+                                    side:          f.side,
+                                    outcome,
+                                    qty:           f.qty,
+                                    price:         f.price,
+                                    ts:            f.match_ts,
+                                })
+                                .await;
+                        }
+                    }
+                }
+                if let Some(orders) = open_ledger.apply_order_values(&values).await {
+                    let _ = app_tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn user_ws_ledger_place_then_cancel_empties_ui() {
+        let l = UserOpenOrdersLedger::new();
+        l.roll_market(&UserWsMarket {
+            condition_id:  "0xabc1".to_string(),
+            up_token_id:   "111".to_string(),
+            down_token_id: "222".to_string(),
+        })
+        .await;
+        let place: Value = serde_json::from_str(
+            r#"{
+            "event_type":"order",
+            "id":"0xff01",
+            "market":"0xabc1",
+            "type":"PLACEMENT",
+            "asset_id":"111",
+            "side":"BUY",
+            "price":"0.5",
+            "original_size":"10",
+            "size_matched":"0"
+        }"#,
+        )
+        .unwrap();
+        let cancel: Value = serde_json::from_str(
+            r#"{"event_type":"order","id":"0xff01","market":"0xabc1","type":"CANCELLATION"}"#,
+        )
+        .unwrap();
+        let o = l.apply_order_values(&[place]).await;
+        assert!(o.is_some());
+        let o2 = l.apply_order_values(&[cancel]).await;
+        assert!(o2.is_some());
+        let rows = o2.expect("rows");
+        assert!(rows.is_empty());
     }
 }
