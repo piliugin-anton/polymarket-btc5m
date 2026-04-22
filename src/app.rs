@@ -418,7 +418,7 @@ impl AppState {
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
-                // Return to normal keys (u/d/…) — otherwise `s` / limit modal survives a roll.
+                // Return to normal keys (w/s/a/d/…) — otherwise `e` / limit modal survives a roll.
                 // Deposit modal (`f`) stays open across rolls.
                 self.input_mode = InputMode::Normal;
                 self.order_error_toast = None;

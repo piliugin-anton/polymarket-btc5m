@@ -835,8 +835,8 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                     CtEvent::Key(k) => {
                         // Crossterm only sets `kind` on Unix when the terminal uses the kitty-style
                         // keyboard protocol (`REPORT_EVENT_TYPES`). Some terminals then emit **only**
-                        // `Release` for Return — we would never leave `InputMode::EditSize` and `u`/`d`
-                        // would be swallowed there. Forward `Press`/`Repeat` always, and `Release`
+                        // `Release` for Return — we would never leave `InputMode::EditSize` and quick
+                        // trade keys would be swallowed there. Forward `Press`/`Repeat` always, and `Release`
                         // only for Enter (Return).
                         let forward = matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
                             || (k.kind == KeyEventKind::Release && k.code == KeyCode::Enter);

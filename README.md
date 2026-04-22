@@ -1,32 +1,35 @@
-# Polymarket "Bitcoin Up or Down 5m" trading terminal
+# Polymarket crypto up/down trading terminal
 
-A Rust TUI for trading Polymarket's 5-minute **Bitcoin Up or Down** prediction
-markets. Colors the live Chainlink BTC/USD price green/red against each
-window's opening "Price to Beat", shows both sides of the order book, your
-current UP/DOWN positions with unrealized PnL, and lets you fire **FAK**
-market orders or **GTD** limit orders that auto-expire just before the
-current 5m window closes — all from single-key actions.
+A Rust TUI for Polymarket’s rolling **Up or Down** crypto prediction markets
+(**BTC, ETH, SOL, XRP**), with **5-minute** and **15-minute** windows. On launch, a
+short **wizard** loads live series from Gamma: pick an asset, then a timeframe,
+then the terminal shows the same layout as before — live Chainlink **spot** price
+(via RTDS) vs each window’s opening **Price to Beat**, full UP/DOWN order book,
+your positions with unrealized PnL, optional **Sentiment** (CLOB mid or Data API
+top holders), **FAK** market orders and **GTD** limit orders that expire just
+before the window closes, plus **Polymarket Bridge** Solana USDC deposit (**`f`**) —
+all from single-key actions where possible.
 
 ## Architecture
 
 ```
 ┌─────────────────────┐   ┌───────────────────────────────┐   ┌────────────────────┐
 │ Crossterm keys      │   │                               │   │ Chainlink RTDS WS  │
-│ + resize / focus    │──▶│  mpsc<AppEvent> (bounded)     │◀──│ BTC/USD ticks      │
-└─────────────────────┘   │  coalesce bursts (price/book) │   └────────────────────┘
-┌─────────────────────┐   │            ↓                  │   ┌─────────────────────┐
-│ 1 Hz Tick           │──▶│         AppState              │◀──│ CLOB market WS      │
-└─────────────────────┘   │            ↓                  │   │ per-market book     │
-┌─────────────────────┐   │     ratatui::draw             │   │ (supervisor restarts│
-│ Gamma poll 60s/1s   │──▶│  throttled ~20 Hz on feeds    │   │  on each roll)      │
-│ (discovery)         │   │                               │   └─────────────────────┘
+│ + resize / focus    │──▶│  mpsc<AppEvent> (bounded)     │◀──│ per-asset spot     │
+└─────────────────────┘   │  coalesce bursts (price/book) │   │  (e.g. btc/usd)    │
+┌─────────────────────┐   │            ↓                  │   └────────────────────┘
+│ 1 Hz Tick           │──▶│         AppState              │   ┌─────────────────────┐
+└─────────────────────┘   │            ↓                  │   │ CLOB market WS      │
+┌─────────────────────┐   │     ratatui::draw             │   │ CLOB user WS        │
+│ Gamma poll 15s/1s   │──▶│  throttled ~20 Hz on feeds    │   │ (fills, subs roll)  │
+│ (asset + 5m/15m)    │   │                               │   └─────────────────────┘
 │                     │   └───────────────┬───────────────┘
 └─────────────────────┘                   │
          ┌────────────────────────────────┼────────────────────────────┐
          ▼                                ▼                            ▼
 ┌─────────────────┐              ┌──────────────────┐        ┌─────────────────────┐
 │ Gamma REST      │              │ TradingClient    │        │ Data API (HTTP)     │
-│ ActiveMarket    │              │ EIP-712 orders   │        │ positions index,    │
+│ ActiveMarket    │              │ EIP-712 orders   │        │ positions, holders, │
 │ resolution      │              │ L1/L2 CLOB REST  │        │ neg-risk claimable  │
 └─────────────────┘              └──────────────────┘        │ (roll bootstrap)    │
                                                              └──────────┬──────────┘
@@ -42,15 +45,23 @@ current 5m window closes — all from single-key actions.
 Many async producers share one `mpsc<AppEvent>` channel (buffer 512): keyboard
 and focus/resize handling, a 1&nbsp;Hz ticker, Chainlink price (via a small
 forwarder that keeps only the latest tick per burst), CLOB book snapshots (via
-a forwarder that merges concurrent UP/DOWN updates), market rolls, position /
-open-order / balance snapshots, and order status lines. The main loop drains
+a forwarder that merges concurrent UP/DOWN updates), **CLOB user-channel** trades
+and order hints (long-lived WSS, market subscription swaps on each roll), market
+rolls, position / open-order / balance / **top-holders** snapshots, and order
+status lines. The main loop drains
 events in batches, applies them to `AppState`, and calls `Terminal::draw`. When
 a batch has **no** key events, redraws are **throttled** (`FEED_REDRAW_MIN`,
 50&nbsp;ms) so feed-heavy sessions do not pin a CPU core — see ratatui
 discussion around high-frequency `draw`.
 
+Before the trading screen, a **startup wizard** (`gamma_series` + Gamma) lists
+assets with live 5m series metadata; the user picks **5m** or **15m** and
+`AppEvent::StartTrading` spawns RTDS, discovery, and feed tasks for that
+[`MarketProfile`](src/market_profile.rs).
+
 Key events go through `events::handle_key`, which returns a pure `Action`. The
-runtime dispatches trading, cancel, and **redeem all** (`x` / `X`) on separate
+runtime dispatches trading, cancel, **redeem all** (`x` / `X`), and **bridge
+deposit** (`f`) on separate
 `tokio` tasks — **no** network I/O on the render path. On startup, API
 credential derivation also runs in the background so the TUI can paint before
 L2 auth completes.
@@ -62,18 +73,24 @@ later REST calls use HMAC-SHA256 over `ts + method + path + body`.
 
 **Networking.** `net` builds a proxy-aware `reqwest` client and WebSocket
 tunnels (`POLYMARKET_PROXY`: HTTP `CONNECT` or SOCKS5, then TLS + WS) shared by
-Gamma, CLOB REST, Data API, RTDS, and both CLOB sockets. The **balance panel**
-uses a **separate** HTTP client to `POLYGON_RPC_URL` only (no proxy) so
-`eth_call` reads stay fast and are not routed through a Polymarket-blocked path.
+Gamma, CLOB REST, Data API, RTDS, CLOB **market** socket, and CLOB **user**
+socket. The **balance panel** uses a **separate** HTTP client to `POLYGON_RPC_URL`
+only (no proxy) so `eth_call` reads stay fast and are not routed through a
+Polymarket-blocked path. **Polymarket Bridge** (`bridge.polymarket.com`) and
+**public** Data API `GET /holders` use the same proxy-capable client as the rest
+of the Polymarket-facing stack.
 
-**Market discovery.** A background task calls `GammaClient::find_current_btc_5m`
-once at startup, then **every 60&nbsp;s** while the current window is open and
-**every 1&nbsp;s** after `closes_at` until Gamma exposes the next window (only one
-Gamma request at a time via an async mutex). It resolves the active
-`btc-updown-5m-*` [`ActiveMarket`](src/gamma.rs). A supervisor task aborts
-the previous per-market book WebSocket and starts a new one on each roll; it
-also kicks off a positions sync (CLOB balances + `/data/trades` replay, Data API
-sizes for escrowed sells) and a 5&nbsp;s open-order poller.
+**Market discovery.** After you finish the wizard, a background task uses
+`GammaClient::find_current_updown` for your [`MarketProfile`](src/market_profile.rs)
+(rolling slugs like `{asset}-updown-{5m|15m}-<window_start>`). While the
+current window is open it polls at most **every 15&nbsp;s** (and wakes at
+`closes_at` so the next tick runs as soon as the window ends). **After** `closes_at`
+it hits the **next** window slug at **1&nbsp;Hz** until Gamma returns 200. Only one
+Gamma request runs at a time (async mutex). A supervisor aborts
+the previous per-market **book** WebSocket and starts a new one on each roll; it
+also updates the **user** WebSocket subscription, kicks off a positions sync (CLOB
+balances + `/data/trades` replay, Data API sizes for escrowed sells), a 5&nbsp;s
+open-order poller, and a top-holders poller for header **Sentiment**.
 
 **Balances and claimable.** A 5&nbsp;s task reads **on-chain** values via Polygon
 [Multicall3](https://github.com/mds1/multicall) **`aggregate3`** (one `eth_call`
@@ -97,8 +114,10 @@ PnL and for limit prices after optional **market BUY → GTD take-profit** sells
 (`MARKET_BUY_TAKE_PROFIT_BPS`).
 
 **Price feed.** `wss://ws-live-data.polymarket.com` → topic
-`crypto_prices_chainlink` → filter `symbol=btc/usd` — the same feed used for
-resolution, so the header matches settlement logic.
+`crypto_prices_chainlink` → `symbol=<asset>/usd` from the wizard (e.g. `btc/usd`,
+`eth/usd`) — the same class of feed used for resolution, so the header aligns with
+settlement. Polymarket’s HTTP **crypto-price** endpoint supplies the **Price to
+Beat** (with description / RTDS latch as fallbacks; see `gamma` + `data_api`).
 
 ## Debugging
 
@@ -134,10 +153,10 @@ the server still says 401, the problem is usually one of:
 
 ## Geo-restricted? Use a proxy
 
-Polymarket blocks a broad set of IPs at the edge. If `cargo run` shows no BTC
-price, no order book, and Gamma errors in the log, you're almost certainly
-being blocked. Set `POLYMARKET_PROXY` in `.env` and everything — REST
-(Gamma, CLOB REST) plus WebSockets (Chainlink RTDS, CLOB book) — will
+Polymarket blocks a broad set of IPs at the edge. If `cargo run` shows no
+**spot** price, no order book, and Gamma errors in the log, you're almost
+certainly being blocked. Set `POLYMARKET_PROXY` in `.env` and everything — REST
+(Gamma, CLOB REST) plus WebSockets (Chainlink RTDS, CLOB book and user) — will
 tunnel through it:
 
 ```
@@ -205,7 +224,7 @@ layer (headers, proxy, TLS).
 
 ```sh
 git clone <your-fork>
-cd polymarket-btc5m
+cd <repo-directory>
 cp .env.example .env
 # ...edit .env with your keys (incl. POLYGON_RPC_URL for on-chain balance reads)
 cargo build --release
@@ -222,20 +241,33 @@ and that the process was restarted after editing `.env`.
 RUST_LOG=polymarket-btc5m=debug ./target/release/polymarket-btc5m
 ```
 
+On first launch the TUI **loads series** for each supported asset, then:
+
+1. **Pick asset** (↑/↓ or `j`/`k`, Enter) — BTC, ETH, SOL, or XRP.
+2. **Pick timeframe** — **5m** or **15m** (↑/↓ or `j`/`k`, Enter). `B` / `Esc` goes back;
+   `q` / `Ctrl-C` quits.
+
+After that you are in the trading screen. From there, **`Esc`** returns to the
+timeframe step (not quit); use **`q`** or **Ctrl-C** to exit the app.
+
 ## Key bindings
 
-Normal mode:
+Trading screen — normal mode:
 
 | key     | action                                 |
 |---------|----------------------------------------|
-| `u` / `d` | **market BUY** UP / DOWN (FAK at best ask) |
-| `U` / `D` | **market SELL** UP / DOWN (FAK at best bid) |
+| `w` / `s` | **market BUY** UP / DOWN (FAK at best ask) — WASD layout |
+| `a` / `d` | **market SELL** UP / DOWN (FAK at best bid) |
 | `l`     | open limit-order modal                 |
 | `c`     | cancel ALL open orders                 |
 | `x` / `X` | **redeem all** claimable resolved positions (relayer + Safe; see *Balances and claimable*) |
-| `s`     | edit persistent ticket size            |
+| `e`     | edit persistent ticket size            |
+| `f`     | **Polymarket Bridge** — fetch Solana (`svm`) USDC deposit address + terminal QR |
 | `r`     | force-refresh active market            |
-| `q` / `Esc` / `Ctrl-C` | quit                    |
+| `q` / `Ctrl-C` | quit                    |
+| `Esc`   | leave trading → **timeframe** wizard step |
+
+Holding a key down does **not** fire repeated market orders (`Repeat` is ignored).
 
 **Sizing (Polymarket CLOB).** Per [Create order](https://docs.polymarket.com/developers/CLOB/orders/create-order), **FAK/FOK market BUY** is a **USDC dollar budget** (“specify the dollar amount you want to spend”); **market SELL** is **outcome shares**. **GTC/GTD limit BUY** uses **`size` in shares** at your limit price (this TUI’s limit modal still types BUY size as USDC notional, then converts to shares before submit). The `minimum_order_size` / `min_order_size` fields on [`getOrderBook`](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getOrderBook) are **share** thresholds— they align with **limit** flow and **share-sized** legs, **not** a direct “\$5 minimum spend” on **market BUY**. Small **market BUY** tickets (e.g. **\$1** while the ask is **> 0.5**, i.e. fewer than five shares if fully filled at that price) can still match in practice; third-party guides often cite **~\$1** as a **market** floor and **~5 shares** for **limits** (e.g. [Start Polymarket — How to Trade](https://startpolymarket.com/guides/how-to-trade/)). If placement fails with `INVALID_ORDER_MIN_SIZE`, increase size or re-check book metadata for that token.
 
@@ -243,14 +275,16 @@ Limit modal:
 
 | key     | action                                 |
 |---------|----------------------------------------|
+| `w` / `s` / `a` / `d` | same as trading screen: set outcome + side (UP/DOWN buy/sell) |
 | ← / →   | flip outcome (UP ↔ DOWN)               |
 | ↑ / ↓   | flip side (BUY ↔ SELL)                 |
 | `Tab`   | switch price / size field              |
 | digits / `.` | edit current field                |
 | `Enter` | submit as **GTD** limit order          |
+| `x` / `X` | **redeem all** (closes modal)      |
 | `Esc`   | cancel modal                           |
 
-The modal enforces at least **5 outcome shares** on submit after converting BUY notional → shares (SELL: size is already shares). That matches typical **`minimum_order_size`** on **btc-updown-5m-*** books and avoids `INVALID_ORDER_MIN_SIZE` on **GTD**; see `min_order_size` / `minimum_order_size` in Polymarket’s [order book](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getOrderBook) / [market](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getMarket) payloads (values can differ by slug).
+The modal enforces at least **5 outcome shares** on submit after converting BUY notional → shares (SELL: size is already shares). That matches typical **`minimum_order_size`** on these rolling crypto up/down books and avoids `INVALID_ORDER_MIN_SIZE` on **GTD**; see `min_order_size` / `minimum_order_size` in Polymarket’s [order book](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getOrderBook) / [market](https://docs.polymarket.com/developers/CLOB/clients/methods-public#getMarket) payloads (values can differ by slug).
 
 GTD expiration is chosen so the order stops resting about **one second before** the active market’s `closes_at`. The CLOB expects a unix `expiration` field with Polymarket’s **+60s** security buffer on top of that instant (see [Create order → GTD](https://docs.polymarket.com/developers/CLOB/orders/create-order)). **CLOB API signing version must be 1** (EIP-712 includes `expiration`); if `/version` returns `2`, GTD placement is rejected until the client supports it.
 
@@ -264,10 +298,10 @@ Size edit mode:
 
 ## What's intentionally *not* here
 
-- **User channel WebSocket (authenticated fills).** Fills today are
-  synthesised from successful order acks. For a tighter PnL, subscribe to
-  `wss://ws-subscriptions-clob.polymarket.com/ws/user` with L2 auth and
-  merge into `AppState` — same code path as book events.
+- **Full parity with the web app.** The CLOB **user** WebSocket is connected
+  (`wss://ws-subscriptions-clob.polymarket.com/ws/user`); trades and some order
+  metadata merge into `AppState`, with REST + order-ack fallbacks. Edge cases
+  (partial fills, unusual order states) may still differ from the website.
 - **On-chain allowance setting.** Assumed pre-approved; if not, run a
   one-time script to call `USDC.approve` and `CTF.setApprovalForAll` for the
   two Exchange contracts.
@@ -275,28 +309,36 @@ Size edit mode:
   markets through the relayer only when `POLYMARKET_RELAYER_API_KEY` and
   `POLYMARKET_RELAYER_API_KEY_ADDRESS` are set (Safe / `sig_type=2`). Otherwise
   use the web Portfolio **Claim** flow or another tool.
-- **Persistence.** Realized PnL resets on restart. Swap the `VecDeque<Fill>`
-  for a sqlite table if you want history across sessions.
+- **Persistence.** Realized PnL and fill history are in-memory. Swap the
+  `VecDeque<Fill>` for a sqlite table if you want history across sessions.
+- **Daily (1D) markets in the wizard.** Code supports **daily** calendar slugs
+  (`Timeframe::D1`) in discovery; the first-run UI currently offers **5m** and
+  **15m** only.
 
 ## Project layout
 
 ```
 src/
-├── main.rs                 # tokio runtime, TUI init, event loop, action dispatch
-├── config.rs               # env vars, endpoints, SignatureType
+├── main.rs                 # tokio runtime, TUI init, event loop, action dispatch, wizard
+├── config.rs               # env vars, endpoints, SignatureType, CTF exchange addrs
 ├── app.rs                  # AppState, positions, fills, AppEvent reducer
 ├── events.rs               # keyboard → Action (pure)
-├── gamma.rs                # Gamma REST, ActiveMarket, GTD expiration helper
-├── trading.rs              # EIP-712 orders, L1/L2 auth, CLOB REST
+├── market_profile.rs       # CryptoAsset list, Timeframe, rolling/daily slug helpers
+├── gamma_series.rs         # Gamma `GET /series` for wizard rows
+├── gamma.rs                # Gamma REST, ActiveMarket, find_current_updown, GTD exp
+├── trading.rs              # EIP-712 orders, L1/L2 auth, CLOB REST, user-channel parse
 ├── balances.rs             # On-chain USDC.e + CTF claimable (Polygon Multicall3)
-├── data_api.rs             # Data API: positions, redeemable index, neg-risk
+├── data_api.rs             # Data API: positions, holders, redeemable, neg-risk
+├── bridge_deposit.rs       # Polymarket Bridge HTTP → Solana USDC deposit + QR
 ├── redeem.rs               # CTF redeem via Polymarket relayer (Safe)
 ├── fees.rs                 # crypto taker fee + take-profit limit price
 ├── net.rs                  # proxy-aware HTTP + WebSocket connect
 ├── feeds/
-│   ├── chainlink.rs        # RTDS WS → PriceTick
+│   ├── chainlink.rs        # RTDS WS → PriceTick (symbol from profile)
 │   ├── clob_ws.rs          # per-market CLOB WS → BookSnapshot
-│   └── market_discovery_gamma.rs  # Gamma poll → ActiveMarket
+│   ├── clob_user_ws.rs     # authenticated CLOB user WS → fills, order hints
+│   ├── user_trade_sync.rs  # trade replay / de-dupe vs user stream
+│   └── market_discovery_gamma.rs  # Gamma poll + roll → ActiveMarket
 └── ui/
     └── render.rs           # ratatui layout
 ```
@@ -306,7 +348,7 @@ src/
 This bot signs orders on your behalf. Until you're confident in its
 behaviour:
 
-1. Start with a small `DEFAULT_SIZE_USDC`. **`u` / `d` market BUY** uses that
+1. Start with a small `DEFAULT_SIZE_USDC`. **`w` / `s` market BUY** uses that
    value as a **USDC spend** budget (Polymarket **FAK BUY** = dollars; see
    [Create order → Order types](https://docs.polymarket.com/developers/CLOB/orders/create-order)),
    so **\$1** tickets can fill even when the implied share count is **below**

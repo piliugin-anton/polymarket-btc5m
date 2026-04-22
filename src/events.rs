@@ -33,8 +33,8 @@ pub enum Action {
 /// enabled (`PushKeyboardEnhancementFlags`), `KeyEvent.state` includes lock-key bits from the
 /// terminal. If Caps Lock was toggled while the terminal pane was unfocused, some emulators emit
 /// uppercase letters with **no** `CAPS_LOCK` in the mask (stale output) — treat that like lowercase
-/// for our `u`/`d`/`U`/`D` bindings. When `state` is empty (legacy mode), keep the character as-is
-/// so Caps Lock still maps to uppercase sells.
+/// for our `w`/`s`/`a`/`d` quick-trade bindings. When `state` is empty (legacy mode), keep the
+/// character as-is; handlers use case-insensitive matching so `W`/`A`/etc. still work.
 fn normalize_terminal_key_event(k: KeyEvent) -> KeyEvent {
     let KeyCode::Char(c) = k.code else {
         return k;
@@ -110,16 +110,16 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
             go_to_wizard_timeframe(state);
             Action::None
         }
-        // Quick market orders — lowercase buys, uppercase sells, matching convention
-        KeyCode::Char('u') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Buy,  size_usdc: size },
-        KeyCode::Char('d') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Buy,  size_usdc: size },
-        KeyCode::Char('U') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Sell, size_usdc: size },
-        KeyCode::Char('D') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Sell, size_usdc: size },
+        // Quick market: WASD-style — W/S buy UP/DOWN, A/D sell UP/DOWN
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Buy,  size_usdc: size },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Buy,  size_usdc: size },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => Action::PlaceMarket { outcome: Outcome::Up,   side: Side::Sell, size_usdc: size },
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => Action::PlaceMarket { outcome: Outcome::Down, side: Side::Sell, size_usdc: size },
 
         // Cancel all
         KeyCode::Char('c') => Action::CancelAll,
 
-        // Open limit modal — default BUY UP; change outcome/side inside modal (←/→, ↑/↓, u/d/U/D).
+        // Open limit modal — default BUY UP; change outcome/side inside modal (←/→, ↑/↓, w/s/a/d).
         KeyCode::Char('l') => {
             state.limit_price_input.clear();
             state.limit_size_input = state.size_input.clone();
@@ -130,7 +130,7 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         }
 
         // Edit persistent size
-        KeyCode::Char('s') => {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
             state.input_mode = InputMode::EditSize;
             Action::None
         }
@@ -281,26 +281,26 @@ fn limit_mode(state: &mut AppState, k: KeyEvent, outcome: Outcome, side: Side, f
             Action::Claim
         }
         KeyCode::Esc => { state.input_mode = InputMode::Normal; Action::None }
-        // Same quick keys as normal mode: u/d buy UP/DOWN, U/D sell UP/DOWN
-        KeyCode::Char('u') => {
+        // Same quick keys as normal mode: w/s buy UP/DOWN, a/d sell UP/DOWN
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'w') => {
             state.input_mode = InputMode::LimitModal {
                 outcome: Outcome::Up, side: Side::Buy, field,
             };
             Action::None
         }
-        KeyCode::Char('d') => {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'s') => {
             state.input_mode = InputMode::LimitModal {
                 outcome: Outcome::Down, side: Side::Buy, field,
             };
             Action::None
         }
-        KeyCode::Char('U') => {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'a') => {
             state.input_mode = InputMode::LimitModal {
                 outcome: Outcome::Up, side: Side::Sell, field,
             };
             Action::None
         }
-        KeyCode::Char('D') => {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&'d') => {
             state.input_mode = InputMode::LimitModal {
                 outcome: Outcome::Down, side: Side::Sell, field,
             };
@@ -396,7 +396,7 @@ mod tests {
     fn uppercase_without_caps_in_protocol_state_maps_to_lowercase() {
         let mut state = test_state();
         let ev = KeyEvent::new_with_kind_and_state(
-            KeyCode::Char('U'),
+            KeyCode::Char('W'),
             KeyModifiers::NONE,
             KeyEventKind::Press,
             KeyEventState::NUM_LOCK,
@@ -411,7 +411,7 @@ mod tests {
     fn uppercase_with_caps_lock_unchanged() {
         let mut state = test_state();
         let ev = KeyEvent::new_with_kind_and_state(
-            KeyCode::Char('U'),
+            KeyCode::Char('A'),
             KeyModifiers::NONE,
             KeyEventKind::Press,
             KeyEventState::CAPS_LOCK,
@@ -425,7 +425,7 @@ mod tests {
     #[test]
     fn normal_mode_ignores_key_repeat() {
         let mut state = test_state();
-        let ev = KeyEvent::new_with_kind(KeyCode::Char('u'), KeyModifiers::NONE, KeyEventKind::Repeat);
+        let ev = KeyEvent::new_with_kind(KeyCode::Char('w'), KeyModifiers::NONE, KeyEventKind::Repeat);
         assert!(matches!(handle_key(&mut state, ev), Action::None));
     }
 
