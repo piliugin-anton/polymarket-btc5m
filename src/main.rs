@@ -26,6 +26,8 @@ mod feeds;
 mod gamma;
 mod market_profile;
 mod gamma_series;
+
+use market_profile::{MarketProfile, CRYPTO_ASSETS, Timeframe};
 mod net;
 mod trading;
 mod ui;
@@ -88,6 +90,8 @@ fn apply_app_event(
     user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     rtds_sym_tx:     &watch::Sender<String>,
     market_tx:       &mpsc::Sender<gamma::ActiveMarket>,
+    market_profile_tx: &watch::Sender<Arc<MarketProfile>>,
+    market_profile_rx_slot: &mut Option<watch::Receiver<Arc<MarketProfile>>>,
     discovery_spawned: &mut bool,
 ) -> bool {
     match ev {
@@ -109,14 +113,18 @@ fn apply_app_event(
         e => {
             if let AppEvent::StartTrading(p) = &e {
                 let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
+                let _ = market_profile_tx.send(p.clone());
                 if !*discovery_spawned {
-                    *discovery_spawned = true;
-                    let txi = tx.clone();
-                    let mtx = market_tx.clone();
-                    let prof = p.clone();
-                    tokio::spawn(async move {
-                        feeds::market_discovery_gamma::spawn(txi, mtx, prof);
-                    });
+                    if let Some(rx) = market_profile_rx_slot.take() {
+                        *discovery_spawned = true;
+                        let txi = tx.clone();
+                        let mtx = market_tx.clone();
+                        tokio::spawn(async move {
+                            feeds::market_discovery_gamma::spawn(txi, mtx, rx);
+                        });
+                    } else {
+                        warn!("market discovery: profile receiver missing — cannot spawn Gamma poll");
+                    }
                 }
             }
             state.apply(e);
@@ -295,8 +303,14 @@ async fn main() -> Result<()> {
         }
     }
 
-    // Market discovery: started after the wizard calls [`AppEvent::StartTrading`].
+    // Market discovery: first [`AppEvent::StartTrading`] spawns the task; later starts update profile via watch.
     let (market_tx, mut market_rx) = mpsc::channel::<gamma::ActiveMarket>(8);
+    let profile_watch_seed = Arc::new(MarketProfile {
+        asset: CRYPTO_ASSETS[0].clone(),
+        timeframe: Timeframe::M5,
+    });
+    let (market_profile_tx, market_profile_rx) = watch::channel(profile_watch_seed);
+    let mut market_profile_rx_slot = Some(market_profile_rx);
 
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();
@@ -657,6 +671,8 @@ async fn main() -> Result<()> {
                 &user_open_ledger,
                 &rtds_sym_tx,
                 &market_tx,
+                &market_profile_tx,
+                &mut market_profile_rx_slot,
                 &mut discovery_spawned,
             ) {
                 should_quit = true;
@@ -695,6 +711,8 @@ async fn main() -> Result<()> {
                                 &user_open_ledger,
                                 &rtds_sym_tx,
                                 &market_tx,
+                                &market_profile_tx,
+                                &mut market_profile_rx_slot,
                                 &mut discovery_spawned,
                             ) {
                                 should_quit = true;
@@ -722,6 +740,8 @@ async fn main() -> Result<()> {
                     &user_open_ledger,
                     &rtds_sym_tx,
                     &market_tx,
+                    &market_profile_tx,
+                    &mut market_profile_rx_slot,
                     &mut discovery_spawned,
                 ) {
                     should_quit = true;

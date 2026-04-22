@@ -598,6 +598,20 @@ impl AppState {
                 self.status_line = "Select asset (↑/↓ Enter) — Q quit".into();
             }
             AppEvent::StartTrading(p) => {
+                // Clear the previous market’s UI until Gamma resolves the new profile’s window.
+                self.input_mode = InputMode::Normal;
+                self.order_error_toast = None;
+                self.market = None;
+                self.book_up = None;
+                self.book_down = None;
+                self.latched_price_to_beat = None;
+                self.position_up = Default::default();
+                self.position_down = Default::default();
+                self.fak_net_up = 0.0;
+                self.fak_net_down = 0.0;
+                self.open_orders.clear();
+                self.top_holders_up_sum = None;
+                self.top_holders_down_sum = None;
                 self.market_profile = Some(p.clone());
                 self.ui_phase = UiPhase::Trading;
                 self.status_line = "Waiting for market data…".into();

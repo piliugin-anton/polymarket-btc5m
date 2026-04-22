@@ -10,7 +10,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use chrono::{DateTime, Utc};
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{info, warn};
 
 use crate::app::AppEvent;
@@ -180,39 +180,39 @@ fn poll_delay_after_tick(
     std::cmp::min(until_close, regular)
 }
 
-/// `profile` is fixed for the process (chosen in the TUI wizard before this task is spawned).
+/// `profile_rx` tracks the wizard’s current [`MarketProfile`] (asset + timeframe). Each
+/// `StartTrading` updates the watch so switching 5m ↔ 15m re-runs Gamma against the new grid.
 pub fn spawn(
-    tx:       mpsc::Sender<AppEvent>,
-    market_tx: mpsc::Sender<gamma::ActiveMarket>,
-    profile:  Arc<MarketProfile>,
+    tx:         mpsc::Sender<AppEvent>,
+    market_tx:  mpsc::Sender<gamma::ActiveMarket>,
+    mut profile_rx: watch::Receiver<Arc<MarketProfile>>,
 ) {
     tokio::spawn(async move {
         let gamma = Arc::new(Mutex::new(GammaClient::new()));
         let mut last_emitted: Option<(String, Option<f64>)> = None;
         let mut last_window_end: Option<DateTime<Utc>> = None;
+        let mut seen_profile: Arc<MarketProfile> = profile_rx.borrow().clone();
 
         let in_window_secs = GAMMA_POLL_IN_WINDOW_SECS;
         info!(
             in_window_sec = in_window_secs,
-            ?profile,
-            "market discovery: Gamma poll (mutex-serialized; sleeps until min(in_window, until closes_at), then slug poll)"
+            ?seen_profile,
+            "market discovery: Gamma poll (mutex-serialized; profile from watch; sleeps until min(in_window, until closes_at), then slug poll)"
         );
 
-        if !try_roll_market(
-            &gamma,
-            &tx,
-            &market_tx,
-            &mut last_emitted,
-            &mut last_window_end,
-            &profile,
-        )
-        .await
-        {
-            return;
-        }
-
         loop {
-            tokio::time::sleep(poll_delay_after_tick(last_window_end, in_window_secs)).await;
+            let profile = profile_rx.borrow().clone();
+            if *seen_profile != *profile {
+                info!(
+                    old = ?seen_profile,
+                    new = ?profile,
+                    "market discovery: profile changed — resetting roll state"
+                );
+                last_emitted = None;
+                last_window_end = None;
+                seen_profile = profile.clone();
+            }
+
             if !try_roll_market(
                 &gamma,
                 &tx,
@@ -224,6 +224,16 @@ pub fn spawn(
             .await
             {
                 return;
+            }
+
+            let delay = poll_delay_after_tick(last_window_end, in_window_secs);
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                res = profile_rx.changed() => {
+                    if res.is_err() {
+                        return;
+                    }
+                }
             }
         }
     });
