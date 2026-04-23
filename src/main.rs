@@ -30,6 +30,7 @@ mod gamma_series;
 use market_profile::{MarketProfile, CRYPTO_ASSETS, Timeframe};
 mod net;
 mod trading;
+mod trailing_stop;
 mod ui;
 
 use anyhow::{Context, Result};
@@ -128,8 +129,66 @@ fn apply_app_event(
                 }
             }
             state.apply(e);
+            try_dispatch_trailing_sell(
+                state,
+                trading,
+                tx,
+                user_open_ledger,
+                cfg,
+            );
             false
         }
+    }
+}
+
+/// After a book tick trips the client-side trail, place a FAK SELL as soon as the CLOB has a bid.
+fn try_dispatch_trailing_sell(
+    state: &mut AppState,
+    trading: &Arc<TradingClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    cfg: &Config,
+) {
+    let ex = match state.pending_trailing_sell {
+        Some(x) => x,
+        None => return,
+    };
+    let m = match state.market.clone() {
+        Some(m) => m,
+        None => return,
+    };
+    let res = resolve_market_order(
+        state,
+        ex.outcome,
+        Side::Sell,
+        ex.sell_shares,
+        cfg.market_buy_slippage_bps,
+        cfg.market_sell_slippage_bps,
+    );
+    if let Some((shares, price, otype)) = res {
+        state.pending_trailing_sell = None;
+        info!(
+            outcome = ?ex.outcome,
+            sell_shares = shares,
+            price,
+            "trailing: dispatching FAK SELL (POST /order)"
+        );
+        spawn_order(
+            trading.clone(),
+            user_open_ledger.clone(),
+            tx.clone(),
+            m,
+            ex.outcome,
+            Side::Sell,
+            shares,
+            price,
+            otype,
+            None,
+            0,
+            0,
+            0,
+            false,
+        );
     }
 }
 
@@ -166,7 +225,8 @@ async fn main() -> Result<()> {
         funder = %cfg.funder,
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
         market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
-        "config loaded (take-profit after market BUY is active only if market_buy_take_profit_bps > 0)",
+        market_buy_trail_bps = cfg.market_buy_trail_bps,
+        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position)",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
@@ -1057,6 +1117,7 @@ fn dispatch_action(
                 buy_notional,
                 0,
                 cfg.market_buy_take_profit_bps,
+                cfg.market_buy_trail_bps,
                 false,
             );
         }
@@ -1103,6 +1164,7 @@ fn dispatch_action(
                 buy_notional,
                 exp_secs,
                 0,
+                0,
                 false,
             );
         }
@@ -1148,6 +1210,9 @@ fn spawn_order(
     buy_notional_usdc: Option<f64>,
     expiration_unix_secs: u64,
     take_profit_bps: u32,
+    // Trailing when > 0; `take_profit_bps` is the **gross** bps move vs entry to arm (see
+    // `RequestTrailingArm` / `try_promote_pending_trail`).
+    trail_bps: u32,
     // If true: GTD limit sell placed after a market buy (take-profit); used for targeted logging.
     is_take_profit_placement: bool,
 ) {
@@ -1162,6 +1227,8 @@ fn spawn_order(
             );
         }
         let market_for_refresh = market.clone();
+        let up_token = market_for_refresh.up_token_id.clone();
+        let down_token = market_for_refresh.down_token_id.clone();
         let token_id = match outcome {
             Outcome::Up   => market.up_token_id,
             Outcome::Down => market.down_token_id,
@@ -1189,6 +1256,7 @@ fn spawn_order(
                             limit_price = price,
                             buy_notional_usdc = ?buy_notional_usdc,
                             take_profit_bps,
+                            trail_bps,
                             success = resp.success,
                             status = ?resp.status,
                             order_id = ?resp.order_id,
@@ -1307,6 +1375,7 @@ fn spawn_order(
                     }
 
                     if take_profit_bps > 0
+                        && trail_bps == 0
                         && matches!(side, Side::Buy)
                         && otype == OrderType::Fak
                     {
@@ -1441,8 +1510,96 @@ fn spawn_order(
                                 None,
                                 exp_secs,
                                 0,
+                                0,
                                 true,
                             );
+                        }
+                    }
+
+                    if trail_bps > 0
+                        && matches!(side, Side::Buy)
+                        && otype == OrderType::Fak
+                    {
+                        if price >= 0.99 {
+                            info!(
+                                limit_price = price,
+                                outcome = ?outcome,
+                                "trailing: skipped — market FAK limit price >= 0.99",
+                            );
+                        } else {
+                            let Some((plan_sell_sh, entry_px, _amounts_from_api)) =
+                                resp.take_profit_fill_for_market_buy(shares, price)
+                            else {
+                                info!(
+                                    outcome = ?outcome,
+                                    success = resp.success,
+                                    status = ?resp.status,
+                                    "trailing: skipped — could not estimate fill",
+                                );
+                                let _ = tx
+                                    .send(AppEvent::StatusInfo(
+                                        "trailing skipped: no fill estimate (unexpected for FAK)"
+                                            .into(),
+                                    ))
+                                    .await;
+                                return;
+                            };
+                            info!(
+                                trail_bps,
+                                take_profit_bps,
+                                entry_px,
+                                outcome = ?outcome,
+                                "trailing: market BUY ok; arming when bid >= entry×(1+TP bps) (position avg or fill est.)"
+                            );
+                            let token_id = match outcome {
+                                Outcome::Up => up_token.clone(),
+                                Outcome::Down => down_token.clone(),
+                            };
+                            let mut plan_sh = plan_sell_sh;
+                            if let Some(oid) = resp.order_id.as_deref() {
+                                match tokio::time::timeout(
+                                    USER_WS_TP_FILL_WAIT,
+                                    cli.wait_user_channel_buy_fill(oid),
+                                )
+                                .await
+                                {
+                                    Ok(Ok(ws_fill)) => {
+                                        if ws_fill.size_shares.is_finite()
+                                            && ws_fill.size_shares > 1e-9
+                                        {
+                                            plan_sh = ws_fill.size_shares;
+                                            debug!(
+                                                shares = ws_fill.size_shares,
+                                                order_id = %oid,
+                                                "trailing: size from CLOB user WS trade"
+                                            );
+                                        }
+                                    }
+                                    Ok(Err(e)) => {
+                                        debug!(
+                                            error = %e,
+                                            order_id = %oid,
+                                            "trailing: user WS did not deliver fill (using REST estimate)"
+                                        );
+                                    }
+                                    Err(_) => {
+                                        debug!(
+                                            order_id = %oid,
+                                            "trailing: user WS fill wait timed out (using estimate)"
+                                        );
+                                    }
+                                }
+                            }
+                            let _ = tx
+                                .send(AppEvent::RequestTrailingArm {
+                                    outcome,
+                                    entry_price: entry_px,
+                                    plan_sell_shares: plan_sh,
+                                    token_id,
+                                    trail_bps,
+                                    activation_bps: take_profit_bps,
+                                })
+                                .await;
                         }
                     }
                 } else {
@@ -1494,6 +1651,7 @@ fn spawn_order(
                                 req_shares = shares,
                                 limit_price = price,
                                 take_profit_bps,
+                                trail_bps,
                                 "CLOB FAK (market) order request failed"
                             );
                         }

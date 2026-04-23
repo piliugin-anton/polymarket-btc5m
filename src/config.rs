@@ -59,9 +59,14 @@ pub struct Config {
     pub market_buy_slippage_bps: u32,
     /// Max fill slippage for market **sell** FAK orders (basis points; widens sell floor vs best bid).
     pub market_sell_slippage_bps: u32,
-    /// After a successful **market BUY** (FAK), place a GTD limit **SELL** at this profit margin in bps
-    /// over the fill price (2000 = 20%). `0` disables.
+    /// Bps margin: (1) with trailing **off** — GTD SELL after a market **Buy** at this edge
+    /// ([`crate::fees::take_profit_limit_price_crypto_after_fees`]). (2) with trailing **on** — trail
+    /// **arms** when `best_bid >= entry * (1 + bps/10_000)` with `entry` from the live position
+    /// (`avg_entry`) or the fill estimate until the position is applied (`0` = arm as soon as bid
+    /// reaches entry).
     pub market_buy_take_profit_bps: u32,
+    /// If positive after a market **Buy** (FAK), run a trailing stop on the bid, then FAK SELL; trail width in bps from peak.
+    pub market_buy_trail_bps: u32,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -118,6 +123,11 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        let market_buy_trail_bps = std::env::var("MARKET_BUY_TRAIL_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
+
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -153,6 +163,7 @@ impl Config {
             market_buy_slippage_bps,
             market_sell_slippage_bps,
             market_buy_take_profit_bps,
+            market_buy_trail_bps,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,

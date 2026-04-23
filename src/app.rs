@@ -10,7 +10,7 @@
 //! Trading actions post results back through the same channel.
 
 use chrono::{DateTime, Utc};
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -19,6 +19,7 @@ use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
+use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use crate::trading::{clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
 use tracing::debug;
 
@@ -91,15 +92,55 @@ pub enum AppEvent {
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
     /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
     StartTrading(std::sync::Arc<MarketProfile>),
+    /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until best bid
+    /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
+    RequestTrailingArm {
+        outcome:         Outcome,
+        /// Fill / REST estimate; used if position not yet updated.
+        entry_price:     f64,
+        plan_sell_shares: f64,
+        token_id:        String,
+        trail_bps:       u32,
+        /// Arm when `best_bid / entry >= 1 + activation_bps/10_000` (entry = live `avg_entry` with
+        /// open size, else `entry_price`). Same bps as GTD take-profit target, not fee-solved.
+        activation_bps:  u32,
+    },
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Outcome { Up, Down }
 impl Outcome {
     pub fn as_str(self) -> &'static str { match self { Outcome::Up => "UP", Outcome::Down => "DOWN" } }
     pub fn opposite(self) -> Self { match self { Outcome::Up => Outcome::Down, Outcome::Down => Outcome::Up } }
+}
+
+/// Client-side trailing for one outcome — fed by CLOB best bid; see [`crate::trailing_stop`].
+#[derive(Debug)]
+pub struct TrailingSession {
+    pub token_id: String,
+    pub stop:     TrailingStop,
+    /// Shares to target on the follow-up market SELL (capped by live position on trigger).
+    pub plan_sell_shares: f64,
+}
+
+/// Queued when the trail trips; `main` submits a FAK SELL (retries if the book is empty).
+#[derive(Debug, Clone, Copy)]
+pub struct TrailingExit {
+    pub outcome:     Outcome,
+    pub sell_shares: f64,
+}
+
+/// Trailing is registered after the buy, but the [`TrailingSession`] is created only when
+/// `best_bid` implies a **gross** move of at least `activation_bps` from the position entry.
+#[derive(Debug, Clone)]
+pub struct PendingTrailArm {
+    pub entry_price:     f64,
+    pub plan_sell_shares: f64,
+    pub token_id:        String,
+    pub trail_bps:       u32,
+    pub activation_bps:  u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -193,7 +234,7 @@ pub enum UiPhase {
     Trading,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct AppState {
     pub ui_phase: UiPhase,
     /// Gamma rows + fallback labels for the first wizard screen.
@@ -259,6 +300,13 @@ pub struct AppState {
 
     /// Deduplication between `OrderAck` and user-channel `trade` (see `feeds::user_trade_sync`).
     pub user_trade_sync: Arc<crate::feeds::user_trade_sync::UserTradeSync>,
+
+    /// Trailing stops keyed by outcome (independent Up / Down).
+    pub trailing: HashMap<Outcome, TrailingSession>,
+    /// Buy registered; waiting for `best_bid` to reach entry × (1 + TP bps) before arming the trail.
+    pub pending_trail_arms: HashMap<Outcome, PendingTrailArm>,
+    /// FAK SELL not yet successfully submitted (empty book, etc.).
+    pub pending_trailing_sell: Option<TrailingExit>,
 }
 
 impl AppState {
@@ -294,6 +342,9 @@ impl AppState {
             top_holders_up_sum: None,
             top_holders_down_sum: None,
             user_trade_sync,
+            trailing: HashMap::new(),
+            pending_trail_arms: HashMap::new(),
+            pending_trailing_sell: None,
         }
     }
 
@@ -392,6 +443,74 @@ impl AppState {
         self.size_input.parse().unwrap_or(self.default_size_usdc)
     }
 
+    /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
+    fn clear_trailing_on_sell(&mut self, o: Outcome) {
+        self.trailing.remove(&o);
+        self.pending_trail_arms.remove(&o);
+        if self.pending_trailing_sell.is_some_and(|p| p.outcome == o) {
+            self.pending_trailing_sell = None;
+        }
+    }
+
+    fn install_trailing_session(
+        &mut self,
+        outcome:         Outcome,
+        entry_price:     f64,
+        plan_sell_shares: f64,
+        token_id:        String,
+        trail_bps:       u32,
+    ) {
+        if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
+            return;
+        }
+        let p = (trail_bps as f64 / 10_000.0).max(1e-12);
+        let stop = TrailingStop::new(
+            TrailSide::Long,
+            entry_price,
+            TrailSpec::Percent(p),
+            Activation::Immediate,
+        );
+        self.trailing.insert(
+            outcome,
+            TrailingSession {
+                token_id,
+                stop,
+                plan_sell_shares,
+            },
+        );
+        self.status_line = format!(
+            "trailing {out} — {trail_bps} bps trail on bid, SELL up to {plan_sell_shares:.2} sh",
+            out = outcome.as_str()
+        );
+    }
+
+    /// If a pending trail for `oc` is satisfied by the current book and position, move into
+    /// [`Self::trailing`]. Entry for the threshold is live `avg_entry` when the outcome has
+    /// shares, otherwise the pending REST/fill `entry_price`.
+    fn try_promote_pending_trail(&mut self, oc: Outcome) {
+        let p0 = match self.pending_trail_arms.get(&oc) {
+            Some(n) => n,
+            None => return,
+        };
+        let bps = p0.activation_bps as f64 / 10_000.0;
+        let Some(bid) = self.best_bid(oc) else { return; };
+        let pos = self.position(oc);
+        let entry = if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+            pos.avg_entry
+        } else {
+            p0.entry_price
+        };
+        if !entry.is_finite() || entry <= 0.0 {
+            return;
+        }
+        let min_bid = entry * (1.0 + bps);
+        if bid + 1e-12 < min_bid {
+            return;
+        }
+        let p = self.pending_trail_arms.remove(&oc).unwrap();
+        self.install_trailing_session(oc, entry, p.plan_sell_shares, p.token_id, p.trail_bps);
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
     pub fn apply(&mut self, ev: AppEvent) {
         match ev {
@@ -419,8 +538,63 @@ impl AppState {
             }
             AppEvent::Book(b) => {
                 if let Some(m) = &self.market {
-                    if b.asset_id == m.up_token_id   { self.book_up   = Some(b); }
-                    else if b.asset_id == m.down_token_id { self.book_down = Some(b); }
+                    let outcome = if b.asset_id == m.up_token_id {
+                        self.book_up = Some(b.clone());
+                        Some(Outcome::Up)
+                    } else if b.asset_id == m.down_token_id {
+                        self.book_down = Some(b.clone());
+                        Some(Outcome::Down)
+                    } else {
+                        None
+                    };
+                    if let Some(oc) = outcome {
+                        if let Some(bid) = b.bids.first().map(|l| l.price) {
+                            self.try_promote_pending_trail(oc);
+                            // (plan shares, entry) when the trail trips — auto-SELL only if bid is still
+                            // **above** entry (profitable mark vs fill); do not market-sell on a sub-entry bid.
+                            let on_trigger: Option<(f64, f64)> = {
+                                if let Some(sess) = self.trailing.get(&oc) {
+                                    if sess.token_id == b.asset_id {
+                                        let out = sess.stop.on_price(bid);
+                                        if let TickOutcome::Triggered { .. } = out {
+                                            Some((
+                                                sess.plan_sell_shares,
+                                                sess.stop.entry_price(),
+                                            ))
+                                        } else {
+                                            None
+                                        }
+                                    } else {
+                                        None
+                                    }
+                                } else {
+                                    None
+                                }
+                            };
+                            if let Some((plan, entry_px)) = on_trigger {
+                                self.trailing.remove(&oc);
+                                if bid > entry_px {
+                                    let pos = self.position(oc).shares.max(0.0);
+                                    let sh = pos.min(plan);
+                                    if sh > 1e-9 {
+                                        self.pending_trailing_sell = Some(TrailingExit {
+                                            outcome:     oc,
+                                            sell_shares: sh,
+                                        });
+                                        self.status_line = format!(
+                                            "trailing: {} tripped (bid {bid:.3} > entry {entry_px:.3}) — SELL {sh:.2} sh",
+                                            oc.as_str()
+                                        );
+                                    }
+                                } else {
+                                    self.status_line = format!(
+                                        "trailing: {} tripped (bid {bid:.3} ≤ entry {entry_px:.3}) — no auto SELL",
+                                        oc.as_str()
+                                    );
+                                }
+                            }
+                        }
+                    }
                 }
             }
             AppEvent::MarketRoll(m) => {
@@ -442,6 +616,9 @@ impl AppState {
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
+                self.trailing.clear();
+                self.pending_trail_arms.clear();
+                self.pending_trailing_sell = None;
             }
             AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
                 if let Some(m) = &mut self.market {
@@ -486,6 +663,8 @@ impl AppState {
                         self.position_down.avg_entry,
                     );
                 }
+                self.try_promote_pending_trail(Outcome::Up);
+                self.try_promote_pending_trail(Outcome::Down);
             }
             AppEvent::OpenOrdersLoaded { orders } => {
                 self.open_orders = orders;
@@ -532,6 +711,11 @@ impl AppState {
                 trim_fills_to_cap(&mut self.fills, 64);
                 self.user_trade_sync
                     .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price);
+                if side == Side::Sell {
+                    self.clear_trailing_on_sell(outcome);
+                } else {
+                    self.try_promote_pending_trail(outcome);
+                }
                 self.status_line = format!("{} {qty:.2} {} @ {price:.3} (WSS trade)",
                     side_str(side), outcome.as_str());
             }
@@ -565,9 +749,42 @@ impl AppState {
                     if let Some(oid) = clob_order_id {
                         self.user_trade_sync.after_order_ack_applied(&oid, qty, price);
                     }
+                    if side == Side::Sell {
+                        self.clear_trailing_on_sell(outcome);
+                    } else {
+                        self.try_promote_pending_trail(outcome);
+                    }
                 }
                 self.status_line = format!("{} {qty:.2} {} @ {price:.3} ✓",
                     side_str(side), outcome.as_str());
+            }
+            AppEvent::RequestTrailingArm {
+                outcome,
+                entry_price,
+                plan_sell_shares,
+                token_id,
+                trail_bps,
+                activation_bps,
+            } => {
+                if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
+                    // Misconfiguration — main should not send; ignore.
+                } else {
+                    self.pending_trail_arms.insert(
+                        outcome,
+                        PendingTrailArm {
+                            entry_price,
+                            plan_sell_shares,
+                            token_id,
+                            trail_bps,
+                            activation_bps,
+                        },
+                    );
+                    self.status_line = format!(
+                        "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
+                        outcome.as_str()
+                    );
+                    self.try_promote_pending_trail(outcome);
+                }
             }
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
             AppEvent::OrderErrModal(e) => {
@@ -636,6 +853,9 @@ impl AppState {
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
+                self.trailing.clear();
+                self.pending_trail_arms.clear();
+                self.pending_trailing_sell = None;
                 self.market_profile = Some(p.clone());
                 self.ui_phase = UiPhase::Trading;
                 self.status_line = "Waiting for market data…".into();
