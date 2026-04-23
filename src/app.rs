@@ -105,6 +105,13 @@ pub enum AppEvent {
         /// open size, else `entry_price`). Same bps as GTD take-profit target, not fee-solved.
         activation_bps:  u32,
     },
+    /// Trailing FAK-SELL task finished: `success` when an order was accepted and UI ack sent;
+    /// on failure (after retries) clears the stuck trail + pending.
+    TrailingExitDispatchDone {
+        outcome: Outcome,
+        success: bool,
+        error:   Option<String>,
+    },
 }
 
 // ── UI-level types ──────────────────────────────────────────────────
@@ -307,6 +314,8 @@ pub struct AppState {
     pub pending_trail_arms: HashMap<Outcome, PendingTrailArm>,
     /// FAK SELL not yet successfully submitted (empty book, etc.).
     pub pending_trailing_sell: Option<TrailingExit>,
+    /// A trailing-exit FAK order is in flight (retries do not spawn duplicate tasks).
+    pub trailing_sell_in_flight: bool,
 }
 
 impl AppState {
@@ -345,6 +354,7 @@ impl AppState {
             trailing: HashMap::new(),
             pending_trail_arms: HashMap::new(),
             pending_trailing_sell: None,
+            trailing_sell_in_flight: false,
         }
     }
 
@@ -449,6 +459,7 @@ impl AppState {
         self.pending_trail_arms.remove(&o);
         if self.pending_trailing_sell.is_some_and(|p| p.outcome == o) {
             self.pending_trailing_sell = None;
+            self.trailing_sell_in_flight = false;
         }
     }
 
@@ -572,7 +583,8 @@ impl AppState {
                                 }
                             };
                             if let Some((plan, entry_px)) = on_trigger {
-                                self.trailing.remove(&oc);
+                                // Keep [`TrailingSession`] in `trailing` until a FAK SELL is acked
+                                // (or retries exhaust) — do not remove here.
                                 if bid > entry_px {
                                     let pos = self.position(oc).shares.max(0.0);
                                     let sh = pos.min(plan);
@@ -619,6 +631,7 @@ impl AppState {
                 self.trailing.clear();
                 self.pending_trail_arms.clear();
                 self.pending_trailing_sell = None;
+                self.trailing_sell_in_flight = false;
             }
             AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
                 if let Some(m) = &mut self.market {
@@ -856,9 +869,33 @@ impl AppState {
                 self.trailing.clear();
                 self.pending_trail_arms.clear();
                 self.pending_trailing_sell = None;
+                self.trailing_sell_in_flight = false;
                 self.market_profile = Some(p.clone());
                 self.ui_phase = UiPhase::Trading;
                 self.status_line = "Waiting for market data…".into();
+            }
+            AppEvent::TrailingExitDispatchDone { outcome, success, error } => {
+                self.trailing_sell_in_flight = false;
+                if !success {
+                    self.trailing.remove(&outcome);
+                    self.pending_trail_arms.remove(&outcome);
+                    if self.pending_trailing_sell.is_some_and(|p| p.outcome == outcome) {
+                        self.pending_trailing_sell = None;
+                    }
+                    if let Some(e) = error {
+                        self.status_line = format!("✗ {e}");
+                        self.order_error_toast = Some(OrderErrorToast {
+                            message: e,
+                            until:   Instant::now() + ORDER_ERROR_TOAST_TTL,
+                        });
+                    }
+                } else {
+                    // `OrderAck` should have cleared; if it was de-duped, still drop the tripped state.
+                    self.trailing.remove(&outcome);
+                    if self.pending_trailing_sell.is_some_and(|p| p.outcome == outcome) {
+                        self.pending_trailing_sell = None;
+                    }
+                }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }

@@ -81,6 +81,9 @@ const FEED_REDRAW_MIN: Duration = Duration::from_millis(50);
 /// size matches the pushed fill (often arrives before REST trade history).
 const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(80);
 
+/// Retries (no added sleep here; each attempt awaits the full `place_order` future).
+const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 fn apply_app_event(
     ev:     AppEvent,
@@ -141,7 +144,9 @@ fn apply_app_event(
     }
 }
 
-/// After a book tick trips the client-side trail, place a FAK SELL as soon as the CLOB has a bid.
+/// After a book tick trips the client-side trail, place a FAK SELL (with retries) as soon as the
+/// CLOB resolves a price. Keeps `pending_trailing_sell` + `trailing` until an order is acked or
+/// [`TRAILING_EXIT_FAK_ATTEMPTS`] fails.
 fn try_dispatch_trailing_sell(
     state: &mut AppState,
     trading: &Arc<TradingClient>,
@@ -149,6 +154,9 @@ fn try_dispatch_trailing_sell(
     user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     cfg: &Config,
 ) {
+    if state.trailing_sell_in_flight {
+        return;
+    }
     let ex = match state.pending_trailing_sell {
         Some(x) => x,
         None => return,
@@ -165,30 +173,181 @@ fn try_dispatch_trailing_sell(
         cfg.market_buy_slippage_bps,
         cfg.market_sell_slippage_bps,
     );
-    if let Some((shares, price, otype)) = res {
-        state.pending_trailing_sell = None;
-        info!(
-            outcome = ?ex.outcome,
-            sell_shares = shares,
+    let Some((shares, price, otype)) = res else {
+        // Empty book: keep `pending` + tripped `trailing` until a bid appears.
+        return;
+    };
+    state.trailing_sell_in_flight = true;
+    let outcome = ex.outcome;
+    let trading2 = trading.clone();
+    let ledger2 = user_open_ledger.clone();
+    let tx2 = tx.clone();
+    info!(
+        outcome = ?outcome,
+        sell_shares = shares,
+        price,
+        attempts = TRAILING_EXIT_FAK_ATTEMPTS,
+        "trailing: FAK SELL (await place_order, up to {n} attempts)",
+        n = TRAILING_EXIT_FAK_ATTEMPTS
+    );
+    tokio::spawn(async move {
+        run_trailing_exit_fak_sell(
+            trading2, ledger2, tx2, m, outcome, shares, price, otype,
+        )
+        .await;
+    });
+}
+
+async fn run_trailing_exit_fak_sell(
+    trading: Arc<TradingClient>,
+    user_open_ledger: std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    tx: mpsc::Sender<AppEvent>,
+    market: gamma::ActiveMarket,
+    outcome: Outcome,
+    shares: f64,
+    price: f64,
+    otype: OrderType,
+) {
+    let market_for_refresh = market.clone();
+    let token_id = match outcome {
+        Outcome::Up   => market.up_token_id.clone(),
+        Outcome::Down => market.down_token_id.clone(),
+    };
+    for attempt in 1u32..=TRAILING_EXIT_FAK_ATTEMPTS {
+        let args = OrderArgs {
+            token_id:        token_id.clone(),
+            side:            Side::Sell,
             price,
-            "trailing: dispatching FAK SELL (POST /order)"
-        );
-        spawn_order(
-            trading.clone(),
-            user_open_ledger.clone(),
-            tx.clone(),
-            m,
-            ex.outcome,
-            Side::Sell,
-            shares,
-            price,
-            otype,
-            None,
-            0,
-            0,
-            0,
-            false,
-        );
+            size:            shares,
+            neg_risk:        market.neg_risk,
+            tick_size:       market.tick_size.clone(),
+            buy_notional_usdc: None,
+            expiration_unix_secs: 0,
+            sell_skip_pre_post_settle: false,
+        };
+        let attempt_label = format!("{}/{}", attempt, TRAILING_EXIT_FAK_ATTEMPTS);
+        let cli = trading.clone();
+        match cli.place_order(args, otype).await {
+            Ok(resp) => {
+                // Same acceptance rule as `spawn_order` (FAK branch).
+                let ok_ui = resp.success
+                    || resp
+                        .status
+                        .as_ref()
+                        .is_some_and(|s| {
+                            s.eq_ignore_ascii_case("matched")
+                                || s.eq_ignore_ascii_case("delayed")
+                                || s.eq_ignore_ascii_case("live")
+                                || s.eq_ignore_ascii_case("open")
+                        });
+                if !ok_ui {
+                    let msg = resp
+                        .error
+                        .unwrap_or_else(|| format!("status={:?}", resp.status));
+                    if attempt < TRAILING_EXIT_FAK_ATTEMPTS {
+                        warn!(
+                            %attempt_label,
+                            outcome = ?outcome,
+                            %msg,
+                            "trailing exit: CLOB body not ok; retry"
+                        );
+                        continue;
+                    }
+                    let _ = tx
+                        .send(AppEvent::TrailingExitDispatchDone {
+                            outcome,
+                            success: false,
+                            error: Some(format!("trailing exit: {msg} ({attempt_label})")),
+                        })
+                        .await;
+                    return;
+                }
+                if otype != OrderType::Fak {
+                    let _ = tx
+                        .send(AppEvent::TrailingExitDispatchDone {
+                            outcome,
+                            success: false,
+                            error: Some("trailing exit: internal — expected FAK SELL".into()),
+                        })
+                        .await;
+                    return;
+                }
+                if let Some((ack_qty, ack_price)) =
+                    resp.fak_fill_for_position_ack(Side::Sell, shares, price)
+                {
+                    let _ = tx
+                        .send(AppEvent::OrderAck {
+                            side:  Side::Sell,
+                            outcome,
+                            qty:   ack_qty,
+                            price: ack_price,
+                            clob_order_id: resp.order_id.clone(),
+                        })
+                        .await;
+                    spawn_open_orders_refresh(
+                        trading.clone(),
+                        tx.clone(),
+                        market_for_refresh.clone(),
+                        user_open_ledger.clone(),
+                    );
+                    let cli2 = trading.clone();
+                    let tid  = match outcome {
+                        Outcome::Up   => market_for_refresh.up_token_id.clone(),
+                        Outcome::Down => market_for_refresh.down_token_id.clone(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = cli2.refresh_conditional_balance_allowance_cache(&tid).await
+                        {
+                            debug!(
+                                error = %e,
+                                token_id = %tid,
+                                "post-SELL delayed balance-allowance cache refresh failed (trailing exit)"
+                            );
+                        }
+                    });
+                    let _ = tx
+                        .send(AppEvent::TrailingExitDispatchDone {
+                            outcome,
+                            success: true,
+                            error:   None,
+                        })
+                        .await;
+                    return;
+                } else {
+                    if attempt < TRAILING_EXIT_FAK_ATTEMPTS {
+                        debug!(
+                            %attempt_label,
+                            outcome = ?outcome,
+                            "trailing exit: no FAK position ack; retry"
+                        );
+                        continue;
+                    }
+                    let _ = tx
+                        .send(AppEvent::TrailingExitDispatchDone {
+                            outcome,
+                            success: false,
+                            error:   Some(
+                                "trailing exit: FAK SELL — no fill ack (see logs)".to_string(),
+                            ),
+                        })
+                        .await;
+                    return;
+                }
+            }
+            Err(e) => {
+                if attempt < TRAILING_EXIT_FAK_ATTEMPTS {
+                    warn!(%attempt_label, error = %e, outcome = ?outcome, "trailing exit: place_order; retry");
+                    continue;
+                }
+                let _ = tx
+                    .send(AppEvent::TrailingExitDispatchDone {
+                        outcome,
+                        success: false,
+                        error:   Some(format!("trailing exit: {e} ({attempt_label})")),
+                    })
+                    .await;
+            }
+        }
     }
 }
 
