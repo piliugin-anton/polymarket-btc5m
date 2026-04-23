@@ -70,7 +70,7 @@ pub fn proxy_env() -> Option<String> {
 /// * **HTTP/2 PING** + **TCP keepalive** reduce stale connections.
 fn reqwest_shared_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
-        .user_agent("polymarket-btc5m/0.1")
+        .user_agent("polymarket-crypto/0.1")
         .timeout(timeout)
         .http2_prior_knowledge()
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))

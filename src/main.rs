@@ -141,8 +141,8 @@ async fn main() -> Result<()> {
     // ── setup ────────────────────────────────────────────────────────
     // stderr gets hidden once crossterm enters the alternate screen, and
     // any warn! / error! we emit during the TUI phase vanishes. Write the
-    // log to ./polymarket-btc5m.log so it's always inspectable post-mortem.
-    let log_path = std::env::var("BTC5M_LOG_PATH").unwrap_or_else(|_| "./polymarket-btc5m.log".into());
+    // log to ./polymarket-crypto.log so it's always inspectable post-mortem.
+    let log_path = std::env::var("POLYMARKET_CRYPTO_LOG_PATH").unwrap_or_else(|_| "./polymarket-crypto.log".into());
     let log_file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -151,14 +151,14 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "polymarket-btc5m=debug,warn".into())
+                .unwrap_or_else(|_| "POLYMARKET_CRYPTO=debug,warn".into())
         )
         .with_writer(std::sync::Mutex::new(log_file))
         .with_ansi(false)
         .init();
 
-    eprintln!("▸ polymarket-btc5m — logging to {log_path}");
-    eprintln!("▸ if credentials or data don't appear, run: polymarket-btc5m debug-auth");
+    eprintln!("▸ polymarket-crypto — logging to {log_path}");
+    eprintln!("▸ if credentials or data don't appear, run: polymarket-crypto debug-auth");
 
     let cfg = Config::from_env().context("loading config")?;
     info!(
@@ -177,7 +177,7 @@ async fn main() -> Result<()> {
             return t.debug_auth_flow().await;
         }
         Some("help") | Some("-h") | Some("--help") => {
-            println!("Usage: polymarket-btc5m [SUBCOMMAND]\n");
+            println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
             println!("Without a subcommand, launches the interactive TUI.\n");
             println!("Subcommands:");
             println!("  debug-auth    Run the CLOB L1 auth flow and dump all intermediate");
@@ -240,7 +240,7 @@ async fn main() -> Result<()> {
                     tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
                 }
                 let _ = tx.send(AppEvent::OrderErr(
-                    "run `polymarket-btc5m debug-auth` for the full auth dump".into()
+                    "run `polymarket-crypto debug-auth` for the full auth dump".into()
                 )).await;
             }
         });

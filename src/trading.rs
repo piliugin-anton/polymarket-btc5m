@@ -1029,7 +1029,7 @@ impl TradingClient {
             "CLOB auth rejected by both endpoints",
         );
         Err(anyhow!(
-            "CLOB auth failed. GET /auth/derive-api-key → {} \"{}\". POST /auth/api-key → {} \"{}\". Run `polymarket-btc5m debug-auth` for a full dump.",
+            "CLOB auth failed. GET /auth/derive-api-key → {} \"{}\". POST /auth/api-key → {} \"{}\". Run `polymarket-crypto debug-auth` for a full dump.",
             get_status, snip(&get_body), post_status, snip(&post_body),
         ))
     }
@@ -1109,7 +1109,7 @@ impl TradingClient {
 
     /// One-shot diagnostic flow — prints every intermediate to stdout and
     /// attempts both auth endpoints, exiting after. Invoked via
-    /// `polymarket-btc5m debug-auth`.
+    /// `polymarket-crypto debug-auth`.
     pub async fn debug_auth_flow(&self) -> Result<()> {
         println!("\n━━━ Polymarket CLOB auth diagnostic ━━━\n");
 

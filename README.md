@@ -121,16 +121,16 @@ Beat** (with description / RTDS latch as fallbacks; see `gamma` + `data_api`).
 
 ## Debugging
 
-Every run writes a log to `./polymarket-btc5m.log` (override with `BTC5M_LOG_PATH`).
+Every run writes a log to `./polymarket-crypto.log` (override with `POLYMARKET_CRYPTO_LOG_PATH`).
 Default log level is `debug` — every HTTP response body, every WS subscribe
-message, every EIP-712 digest is captured there. `tail -f polymarket-btc5m.log` in
+message, every EIP-712 digest is captured there. `tail -f polymarket-crypto.log` in
 another pane while the TUI runs.
 
 If CLOB auth fails, the TUI's status line will scroll through the error
 chain over ~10 seconds. For the definitive dump, quit the TUI and run:
 
 ```sh
-./target/release/polymarket-btc5m debug-auth
+./target/release/polymarket-crypto debug-auth
 ```
 
 That prints everything: the signer address, the funder, the proxy status,
@@ -178,7 +178,7 @@ You'll see `proxy=…` in the startup log line when it's active.
 If you see `could not derive CLOB API credentials` in the startup log, run:
 
 ```sh
-./target/release/polymarket-btc5m debug-auth
+./target/release/polymarket-crypto debug-auth
 ```
 
 This skips the TUI, runs the L1 auth flow with verbose output, and prints
@@ -238,7 +238,7 @@ and that the process was restarted after editing `.env`.
 ### Run
 
 ```sh
-RUST_LOG=polymarket-btc5m=debug ./target/release/polymarket-btc5m
+RUST_LOG=polymarket-crypto=debug ./target/release/polymarket-crypto
 ```
 
 On first launch the TUI **loads series** for each supported asset, then:
