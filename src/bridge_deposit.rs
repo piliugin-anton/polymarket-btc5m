@@ -29,6 +29,9 @@ struct SupportedAssetsResponse {
 struct SupportedAssetRow {
     chain_name: String,
     token: SupportedTokenMeta,
+    /// Bridge minimum for this chain/token (USD), when present.
+    #[serde(default)]
+    min_checkout_usd: Option<f64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -37,8 +40,8 @@ struct SupportedTokenMeta {
     symbol: String,
 }
 
-/// Fails if the bridge no longer lists Solana + USDC (see Polymarket `/supported-assets`).
-pub async fn ensure_solana_usdc_supported(client: &reqwest::Client) -> Result<()> {
+/// Fetches `/supported-assets`, ensures Solana + USDC is listed, returns `minCheckoutUsd` for that row when set.
+pub async fn ensure_solana_usdc_supported(client: &reqwest::Client) -> Result<Option<f64>> {
     let resp = client
         .get(BRIDGE_SUPPORTED_ASSETS_URL)
         .send()
@@ -51,16 +54,15 @@ pub async fn ensure_solana_usdc_supported(client: &reqwest::Client) -> Result<()
     }
     let parsed: SupportedAssetsResponse =
         serde_json::from_str(&text).context("supported-assets JSON")?;
-    let ok = parsed.supported_assets.iter().any(|row| {
+    let Some(sol_usdc) = parsed.supported_assets.iter().find(|row| {
         row.chain_name.eq_ignore_ascii_case("solana")
             && row.token.symbol.eq_ignore_ascii_case("USDC")
-    });
-    if !ok {
+    }) else {
         anyhow::bail!(
             "bridge supported-assets: no Solana USDC entry — chain or token may be unavailable"
         );
-    }
-    Ok(())
+    };
+    Ok(sol_usdc.min_checkout_usd)
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,8 +78,8 @@ struct DepositAddresses {
 pub async fn fetch_svm_deposit_address(
     client: &reqwest::Client,
     polymarket_wallet: Address,
-) -> Result<String> {
-    ensure_solana_usdc_supported(client).await?;
+) -> Result<(String, Option<f64>)> {
+    let min_deposit_usd = ensure_solana_usdc_supported(client).await?;
 
     let addr = format!("{:#x}", polymarket_wallet);
     let body = serde_json::json!({ "address": addr });
@@ -98,7 +100,7 @@ pub async fn fetch_svm_deposit_address(
     if svm.is_empty() {
         anyhow::bail!("bridge deposit: empty svm address");
     }
-    Ok(svm)
+    Ok((svm, min_deposit_usd))
 }
 
 /// Dense Unicode QR (two terminal rows per module) for terminal display.
@@ -120,11 +122,12 @@ pub fn svm_address_qr_unicode(svm_address: &str) -> Result<String> {
 fn supported_assets_json_finds_solana_usdc() {
     let j = r#"{"supportedAssets":[{"chainId":"x","chainName":"Solana","token":{"name":"USD Coin","symbol":"USDC","address":"EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v","decimals":6},"minCheckoutUsd":2},{"chainName":"Ethereum","token":{"symbol":"USDC"}}]}"#;
     let parsed: SupportedAssetsResponse = serde_json::from_str(j).unwrap();
-    let ok = parsed.supported_assets.iter().any(|row| {
+    let sol = parsed.supported_assets.iter().find(|row| {
         row.chain_name.eq_ignore_ascii_case("solana")
             && row.token.symbol.eq_ignore_ascii_case("USDC")
     });
-    assert!(ok);
+    assert!(sol.is_some());
+    assert_eq!(sol.unwrap().min_checkout_usd, Some(2.0));
 }
 
 #[cfg(test)]

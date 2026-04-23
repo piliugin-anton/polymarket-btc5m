@@ -978,7 +978,7 @@ fn dispatch_action(
                     }
                 };
                 match bridge_deposit::fetch_svm_deposit_address(&client, funder).await {
-                    Ok(svm) => {
+                    Ok((svm, min_deposit_usd)) => {
                         let pay_url = bridge_deposit::solana_pay_transfer_url(
                             &svm,
                             bridge_deposit::SOLANA_MAINNET_USDC_MINT,
@@ -989,6 +989,7 @@ fn dispatch_action(
                             .send(AppEvent::SolanaDepositFetched {
                                 svm_address: svm,
                                 qr_unicode,
+                                min_deposit_usd,
                             })
                             .await;
                     }

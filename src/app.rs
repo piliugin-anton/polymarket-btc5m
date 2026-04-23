@@ -80,7 +80,12 @@ pub enum AppEvent {
     /// Status line update without the `✗` prefix (e.g. claim hint).
     StatusInfo(String),
     /// `POST https://bridge.polymarket.com/deposit` → Solana (`svm`) address + terminal QR art.
-    SolanaDepositFetched { svm_address: String, qr_unicode: String },
+    /// `min_deposit_usd` comes from the preceding `/supported-assets` row for Solana USDC.
+    SolanaDepositFetched {
+        svm_address: String,
+        qr_unicode: String,
+        min_deposit_usd: Option<f64>,
+    },
     SolanaDepositFailed(String),
     /// Wizard: result of `GET /series?slug=…` (per-asset).
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
@@ -171,7 +176,11 @@ pub enum LimitField { Price, Size }
 #[derive(Debug, Clone)]
 pub enum DepositModalPhase {
     Loading,
-    Ready { svm_address: String, qr_unicode: String },
+    Ready {
+        svm_address: String,
+        qr_unicode: String,
+        min_deposit_usd: Option<f64>,
+    },
     Failed(String),
 }
 
@@ -569,11 +578,16 @@ impl AppState {
                 });
             }
             AppEvent::StatusInfo(msg) => self.status_line = msg,
-            AppEvent::SolanaDepositFetched { svm_address, qr_unicode } => {
+            AppEvent::SolanaDepositFetched {
+                svm_address,
+                qr_unicode,
+                min_deposit_usd,
+            } => {
                 if matches!(self.deposit_modal, Some(DepositModalPhase::Loading)) {
                     self.deposit_modal = Some(DepositModalPhase::Ready {
                         svm_address,
                         qr_unicode,
+                        min_deposit_usd,
                     });
                 }
             }

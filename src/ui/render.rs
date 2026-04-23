@@ -730,7 +730,11 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 inner,
             );
         }
-        DepositModalPhase::Ready { svm_address, qr_unicode } => {
+        DepositModalPhase::Ready {
+            svm_address,
+            qr_unicode,
+            min_deposit_usd,
+        } => {
             let qr_lines: Vec<&str> = qr_unicode.lines().collect();
             let qr_h = qr_lines.len().max(1) as u16;
             let qr_w = qr_lines
@@ -746,6 +750,8 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             let inner_w = w.saturating_sub(2).max(12) as usize;
             let mint_with_label = format!("Mint: {SOLANA_MAINNET_USDC_MINT}");
             let send_hint = "Send USDC from Solana to the address below or scan the QR.";
+            // Min deposit is rendered in the footer so it is not clipped when header `Paragraph`
+            // wraps differently than `word_wrap_line_count` (header height is a fixed `Length`).
             let header_wrapped_lines: u16 = (word_wrap_line_count("Network: Solana (SPL)", inner_w)
                 + word_wrap_line_count("Token: USDC only (Solana SPL)", inner_w)
                 + word_wrap_line_count(&mint_with_label, inner_w)
@@ -753,7 +759,13 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 + 1)
                 .max(5) as u16; // trailing blank
             let head_h = header_wrapped_lines;
-            let foot_h = 3u16;
+            let min_footer_lines: u16 = min_deposit_usd
+                .map(|v| {
+                    let s = format!("Minimum deposit: ${v:.2} USDC");
+                    word_wrap_line_count(&s, inner_w) as u16
+                })
+                .unwrap_or(0);
+            let foot_h = 3u16 + min_footer_lines;
             let h = (head_h + qr_h + foot_h + 2)
                 .min(screen.height.saturating_sub(2))
                 .max(12);
@@ -782,7 +794,12 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
             let mint_style = Style::default()
                 .fg(Color::Rgb(190, 230, 255))
                 .bg(dialog_bg);
-            let header: Vec<Line> = [
+            // ANSI red survives terminals without truecolor (Rgb foreground can look like default).
+            let text_min_deposit = Style::default()
+                .fg(Color::LightRed)
+                .bg(dialog_bg)
+                .add_modifier(Modifier::BOLD);
+            let header: Vec<Line> = vec![
                 Line::from(vec![
                     Span::styled("Network: ", text_muted),
                     Span::styled("Solana (SPL)", text_warn.add_modifier(Modifier::BOLD)),
@@ -797,9 +814,7 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 ]),
                 Line::from(Span::styled(send_hint, text_muted)),
                 Line::from(""),
-            ]
-            .into_iter()
-            .collect();
+            ];
             f.render_widget(
                 Paragraph::new(header)
                     .alignment(Alignment::Center)
@@ -823,7 +838,12 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                 chunks[1],
             );
 
-            let footer = vec![
+            let mut footer: Vec<Line> = Vec::new();
+            if let Some(v) = *min_deposit_usd {
+                let s = format!("Minimum deposit: ${v:.2} USDC");
+                footer.push(Line::from(Span::styled(s, text_min_deposit)));
+            }
+            footer.extend([
                 Line::from(Span::styled(svm_address.as_str(), text_main.add_modifier(Modifier::BOLD))),
                 Line::from(""),
                 Line::from(vec![
@@ -832,11 +852,11 @@ fn draw_deposit_modal(f: &mut Frame, screen: Rect, phase: &DepositModalPhase) {
                     Span::styled("f ", text_muted),
                     Span::styled("refresh", text_main),
                 ]),
-            ];
+            ]);
             f.render_widget(
                 Paragraph::new(footer)
                     .alignment(Alignment::Center)
-                    .wrap(Wrap { trim: false }),
+                    .wrap(Wrap { trim: true }),
                 chunks[2],
             );
         }
