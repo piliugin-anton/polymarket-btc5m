@@ -7,8 +7,10 @@ then the terminal shows the same layout as before — live Chainlink **spot** pr
 (via RTDS) vs each window’s opening **Price to Beat**, full UP/DOWN order book,
 your positions with unrealized PnL, optional **Sentiment** (CLOB mid or Data API
 top holders), **FAK** market orders and **GTD** limit orders that expire just
-before the window closes, plus **Polymarket Bridge** Solana USDC deposit (**`f`**) —
-all from single-key actions where possible.
+before the window closes, optional **trailing stop** on market buys (client-side
+trail on **best bid**, then **FAK SELL** on trigger with retries), plus
+**Polymarket Bridge** Solana USDC deposit (**`f`**) — all from single-key actions
+where possible.
 
 ## Architecture
 
@@ -109,9 +111,20 @@ a single market still uses a direct `redeemPositions` call on the CTF contract
 or neg-risk adapter. Rows that cannot be built (bad ids, zero on-chain neg-risk
 balances, etc.) are skipped with a log warning so the rest still redeem.
 
-**Fees and take-profit.** `fees` implements Polymarket **crypto** taker fees for
-PnL and for limit prices after optional **market BUY → GTD take-profit** sells
-(`MARKET_BUY_TAKE_PROFIT_BPS`).
+**Fees, take-profit, and trailing.** `fees` implements Polymarket **crypto** taker
+fees for PnL. **`MARKET_BUY_TAKE_PROFIT_BPS`** has two roles: (1) with
+**`MARKET_BUY_TRAIL_BPS=0`**, after a market **BUY** the bot can place a **GTD**
+limit **SELL** at a fee-aware target ([`fees::take_profit_limit_price_crypto_after_fees`](src/fees.rs)).
+(2) With **trailing on** (`MARKET_BUY_TRAIL_BPS>0`), that GTD path is **skipped**;
+instead a **trailing stop** on the CLOB **best bid** is registered, which **arms**
+when `best_bid` reaches a **gross** move of that many bps from your **position
+`avg_entry`** (or a fill estimate until the position is applied). On **trip**, the
+app queues a **FAK SELL** (up to the planned size, capped by live shares), with
+**no extra sleep** between up to **3** `place_order` attempts (internal CLOB
+retries may still apply). The trail is **not** removed until the SELL is acked or
+retries exhaust. See [`trailing_stop.rs`](src/trailing_stop.rs) and
+[`app.rs`](src/app.rs) (`TrailingSession`, `try_promote_pending_trail`,
+`run_trailing_exit_fak_sell` in `main.rs`).
 
 **Price feed.** `wss://ws-live-data.polymarket.com` → topic
 `crypto_prices_chainlink` → `symbol=<asset>/usd` from the wizard (e.g. `btc/usd`,
@@ -235,6 +248,14 @@ public `polygon-rpc.com`, etc.). The TUI balance panel does **not** use
 `POLYMARKET_PROXY` for this URL. If you see empty Cash/Claimable, verify the URL
 and that the process was restarted after editing `.env`.
 
+**Market BUY follow-ups (`.env`).** `MARKET_BUY_TAKE_PROFIT_BPS` and
+`MARKET_BUY_TRAIL_BPS` are described in [`.env.example`](.env.example). You **cannot**
+use the post-buy **GTD take-profit** and the **trailing** path at the same time;
+if `MARKET_BUY_TRAIL_BPS>0`, only trailing applies after a successful market FAK
+buy (when the response allows registering the plan). Trailing is evaluated on
+**each CLOB book update** for that outcome (best **bid**), not on the Chainlink
+header price.
+
 ### Run
 
 ```sh
@@ -332,6 +353,7 @@ src/
 ├── bridge_deposit.rs       # Polymarket Bridge HTTP → Solana USDC deposit + QR
 ├── redeem.rs               # CTF redeem via Polymarket relayer (Safe)
 ├── fees.rs                 # crypto taker fee + take-profit limit price
+├── trailing_stop.rs        # lock-free TrailingStop (hot path: best bid)
 ├── net.rs                  # proxy-aware HTTP + WebSocket connect
 ├── feeds/
 │   ├── chainlink.rs        # RTDS WS → PriceTick (symbol from profile)
@@ -358,7 +380,12 @@ behaviour:
    bump the ticket or check the book if that happens.
 2. Tune `MARKET_BUY_SLIPPAGE_BPS` / `MARKET_SELL_SLIPPAGE_BPS` (use `0` for no
    cushion); legacy `MARKET_SLIPPAGE_BPS` still sets either side if unset.
-3. Never check your private key into source control. The `.env.example`
+3. If you enable **`MARKET_BUY_TRAIL_BPS`**, read the comments for
+   **`MARKET_BUY_TAKE_PROFIT_BPS`**: the trail **arms** on a gross bps move from
+   **avg entry**; the FAK SELL on trip is a real market order — start with small
+   size and understand that **UP** and **DOWN** each have at most one active
+   trailing plan per outcome.
+4. Never check your private key into source control. The `.env.example`
    file ships with zeros specifically so that `cp .env.example .env` fails
    loudly if you forget to edit.
 
