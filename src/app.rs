@@ -92,7 +92,7 @@ pub enum AppEvent {
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
     /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
     StartTrading(std::sync::Arc<MarketProfile>),
-    /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until best bid
+    /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
     RequestTrailingArm {
         outcome:         Outcome,
@@ -101,7 +101,7 @@ pub enum AppEvent {
         plan_sell_shares: f64,
         token_id:        String,
         trail_bps:       u32,
-        /// Arm when `best_bid / entry >= 1 + activation_bps/10_000` (entry = live `avg_entry` with
+        /// Arm when `mid / entry >= 1 + activation_bps/10_000` (entry = live `avg_entry` with
         /// open size, else `entry_price`). Same bps as GTD take-profit target, not fee-solved.
         activation_bps:  u32,
     },
@@ -123,7 +123,7 @@ impl Outcome {
     pub fn opposite(self) -> Self { match self { Outcome::Up => Outcome::Down, Outcome::Down => Outcome::Up } }
 }
 
-/// Client-side trailing for one outcome — fed by CLOB best bid; see [`crate::trailing_stop`].
+/// Client-side trailing for one outcome — fed by CLOB mid (bid/ask average); see [`crate::trailing_stop`].
 #[derive(Debug)]
 pub struct TrailingSession {
     pub token_id: String,
@@ -142,7 +142,7 @@ pub struct TrailingExit {
 }
 
 /// Trailing is registered after the buy, but the [`TrailingSession`] is created only when
-/// `best_bid` implies a **gross** move of at least `activation_bps` from the position entry.
+/// **mid** implies a **gross** move of at least `activation_bps` from the position entry.
 #[derive(Debug, Clone)]
 pub struct PendingTrailArm {
     pub entry_price:     f64,
@@ -312,7 +312,7 @@ pub struct AppState {
 
     /// Trailing stops keyed by outcome (independent Up / Down).
     pub trailing: HashMap<Outcome, TrailingSession>,
-    /// Buy registered; waiting for `best_bid` to reach entry × (1 + TP bps) before arming the trail.
+    /// Buy registered; waiting for **mid** to reach entry × (1 + TP bps) before arming the trail.
     pub pending_trail_arms: HashMap<Outcome, PendingTrailArm>,
     /// FAK SELL not yet successfully submitted (empty book, etc.).
     pub pending_trailing_sell: Option<TrailingExit>,
@@ -493,7 +493,7 @@ impl AppState {
             },
         );
         self.status_line = format!(
-            "trailing {out} — {trail_bps} bps trail on bid, SELL up to {plan_sell_shares:.2} sh",
+            "trailing {out} — {trail_bps} bps trail on mid, SELL up to {plan_sell_shares:.2} sh",
             out = outcome.as_str()
         );
     }
@@ -507,7 +507,7 @@ impl AppState {
             None => return,
         };
         let bps = p0.activation_bps as f64 / 10_000.0;
-        let Some(bid) = self.best_bid(oc) else { return; };
+        let Some(mid) = self.mark(oc) else { return; };
         let pos = self.position(oc);
         let entry = if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
             pos.avg_entry
@@ -517,8 +517,8 @@ impl AppState {
         if !entry.is_finite() || entry <= 0.0 {
             return;
         }
-        let min_bid = entry * (1.0 + bps);
-        if bid + 1e-12 < min_bid {
+        let min_mid = entry * (1.0 + bps);
+        if mid + 1e-12 < min_mid {
             return;
         }
         let p = self.pending_trail_arms.remove(&oc).unwrap();
@@ -562,15 +562,15 @@ impl AppState {
                         None
                     };
                     if let Some(oc) = outcome {
-                        if let Some(bid) = b.bids.first().map(|l| l.price) {
+                        if let Some(mid) = self.mark(oc) {
                             self.try_promote_pending_trail(oc);
-                            // (plan shares, entry for gate) when the trail trips — auto-SELL only if bid is
+                            // (plan shares, entry for gate) when the trail trips — auto-SELL only if mid is
                             // still **above** live avg entry (profitable vs current position); if no position
                             // yet, fall back to the stop's install-time entry.
                             let on_trigger: Option<(f64, f64)> = {
                                 if let Some(sess) = self.trailing.get(&oc) {
                                     if sess.token_id == b.asset_id {
-                                        let out = sess.stop.on_price(bid);
+                                        let out = sess.stop.on_price(mid);
                                         if let TickOutcome::Triggered { .. } = out {
                                             let pos = self.position(oc);
                                             let entry_px =
@@ -596,7 +596,7 @@ impl AppState {
                             if let Some((plan, entry_px)) = on_trigger {
                                 // Keep [`TrailingSession`] in `trailing` until a FAK SELL is acked
                                 // (or retries exhaust) — do not remove here.
-                                if bid > entry_px {
+                                if mid > entry_px {
                                     let pos = self.position(oc).shares.max(0.0);
                                     let sh = pos.min(plan);
                                     if sh > 1e-9 {
@@ -605,13 +605,13 @@ impl AppState {
                                             sell_shares: sh,
                                         });
                                         self.status_line = format!(
-                                            "trailing: {} tripped (bid {bid:.3} > entry {entry_px:.3}) — SELL {sh:.2} sh",
+                                            "trailing: {} tripped (mid {mid:.3} > entry {entry_px:.3}) — SELL {sh:.2} sh",
                                             oc.as_str()
                                         );
                                     }
                                 } else {
                                     self.status_line = format!(
-                                        "trailing: {} tripped (bid {bid:.3} ≤ entry {entry_px:.3}) — no auto SELL",
+                                        "trailing: {} tripped (mid {mid:.3} ≤ entry {entry_px:.3}) — no auto SELL",
                                         oc.as_str()
                                     );
                                 }
@@ -804,7 +804,7 @@ impl AppState {
                         },
                     );
                     self.status_line = format!(
-                        "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
+                        "trailing: {} pending — arm when mid ≥ entry×(1+{activation_bps} bps) (from position)",
                         outcome.as_str()
                     );
                     self.try_promote_pending_trail(outcome);
