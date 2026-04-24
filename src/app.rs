@@ -130,6 +130,8 @@ pub struct TrailingSession {
     pub stop:     TrailingStop,
     /// Shares to target on the follow-up market SELL (capped by live position on trigger).
     pub plan_sell_shares: f64,
+    /// Same as at install — used to re-arm after a failed trailing FAK without user action.
+    pub trail_bps: u32,
 }
 
 /// Queued when the trail trips; `main` submits a FAK SELL (retries if the book is empty).
@@ -487,6 +489,7 @@ impl AppState {
                 token_id,
                 stop,
                 plan_sell_shares,
+                trail_bps,
             },
         );
         self.status_line = format!(
@@ -561,17 +564,25 @@ impl AppState {
                     if let Some(oc) = outcome {
                         if let Some(bid) = b.bids.first().map(|l| l.price) {
                             self.try_promote_pending_trail(oc);
-                            // (plan shares, entry) when the trail trips — auto-SELL only if bid is still
-                            // **above** entry (profitable mark vs fill); do not market-sell on a sub-entry bid.
+                            // (plan shares, entry for gate) when the trail trips — auto-SELL only if bid is
+                            // still **above** live avg entry (profitable vs current position); if no position
+                            // yet, fall back to the stop's install-time entry.
                             let on_trigger: Option<(f64, f64)> = {
                                 if let Some(sess) = self.trailing.get(&oc) {
                                     if sess.token_id == b.asset_id {
                                         let out = sess.stop.on_price(bid);
                                         if let TickOutcome::Triggered { .. } = out {
-                                            Some((
-                                                sess.plan_sell_shares,
-                                                sess.stop.entry_price(),
-                                            ))
+                                            let pos = self.position(oc);
+                                            let entry_px =
+                                                if pos.shares > 1e-9
+                                                    && pos.avg_entry.is_finite()
+                                                    && pos.avg_entry > 0.0
+                                                {
+                                                    pos.avg_entry
+                                                } else {
+                                                    sess.stop.entry_price()
+                                                };
+                                            Some((sess.plan_sell_shares, entry_px))
                                         } else {
                                             None
                                         }
@@ -877,17 +888,51 @@ impl AppState {
             AppEvent::TrailingExitDispatchDone { outcome, success, error } => {
                 self.trailing_sell_in_flight = false;
                 if !success {
-                    self.trailing.remove(&outcome);
-                    self.pending_trail_arms.remove(&outcome);
+                    let had_sess = self.trailing.remove(&outcome);
+                    let mut re_armed = false;
+                    if let Some(sess) = had_sess {
+                        let pos = self.position(outcome);
+                        if pos.shares > 1e-9
+                            && sess.trail_bps > 0
+                            && sess.plan_sell_shares.is_finite()
+                            && sess.plan_sell_shares > 0.0
+                        {
+                            let entry = if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                pos.avg_entry
+                            } else {
+                                sess.stop.entry_price()
+                            };
+                            self.install_trailing_session(
+                                outcome,
+                                entry,
+                                sess.plan_sell_shares,
+                                sess.token_id,
+                                sess.trail_bps,
+                            );
+                            re_armed = true;
+                        }
+                    }
                     if self.pending_trailing_sell.is_some_and(|p| p.outcome == outcome) {
                         self.pending_trailing_sell = None;
                     }
                     if let Some(e) = error {
-                        self.status_line = format!("✗ {e}");
+                        self.status_line = if re_armed {
+                            format!(
+                                "✗ {e} — trailing {} re-armed (live entry)",
+                                outcome.as_str()
+                            )
+                        } else {
+                            format!("✗ {e}")
+                        };
                         self.order_error_toast = Some(OrderErrorToast {
                             message: e,
                             until:   Instant::now() + ORDER_ERROR_TOAST_TTL,
                         });
+                    } else if re_armed {
+                        self.status_line = format!(
+                            "trailing {} re-armed after exit failure",
+                            outcome.as_str()
+                        );
                     }
                 } else {
                     // `OrderAck` should have cleared; if it was de-duped, still drop the tripped state.

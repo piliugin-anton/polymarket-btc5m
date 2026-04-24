@@ -284,6 +284,12 @@ mod tests {
         (a - b).abs() < 1e-9
     }
 
+    /// Tolerance for prices in ~0.01–1.0 range (percent trails, small absolute offsets).
+    fn approx_eq_frac(a: f64, b: f64) -> bool {
+        let scale = a.abs().max(b.abs()).max(0.01);
+        (a - b).abs() < 1e-12_f64.max(1e-9 * scale)
+    }
+
     #[test]
     fn long_immediate_basic() {
         let ts = TrailingStop::new(
@@ -383,6 +389,318 @@ mod tests {
                 assert!(approx_eq(stop_price, 98.0));
             }
             o => panic!("expected Triggered, got {:?}", o),
+        }
+    }
+
+    // --- Prices in 0.01–0.99 (fractional quote / low-tick instruments) ---
+
+    #[test]
+    fn frac_long_immediate_percent_trail_and_trigger() {
+        let entry = 0.50;
+        let pct = 0.02;
+        let ts = TrailingStop::new(
+            Side::Long,
+            entry,
+            TrailSpec::Percent(pct),
+            Activation::Immediate,
+        );
+        assert!(ts.is_armed());
+        let initial_stop = entry * (1.0 - pct);
+        assert!(
+            approx_eq_frac(ts.stop_price().unwrap(), initial_stop),
+            "stop={:?} want {}",
+            ts.stop_price(),
+            initial_stop
+        );
+
+        let peak = 0.66;
+        match ts.on_price(peak) {
+            TickOutcome::Trailed { new_stop } => {
+                let want = peak * (1.0 - pct);
+                assert!(approx_eq_frac(new_stop, want), "got {} want {}", new_stop, want);
+            }
+            o => panic!("expected Trailed, got {:?}", o),
+        }
+
+        let new_stop = ts.stop_price().unwrap();
+        assert!(approx_eq_frac(new_stop, peak * (1.0 - pct)));
+
+        // Pullback above stop but below prior peak — no-op.
+        let mid = 0.65;
+        assert!(mid > new_stop && mid < peak);
+        assert_eq!(ts.on_price(mid), TickOutcome::NoOp);
+
+        let breach = new_stop - 0.005;
+        assert!(breach > 0.01);
+        match ts.on_price(breach) {
+            TickOutcome::Triggered { trigger_price, stop_price } => {
+                assert!(approx_eq_frac(trigger_price, breach));
+                assert!(approx_eq_frac(stop_price, new_stop));
+            }
+            o => panic!("expected Triggered, got {:?}", o),
+        }
+        assert_eq!(ts.on_price(0.01), TickOutcome::AlreadyTriggered);
+    }
+
+    #[test]
+    fn frac_short_immediate_absolute_trail_and_trigger() {
+        let entry = 0.55;
+        let abs_off = 0.02;
+        let ts = TrailingStop::new(
+            Side::Short,
+            entry,
+            TrailSpec::Absolute(abs_off),
+            Activation::Immediate,
+        );
+        assert!(approx_eq_frac(ts.stop_price().unwrap(), entry + abs_off));
+
+        let low = 0.22;
+        match ts.on_price(low) {
+            TickOutcome::Trailed { new_stop } => {
+                assert!(approx_eq_frac(new_stop, low + abs_off));
+            }
+            o => panic!("expected Trailed, got {:?}", o),
+        }
+
+        let new_stop = ts.stop_price().unwrap();
+        // Slight unfavorable bounce: stay strictly below stop (short breach is price >= stop).
+        let pullback = (new_stop + low) * 0.5;
+        assert!(pullback > low && pullback < new_stop);
+        assert_eq!(ts.on_price(pullback), TickOutcome::NoOp);
+
+        let breach = new_stop + 0.01;
+        assert!(breach < 0.99);
+        match ts.on_price(breach) {
+            TickOutcome::Triggered { stop_price, .. } => {
+                assert!(approx_eq_frac(stop_price, new_stop));
+            }
+            o => panic!("expected Triggered, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_long_activation_by_price() {
+        let entry = 0.20;
+        let arm_at = 0.45;
+        let pct = 0.01;
+        let ts = TrailingStop::new(
+            Side::Long,
+            entry,
+            TrailSpec::Percent(pct),
+            Activation::Price(arm_at),
+        );
+        assert!(!ts.is_armed());
+        assert_eq!(ts.on_price(0.30), TickOutcome::NoOp);
+        assert_eq!(ts.on_price(0.44), TickOutcome::NoOp);
+
+        let cross = 0.46;
+        match ts.on_price(cross) {
+            TickOutcome::Armed { stop_price } => {
+                let want = cross * (1.0 - pct);
+                assert!(approx_eq_frac(stop_price, want));
+            }
+            o => panic!("expected Armed, got {:?}", o),
+        }
+        assert!(ts.is_armed());
+    }
+
+    #[test]
+    fn frac_short_activation_by_price() {
+        let entry = 0.80;
+        let arm_at = 0.35;
+        let pct = 0.015;
+        let ts = TrailingStop::new(
+            Side::Short,
+            entry,
+            TrailSpec::Percent(pct),
+            Activation::Price(arm_at),
+        );
+        assert_eq!(ts.on_price(0.50), TickOutcome::NoOp);
+        match ts.on_price(0.34) {
+            TickOutcome::Armed { stop_price } => {
+                let want = 0.34 * (1.0 + pct);
+                assert!(approx_eq_frac(stop_price, want));
+            }
+            o => panic!("expected Armed, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_long_activation_favorable_distance() {
+        let entry = 0.35;
+        let need = 0.10;
+        let ts = TrailingStop::new(
+            Side::Long,
+            entry,
+            TrailSpec::Percent(0.02),
+            Activation::FavorableDistance(need),
+        );
+        assert_eq!(ts.on_price(0.40), TickOutcome::NoOp);
+        // `entry + need` is not always representable; arm clearly past the threshold.
+        let arm_price = 0.46;
+        assert!(arm_price - entry > need - 1e-12);
+        match ts.on_price(arm_price) {
+            TickOutcome::Armed { stop_price } => {
+                assert!(approx_eq_frac(stop_price, arm_price * 0.98));
+            }
+            o => panic!("expected Armed, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_short_activation_favorable_distance() {
+        let entry = 0.72;
+        let need = 0.08;
+        let ts = TrailingStop::new(
+            Side::Short,
+            entry,
+            TrailSpec::Absolute(0.015),
+            Activation::FavorableDistance(need),
+        );
+        assert_eq!(ts.on_price(0.68), TickOutcome::NoOp);
+        let arm_price = 0.63;
+        assert!(entry - arm_price > need - 1e-12);
+        match ts.on_price(arm_price) {
+            TickOutcome::Armed { stop_price } => {
+                assert!(approx_eq_frac(stop_price, arm_price + 0.015));
+            }
+            o => panic!("expected Armed, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_long_gap_through_stop_on_first_tick() {
+        let entry = 0.60;
+        let abs = 0.05;
+        let ts = TrailingStop::new(
+            Side::Long,
+            entry,
+            TrailSpec::Absolute(abs),
+            Activation::Immediate,
+        );
+        let want_stop = entry - abs;
+        match ts.on_price(0.02) {
+            TickOutcome::Triggered { trigger_price, stop_price } => {
+                assert!(approx_eq_frac(trigger_price, 0.02));
+                assert!(approx_eq_frac(stop_price, want_stop));
+            }
+            o => panic!("expected Triggered, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_short_gap_through_stop_on_first_tick() {
+        let entry = 0.15;
+        let abs = 0.03;
+        let ts = TrailingStop::new(
+            Side::Short,
+            entry,
+            TrailSpec::Absolute(abs),
+            Activation::Immediate,
+        );
+        let want_stop = entry + abs;
+        match ts.on_price(0.97) {
+            TickOutcome::Triggered { trigger_price, stop_price } => {
+                assert!(approx_eq_frac(trigger_price, 0.97));
+                assert!(approx_eq_frac(stop_price, want_stop));
+            }
+            o => panic!("expected Triggered, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_long_trigger_exactly_at_stop() {
+        let ts = TrailingStop::new(
+            Side::Long,
+            0.40,
+            TrailSpec::Percent(0.05),
+            Activation::Immediate,
+        );
+        let stop = ts.stop_price().unwrap();
+        match ts.on_price(stop) {
+            TickOutcome::Triggered { .. } => {}
+            o => panic!("expected Triggered at stop, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_short_trigger_exactly_at_stop() {
+        let ts = TrailingStop::new(
+            Side::Short,
+            0.88,
+            TrailSpec::Absolute(0.04),
+            Activation::Immediate,
+        );
+        let stop = ts.stop_price().unwrap();
+        match ts.on_price(stop) {
+            TickOutcome::Triggered { .. } => {}
+            o => panic!("expected Triggered at stop, got {:?}", o),
+        }
+    }
+
+    #[test]
+    fn frac_boundary_entry_0_01_percent_trail() {
+        let entry = 0.01;
+        let pct = 0.10;
+        let ts = TrailingStop::new(
+            Side::Long,
+            entry,
+            TrailSpec::Percent(pct),
+            Activation::Immediate,
+        );
+        let stop0 = entry * (1.0 - pct);
+        assert!(approx_eq_frac(ts.stop_price().unwrap(), stop0));
+
+        match ts.on_price(0.99) {
+            TickOutcome::Trailed { new_stop } => {
+                assert!(approx_eq_frac(new_stop, 0.99 * (1.0 - pct)));
+            }
+            o => panic!("expected Trailed, got {:?}", o),
+        }
+        assert!(ts.best_price().unwrap() <= 0.99);
+    }
+
+    #[test]
+    fn frac_many_small_ratchets_monotonic_stop() {
+        let ts = TrailingStop::new(
+            Side::Long,
+            0.25,
+            TrailSpec::Percent(0.01),
+            Activation::Immediate,
+        );
+        let mut last_stop = ts.stop_price().unwrap();
+        for p in [0.26, 0.27, 0.28, 0.29, 0.30, 0.31] {
+            match ts.on_price(p) {
+                TickOutcome::Trailed { new_stop } => {
+                    assert!(new_stop > last_stop, "stop should ratchet up");
+                    assert!(approx_eq_frac(new_stop, p * 0.99));
+                    last_stop = new_stop;
+                }
+                TickOutcome::NoOp => panic!("expected Trailed at {}", p),
+                o => panic!("unexpected {:?} at {}", o, p),
+            }
+        }
+    }
+
+    #[test]
+    fn frac_short_many_small_ratchets_monotonic_stop() {
+        let ts = TrailingStop::new(
+            Side::Short,
+            0.75,
+            TrailSpec::Percent(0.01),
+            Activation::Immediate,
+        );
+        let mut last_stop = ts.stop_price().unwrap();
+        for p in [0.74, 0.73, 0.72, 0.71, 0.70] {
+            match ts.on_price(p) {
+                TickOutcome::Trailed { new_stop } => {
+                    assert!(new_stop < last_stop, "short stop should ratchet down");
+                    assert!(approx_eq_frac(new_stop, p * 1.01));
+                    last_stop = new_stop;
+                }
+                TickOutcome::NoOp => panic!("expected Trailed at {}", p),
+                o => panic!("unexpected {:?} at {}", o, p),
+            }
         }
     }
 }
