@@ -37,7 +37,7 @@ use anyhow::{Context, Result};
 use app::{
     clamp_prob, collect_book_watch_token_ids, escrow_sell_shares_from_clob_orders,
     hydrate_positions_from_trades,     AppEvent, AppState, Outcome, resolve_market_order, resolve_trailing_sell, TrailingExit,
-    MIN_LIMIT_ORDER_SHARES,
+    MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
 };
 use feeds::clob_user_ws::{UserWsBundle, UserWsMarket};
 use fees::take_profit_limit_price_crypto_after_fees;
@@ -55,8 +55,9 @@ use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::{mpsc, watch};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::stdout,
+    mem,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -204,8 +205,11 @@ async fn apply_app_event(
     }
 }
 
-/// After a book tick trips the client-side trail, place a FAK SELL (with retries) as soon as the
-/// CLOB resolves a price. Keeps `pending_trailing_sell` + `trailing` until an order is acked or
+/// After book ticks trip client-side trails, FAK SELLs run as soon as the CLOB can price them.
+/// Multiple `token_id`s can be in progress at once, bounded by [`TRAILING_SELL_MAX_PARALLEL`]
+/// (backpressure: same idea as `tokio::sync::Semaphore` / bounded worker pools, without holding
+/// permits across the synchronous `state.apply` path).
+/// Keeps `pending_trailing_sells` + `trailing` until an order is acked or
 /// [`TRAILING_EXIT_FAK_ATTEMPTS`] fails.
 fn try_dispatch_trailing_sell(
     state: &mut AppState,
@@ -214,39 +218,62 @@ fn try_dispatch_trailing_sell(
     user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     cfg: &Config,
 ) {
-    if state.trailing_sell_in_flight {
+    if state.pending_trailing_sells.is_empty() {
         return;
     }
-    let ex = match state.pending_trailing_sell.clone() {
-        Some(x) => x,
-        None => return,
-    };
-    let res = resolve_trailing_sell(
-        state,
-        ex.token_id.as_str(),
-        ex.sell_shares,
-        cfg.market_sell_slippage_bps,
-    );
-    let Some((shares, price, otype)) = res else {
-        // Empty book: keep `pending` + tripped `trailing` until the book can price a FAK SELL.
+    let can = TRAILING_SELL_MAX_PARALLEL.saturating_sub(state.trailing_sell_in_flight.len());
+    if can == 0 {
         return;
-    };
-    state.trailing_sell_in_flight = true;
-    let exit = ex;
-    let trading2 = trading.clone();
-    let ledger2 = user_open_ledger.clone();
-    let tx2 = tx.clone();
-    info!(
-        outcome = ?exit.outcome,
-        sell_shares = shares,
-        price,
-        attempts = TRAILING_EXIT_FAK_ATTEMPTS,
-        "trailing: FAK SELL (await place_order, up to {n} attempts)",
-        n = TRAILING_EXIT_FAK_ATTEMPTS
-    );
-    tokio::spawn(async move {
-        run_trailing_exit_fak_sell(trading2, ledger2, tx2, exit, shares, price, otype).await;
-    });
+    }
+    let mut q = mem::take(&mut state.pending_trailing_sells);
+    let mut newq = VecDeque::new();
+    let mut started = 0usize;
+    while let Some(ex) = q.pop_front() {
+        if state
+            .trailing_sell_in_flight
+            .iter()
+            .any(|k| clob_asset_ids_match(k, ex.token_id.as_str()))
+        {
+            newq.push_back(ex);
+            continue;
+        }
+        if started >= can {
+            newq.push_back(ex);
+            continue;
+        }
+        let res = resolve_trailing_sell(
+            state,
+            ex.token_id.as_str(),
+            ex.sell_shares,
+            cfg.market_sell_slippage_bps,
+        );
+        let Some((shares, price, otype)) = res else {
+            // Empty book: wait for a later book tick that can price this leg.
+            newq.push_back(ex);
+            continue;
+        };
+        state
+            .trailing_sell_in_flight
+            .insert(ex.token_id.clone());
+        started += 1;
+        let exit = ex;
+        let trading2 = trading.clone();
+        let ledger2 = user_open_ledger.clone();
+        let tx2 = tx.clone();
+        info!(
+            outcome = ?exit.outcome,
+            sell_shares = shares,
+            price,
+            attempts = TRAILING_EXIT_FAK_ATTEMPTS,
+            in_flight = state.trailing_sell_in_flight.len(),
+            "trailing: FAK SELL (await place_order, up to {n} attempts)",
+            n = TRAILING_EXIT_FAK_ATTEMPTS
+        );
+        tokio::spawn(async move {
+            run_trailing_exit_fak_sell(trading2, ledger2, tx2, exit, shares, price, otype).await;
+        });
+    }
+    state.pending_trailing_sells = newq;
 }
 
 async fn run_trailing_exit_fak_sell(
@@ -398,7 +425,7 @@ async fn run_trailing_exit_fak_sell(
 }
 
 use tracing::{debug, error, info, warn};
-use trading::{OrderArgs, OrderType, Side, TradingClient};
+use trading::{clob_asset_ids_match, OrderArgs, OrderType, Side, TradingClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {

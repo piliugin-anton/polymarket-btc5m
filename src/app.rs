@@ -10,7 +10,7 @@
 //! Trading actions post results back through the same channel.
 
 use chrono::{DateTime, Utc};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +25,11 @@ use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
 pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
+
+/// Max concurrent in-flight [`AppEvent::TrailingExitDispatchDone`] FAK SELL runs (per-token, bounded
+/// like `tokio::sync::Semaphore(N)` to limit API / exchange load; see `try_dispatch_trailing_sell` in
+/// `main.rs`).
+pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 
 /// How long an [`AppState::order_error_toast`] stays visible.
 pub const ORDER_ERROR_TOAST_TTL: Duration = Duration::from_secs(10);
@@ -292,7 +297,7 @@ pub fn collect_book_watch_token_ids(state: &AppState) -> Vec<String> {
     for k in state.pending_trail_arms.keys() {
         s.insert(k.clone());
     }
-    if let Some(p) = &state.pending_trailing_sell {
+    for p in &state.pending_trailing_sells {
         s.insert(p.token_id.clone());
     }
     let mut v: Vec<_> = s.into_iter().collect();
@@ -373,10 +378,12 @@ pub struct AppState {
     pub pending_trail_arms: HashMap<String, PendingTrailArm>,
     /// Books for tokens that are not the active UI pair but still have trailing / pending arms.
     pub watched_books: HashMap<String, BookSnapshot>,
-    /// FAK SELL not yet successfully submitted (empty book, etc.).
-    pub pending_trailing_sell: Option<TrailingExit>,
-    /// A trailing-exit FAK order is in flight (retries do not spawn duplicate tasks).
-    pub trailing_sell_in_flight: bool,
+    /// FAK SELLs queued: priced on dispatch (empty book → stays queued until a later book tick).
+    /// FIFO per enqueue; the same `token_id` is not enqueued while already queued or in-flight.
+    pub pending_trailing_sells: VecDeque<TrailingExit>,
+    /// `token_id`s with a `run_trailing_exit_fak_sell` task in progress; capped by
+    /// [`TRAILING_SELL_MAX_PARALLEL`].
+    pub trailing_sell_in_flight: HashSet<String>,
 }
 
 impl AppState {
@@ -415,9 +422,20 @@ impl AppState {
             trailing: HashMap::new(),
             pending_trail_arms: HashMap::new(),
             watched_books: HashMap::new(),
-            pending_trailing_sell: None,
-            trailing_sell_in_flight: false,
+            pending_trailing_sells: VecDeque::new(),
+            trailing_sell_in_flight: HashSet::new(),
         }
+    }
+
+    /// True if `token_id` already has a queued trailing exit or an in-flight FAK SELL.
+    fn trailing_sell_queued_or_in_flight(&self, token_id: &str) -> bool {
+        self.pending_trailing_sells
+            .iter()
+            .any(|e| clob_asset_ids_match(&e.token_id, token_id))
+            || self
+                .trailing_sell_in_flight
+                .iter()
+                .any(|k| clob_asset_ids_match(k, token_id))
     }
 
     // ── Queries ─────────────────────────────────────────────────────
@@ -579,14 +597,9 @@ impl AppState {
         self.trailing.remove(token_id);
         self.pending_trail_arms.remove(token_id);
         self.watched_books.remove(token_id);
-        if self
-            .pending_trailing_sell
-            .as_ref()
-            .is_some_and(|p| clob_asset_ids_match(&p.token_id, token_id))
-        {
-            self.pending_trailing_sell = None;
-            self.trailing_sell_in_flight = false;
-        }
+        self.pending_trailing_sells
+            .retain(|e| !clob_asset_ids_match(&e.token_id, token_id));
+        self.trailing_sell_in_flight.retain(|k| !clob_asset_ids_match(k, token_id));
     }
 
     fn install_trailing_session(
@@ -720,12 +733,14 @@ impl AppState {
             };
             let sh = pos_sh.min(plan).min(tracked.max(0.0));
             if sh > 1e-9 {
-                self.pending_trailing_sell = Some(TrailingExit {
-                    token_id,
-                    market,
-                    outcome,
-                    sell_shares: sh,
-                });
+                if !self.trailing_sell_queued_or_in_flight(&token_id) {
+                    self.pending_trailing_sells.push_back(TrailingExit {
+                        token_id,
+                        market,
+                        outcome,
+                        sell_shares: sh,
+                    });
+                }
                 self.status_line = format!(
                     "trailing: {} tripped (mid {mid:.3} > entry {entry_px:.3}) — SELL {sh:.2} sh",
                     outcome.as_str()
@@ -1099,7 +1114,9 @@ impl AppState {
                 success,
                 error,
             } => {
-                self.trailing_sell_in_flight = false;
+                self.trailing_sell_in_flight.remove(&token_id);
+                self.pending_trailing_sells
+                    .retain(|p| !clob_asset_ids_match(&p.token_id, &token_id));
                 let tid = token_id.clone();
                 if !success {
                     let had_sess = self.trailing.remove(&tid);
@@ -1140,13 +1157,6 @@ impl AppState {
                             re_armed = true;
                         }
                     }
-                    if self
-                        .pending_trailing_sell
-                        .as_ref()
-                        .is_some_and(|p| clob_asset_ids_match(&p.token_id, &tid))
-                    {
-                        self.pending_trailing_sell = None;
-                    }
                     if let Some(e) = error {
                         let oc = session_outcome.unwrap_or(Outcome::Up);
                         self.status_line = if re_armed {
@@ -1165,13 +1175,6 @@ impl AppState {
                     }
                 } else {
                     self.trailing.remove(&tid);
-                    if self
-                        .pending_trailing_sell
-                        .as_ref()
-                        .is_some_and(|p| clob_asset_ids_match(&p.token_id, &tid))
-                    {
-                        self.pending_trailing_sell = None;
-                    }
                 }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
