@@ -35,9 +35,11 @@ mod ui;
 
 use anyhow::{Context, Result};
 use app::{
-    clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
-    AppEvent, AppState, Outcome, resolve_market_order, MIN_LIMIT_ORDER_SHARES,
+    clamp_prob, collect_book_watch_token_ids, escrow_sell_shares_from_clob_orders,
+    hydrate_positions_from_trades,     AppEvent, AppState, Outcome, resolve_market_order, resolve_trailing_sell, TrailingExit,
+    MIN_LIMIT_ORDER_SHARES,
 };
+use feeds::clob_user_ws::{UserWsBundle, UserWsMarket};
 use fees::take_profit_limit_price_crypto_after_fees;
 use config::Config;
 use crossterm::{
@@ -53,7 +55,7 @@ use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use tokio::sync::{mpsc, watch};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     io::stdout,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -84,6 +86,60 @@ const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(80);
 /// Retries (no added sleep here; each attempt awaits the full `place_order` future).
 const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
 
+/// Build CLOB user-channel subscription set (active UI + trailing tail markets).
+fn build_user_ws_bundle(state: &AppState) -> UserWsBundle {
+    let active = state
+        .market
+        .as_ref()
+        .map(|m| UserWsMarket {
+            condition_id:  m.condition_id.clone(),
+            up_token_id:   m.up_token_id.clone(),
+            down_token_id: m.down_token_id.clone(),
+        })
+        .unwrap_or_default();
+
+    let mut seen: HashSet<String> = HashSet::new();
+    if !active.condition_id.is_empty() {
+        seen.insert(active.condition_id.clone());
+    }
+    let mut extras: Vec<UserWsMarket> = Vec::new();
+    let mut push_extra = |mkt: &gamma::ActiveMarket| {
+        if mkt.condition_id.is_empty() || seen.contains(&mkt.condition_id) {
+            return;
+        }
+        seen.insert(mkt.condition_id.clone());
+        extras.push(UserWsMarket {
+            condition_id:  mkt.condition_id.clone(),
+            up_token_id:   mkt.up_token_id.clone(),
+            down_token_id: mkt.down_token_id.clone(),
+        });
+    };
+    for sess in state.trailing.values() {
+        if active.condition_id.is_empty() || sess.market.condition_id != active.condition_id {
+            push_extra(&sess.market);
+        }
+    }
+    for p in state.pending_trail_arms.values() {
+        if active.condition_id.is_empty() || p.market.condition_id != active.condition_id {
+            push_extra(&p.market);
+        }
+    }
+    UserWsBundle { active, extras }
+}
+
+fn merge_ui_and_extra_book_tokens(ui_pair: &[String], extra: &[String]) -> Vec<String> {
+    let mut s: HashSet<String> = HashSet::new();
+    for t in ui_pair {
+        s.insert(t.clone());
+    }
+    for t in extra {
+        s.insert(t.clone());
+    }
+    let mut v: Vec<String> = s.into_iter().collect();
+    v.sort();
+    v
+}
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 fn apply_app_event(
     ev:     AppEvent,
@@ -97,6 +153,8 @@ fn apply_app_event(
     market_profile_tx: &watch::Sender<Arc<MarketProfile>>,
     market_profile_rx_slot: &mut Option<watch::Receiver<Arc<MarketProfile>>>,
     discovery_spawned: &mut bool,
+    user_bundle_tx:  &watch::Sender<UserWsBundle>,
+    book_token_tx:   &watch::Sender<Vec<String>>,
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
@@ -139,6 +197,8 @@ fn apply_app_event(
                 user_open_ledger,
                 cfg,
             );
+            let _ = user_bundle_tx.send(build_user_ws_bundle(state));
+            let _ = book_token_tx.send(collect_book_watch_token_ids(state));
             false
         }
     }
@@ -157,20 +217,14 @@ fn try_dispatch_trailing_sell(
     if state.trailing_sell_in_flight {
         return;
     }
-    let ex = match state.pending_trailing_sell {
+    let ex = match state.pending_trailing_sell.clone() {
         Some(x) => x,
         None => return,
     };
-    let m = match state.market.clone() {
-        Some(m) => m,
-        None => return,
-    };
-    let res = resolve_market_order(
+    let res = resolve_trailing_sell(
         state,
-        ex.outcome,
-        Side::Sell,
+        ex.token_id.as_str(),
         ex.sell_shares,
-        cfg.market_buy_slippage_bps,
         cfg.market_sell_slippage_bps,
     );
     let Some((shares, price, otype)) = res else {
@@ -178,12 +232,12 @@ fn try_dispatch_trailing_sell(
         return;
     };
     state.trailing_sell_in_flight = true;
-    let outcome = ex.outcome;
+    let exit = ex;
     let trading2 = trading.clone();
     let ledger2 = user_open_ledger.clone();
     let tx2 = tx.clone();
     info!(
-        outcome = ?outcome,
+        outcome = ?exit.outcome,
         sell_shares = shares,
         price,
         attempts = TRAILING_EXIT_FAK_ATTEMPTS,
@@ -191,10 +245,7 @@ fn try_dispatch_trailing_sell(
         n = TRAILING_EXIT_FAK_ATTEMPTS
     );
     tokio::spawn(async move {
-        run_trailing_exit_fak_sell(
-            trading2, ledger2, tx2, m, outcome, shares, price, otype,
-        )
-        .await;
+        run_trailing_exit_fak_sell(trading2, ledger2, tx2, exit, shares, price, otype).await;
     });
 }
 
@@ -202,25 +253,22 @@ async fn run_trailing_exit_fak_sell(
     trading: Arc<TradingClient>,
     user_open_ledger: std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     tx: mpsc::Sender<AppEvent>,
-    market: gamma::ActiveMarket,
-    outcome: Outcome,
+    exit: TrailingExit,
     shares: f64,
     price: f64,
     otype: OrderType,
 ) {
-    let market_for_refresh = market.clone();
-    let token_id = match outcome {
-        Outcome::Up   => market.up_token_id.clone(),
-        Outcome::Down => market.down_token_id.clone(),
-    };
+    let market_for_refresh = exit.market.clone();
+    let token_id = exit.token_id.clone();
+    let outcome = exit.outcome;
     for attempt in 1u32..=TRAILING_EXIT_FAK_ATTEMPTS {
         let args = OrderArgs {
             token_id:        token_id.clone(),
             side:            Side::Sell,
             price,
             size:            shares,
-            neg_risk:        market.neg_risk,
-            tick_size:       market.tick_size.clone(),
+            neg_risk:        exit.market.neg_risk,
+            tick_size:       exit.market.tick_size.clone(),
             buy_notional_usdc: None,
             expiration_unix_secs: 0,
             sell_skip_pre_post_settle: false,
@@ -255,9 +303,9 @@ async fn run_trailing_exit_fak_sell(
                     }
                     let _ = tx
                         .send(AppEvent::TrailingExitDispatchDone {
-                            outcome,
-                            success: false,
-                            error: Some(format!("trailing exit: {msg} ({attempt_label})")),
+                            token_id: token_id.clone(),
+                            success:  false,
+                            error:    Some(format!("trailing exit: {msg} ({attempt_label})")),
                         })
                         .await;
                     return;
@@ -265,9 +313,9 @@ async fn run_trailing_exit_fak_sell(
                 if otype != OrderType::Fak {
                     let _ = tx
                         .send(AppEvent::TrailingExitDispatchDone {
-                            outcome,
-                            success: false,
-                            error: Some("trailing exit: internal — expected FAK SELL".into()),
+                            token_id: token_id.clone(),
+                            success:  false,
+                            error:    Some("trailing exit: internal — expected FAK SELL".into()),
                         })
                         .await;
                     return;
@@ -282,6 +330,7 @@ async fn run_trailing_exit_fak_sell(
                             qty:   ack_qty,
                             price: ack_price,
                             clob_order_id: resp.order_id.clone(),
+                            token_id:      token_id.clone(),
                         })
                         .await;
                     spawn_open_orders_refresh(
@@ -291,10 +340,7 @@ async fn run_trailing_exit_fak_sell(
                         user_open_ledger.clone(),
                     );
                     let cli2 = trading.clone();
-                    let tid  = match outcome {
-                        Outcome::Up   => market_for_refresh.up_token_id.clone(),
-                        Outcome::Down => market_for_refresh.down_token_id.clone(),
-                    };
+                    let tid = token_id.clone();
                     tokio::spawn(async move {
                         if let Err(e) = cli2.refresh_conditional_balance_allowance_cache(&tid).await
                         {
@@ -307,9 +353,9 @@ async fn run_trailing_exit_fak_sell(
                     });
                     let _ = tx
                         .send(AppEvent::TrailingExitDispatchDone {
-                            outcome,
-                            success: true,
-                            error:   None,
+                            token_id: token_id.clone(),
+                            success:  true,
+                            error:    None,
                         })
                         .await;
                     return;
@@ -324,9 +370,9 @@ async fn run_trailing_exit_fak_sell(
                     }
                     let _ = tx
                         .send(AppEvent::TrailingExitDispatchDone {
-                            outcome,
-                            success: false,
-                            error:   Some(
+                            token_id: token_id.clone(),
+                            success:  false,
+                            error:    Some(
                                 "trailing exit: FAK SELL — no fill ack (see logs)".to_string(),
                             ),
                         })
@@ -341,9 +387,9 @@ async fn run_trailing_exit_fak_sell(
                 }
                 let _ = tx
                     .send(AppEvent::TrailingExitDispatchDone {
-                        outcome,
-                        success: false,
-                        error:   Some(format!("trailing exit: {e} ({attempt_label})")),
+                        token_id: token_id.clone(),
+                        success:  false,
+                        error:    Some(format!("trailing exit: {e} ({attempt_label})")),
                     })
                     .await;
             }
@@ -531,6 +577,9 @@ async fn main() -> Result<()> {
     let (market_profile_tx, market_profile_rx) = watch::channel(profile_watch_seed);
     let mut market_profile_rx_slot = Some(market_profile_rx);
 
+    let (user_bundle_tx, user_bundle_rx) = watch::channel(UserWsBundle::default());
+    let (book_token_tx, book_token_rx) = watch::channel(Vec::<String>::new());
+
     // When a new market arrives, tear down the old book WS and start a new one.
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
@@ -540,40 +589,68 @@ async fn main() -> Result<()> {
     // Supervisor moves a clone; `user_open_ledger` / `user_trade_sync` stay in `main` for TUI.
     let user_open_ledger_for_supervisor = user_open_ledger.clone();
     let user_trade_sync_for_supervisor = user_trade_sync.clone();
+    let mut book_token_rx_supervisor = book_token_rx;
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
         let mut holders_poll: Option<tokio::task::JoinHandle<()>> = None;
 
-        // User WS: one long-lived connection; market switches via watch + dynamic subscribe
-        // (Polymarket WSS `operation`: subscribe / unsubscribe on `markets`).
-        let (user_market_tx, user_market_rx) = tokio::sync::watch::channel(feeds::clob_user_ws::UserWsMarket::default());
+        // User WS: one long-lived connection; `UserWsBundle` adds extra condition IDs for
+        // background trailing fills (main updates the watch after each `apply`).
         let ledger_user_ws = user_open_ledger_for_supervisor.clone();
         let uts = user_trade_sync_for_supervisor.clone();
         let _user_ws = feeds::clob_user_ws::spawn(
             trading_for_positions.fill_wait_registry(),
             trading_for_positions.clone(),
-            user_market_rx,
+            user_bundle_rx,
             tx_for_books.clone(),
             ledger_user_ws,
             uts,
         );
 
-        while let Some(m) = market_rx.recv().await {
-            if let Some(h) = book_handle.take() { h.abort(); }
-            if let Some(h) = orders_poll.take() { h.abort(); }
-            if let Some(h) = holders_poll.take() { h.abort(); }
-            let uwm = feeds::clob_user_ws::UserWsMarket {
-                condition_id:  m.condition_id.clone(),
-                up_token_id:   m.up_token_id.clone(),
-                down_token_id: m.down_token_id.clone(),
+        let mut ui_book_tokens: Vec<String> = Vec::new();
+        let mut last_book_spawn: Vec<String> = Vec::new();
+
+        let mut restart_book_ws =
+            |ids: &[String], book_handle: &mut Option<tokio::task::JoinHandle<()>>| {
+                if ids.len() == last_book_spawn.len()
+                    && ids.iter().zip(last_book_spawn.iter()).all(|(a, b)| a == b)
+                {
+                    return;
+                }
+                if let Some(h) = book_handle.take() {
+                    h.abort();
+                }
+                if ids.is_empty() {
+                    last_book_spawn.clear();
+                    return;
+                }
+                *book_handle = Some(feeds::clob_ws::spawn(
+                    ids.to_vec(),
+                    clob_forwarder(tx_for_books.clone()),
+                ));
+                last_book_spawn = ids.to_vec();
             };
-            user_open_ledger_for_supervisor.roll_market(&uwm).await;
-            user_trade_sync_for_supervisor.on_market_roll();
-            let _ = user_market_tx.send(uwm);
-            let token_ids = vec![m.up_token_id.clone(), m.down_token_id.clone()];
-            book_handle = Some(feeds::clob_ws::spawn(token_ids, clob_forwarder(tx_for_books.clone())));
-            let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
+
+        loop {
+            tokio::select! {
+                mb = market_rx.recv() => {
+                    let Some(m) = mb else { break };
+                    if let Some(h) = book_handle.take() { h.abort(); }
+                    if let Some(h) = orders_poll.take() { h.abort(); }
+                    if let Some(h) = holders_poll.take() { h.abort(); }
+                    let uwm = feeds::clob_user_ws::UserWsMarket {
+                        condition_id:  m.condition_id.clone(),
+                        up_token_id:   m.up_token_id.clone(),
+                        down_token_id: m.down_token_id.clone(),
+                    };
+                    user_open_ledger_for_supervisor.roll_market(&uwm).await;
+                    user_trade_sync_for_supervisor.on_market_roll();
+                    ui_book_tokens = vec![m.up_token_id.clone(), m.down_token_id.clone()];
+                    let extra = book_token_rx_supervisor.borrow().clone();
+                    let merged = merge_ui_and_extra_book_tokens(&ui_book_tokens, &extra);
+                    restart_book_ws(&merged, &mut book_handle);
+                    let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
 
             let tw = trading_for_positions.clone();
             let up_pw = m.up_token_id.clone();
@@ -834,6 +911,16 @@ async fn main() -> Result<()> {
                     interval.tick().await;
                 }
             }));
+                }
+                r = book_token_rx_supervisor.changed() => {
+                    if r.is_err() {
+                        break;
+                    }
+                    let extra = book_token_rx_supervisor.borrow().clone();
+                    let merged = merge_ui_and_extra_book_tokens(&ui_book_tokens, &extra);
+                    restart_book_ws(&merged, &mut book_handle);
+                }
+            }
         }
     });
 
@@ -862,6 +949,8 @@ async fn main() -> Result<()> {
 
     let mut state = AppState::new(cfg.default_size_usdc, user_trade_sync.clone());
     let mut discovery_spawned = false;
+    let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
+    let _ = book_token_tx.send(collect_book_watch_token_ids(&state));
 
     // ── main loop ────────────────────────────────────────────────────
     /// Drain coalesced feed events in one frame so a burst of book updates
@@ -893,6 +982,8 @@ async fn main() -> Result<()> {
                 &market_profile_tx,
                 &mut market_profile_rx_slot,
                 &mut discovery_spawned,
+                &user_bundle_tx,
+                &book_token_tx,
             ) {
                 should_quit = true;
                 break;
@@ -933,6 +1024,8 @@ async fn main() -> Result<()> {
                                 &market_profile_tx,
                                 &mut market_profile_rx_slot,
                                 &mut discovery_spawned,
+                                &user_bundle_tx,
+                                &book_token_tx,
                             ) {
                                 should_quit = true;
                                 break;
@@ -962,6 +1055,8 @@ async fn main() -> Result<()> {
                     &market_profile_tx,
                     &mut market_profile_rx_slot,
                     &mut discovery_spawned,
+                    &user_bundle_tx,
+                    &book_token_tx,
                 ) {
                     should_quit = true;
                     break;
@@ -1385,20 +1480,20 @@ fn spawn_order(
                 "take-profit GTD: request task started (POST /order next)",
             );
         }
-        let market_for_refresh = market.clone();
+        let market_for_refresh = market;
         let up_token = market_for_refresh.up_token_id.clone();
         let down_token = market_for_refresh.down_token_id.clone();
         let token_id = match outcome {
-            Outcome::Up   => market.up_token_id,
-            Outcome::Down => market.down_token_id,
+            Outcome::Up   => market_for_refresh.up_token_id.clone(),
+            Outcome::Down => market_for_refresh.down_token_id.clone(),
         };
         let args = OrderArgs {
             token_id,
             side,
             price,
             size: shares,
-            neg_risk: market.neg_risk,
-            tick_size: market.tick_size.clone(),
+            neg_risk: market_for_refresh.neg_risk,
+            tick_size: market_for_refresh.tick_size.clone(),
             buy_notional_usdc,
             expiration_unix_secs,
             sell_skip_pre_post_settle: is_take_profit_placement,
@@ -1482,6 +1577,10 @@ fn spawn_order(
                     };
                     if let Some((ack_qty, ack_price)) = ack
                     {
+                        let token_id_ack = match outcome {
+                            Outcome::Up => market_for_refresh.up_token_id.clone(),
+                            Outcome::Down => market_for_refresh.down_token_id.clone(),
+                        };
                         let _ = tx
                             .send(AppEvent::OrderAck {
                                 side,
@@ -1489,6 +1588,7 @@ fn spawn_order(
                                 qty: ack_qty,
                                 price: ack_price,
                                 clob_order_id: resp.order_id.clone(),
+                                token_id:      token_id_ack,
                             })
                             .await;
                     } else {
@@ -1660,7 +1760,7 @@ fn spawn_order(
                                 trading.clone(),
                                 user_open_ledger.clone(),
                                 tx.clone(),
-                                market_for_refresh,
+                                market_for_refresh.clone(),
                                 outcome,
                                 Side::Sell,
                                 tp_sell_shares,
@@ -1757,6 +1857,7 @@ fn spawn_order(
                                     token_id,
                                     trail_bps,
                                     activation_bps: take_profit_bps,
+                                    market:      market_for_refresh.clone(),
                                 })
                                 .await;
                         }

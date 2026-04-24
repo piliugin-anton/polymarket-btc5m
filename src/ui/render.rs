@@ -285,8 +285,9 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     ];
     line1_parts.extend(sentiment_spans);
     let line1 = Line::from(line1_parts);
-    // Line 2: price to beat + countdown + market
-    let line2 = Line::from(vec![
+    // Line 2: price to beat + countdown + market (+ background trailing sessions)
+    let bg_trail = s.background_trail_count();
+    let mut line2_parts = vec![
         Span::styled(target, Style::default().fg(Color::Yellow)),
         Span::raw("   "),
         Span::styled(
@@ -302,7 +303,15 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
             s.market.as_ref().map(|m| truncate(&m.question, 60)).unwrap_or_default(),
             Style::default().fg(Color::White),
         ),
-    ]);
+    ];
+    if bg_trail > 0 {
+        line2_parts.push(Span::raw("   "));
+        line2_parts.push(Span::styled(
+            format!("bg trail ×{bg_trail}"),
+            Style::default().fg(Color::Cyan),
+        ));
+    }
+    let line2 = Line::from(line2_parts);
 
     let block_title = s
         .market_profile

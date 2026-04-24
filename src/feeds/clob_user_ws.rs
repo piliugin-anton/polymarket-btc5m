@@ -10,7 +10,7 @@
 //! - **`order`** (PLACEMENT / UPDATE / CANCELLATION) → in-memory open-order ledger, then
 //!   `AppEvent::OpenOrdersLoaded` (same as `GET /data/orders` snapshot path)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -41,6 +41,13 @@ pub struct UserWsMarket {
     pub condition_id:  String,
     pub up_token_id:   String,
     pub down_token_id: String,
+}
+
+/// User-channel subscription: UI market + extra condition IDs for background trailing fills.
+#[derive(Clone, Default, Debug, Eq, PartialEq)]
+pub struct UserWsBundle {
+    pub active: UserWsMarket,
+    pub extras: Vec<UserWsMarket>,
 }
 
 /// OPEN orders mirror for the active market, merged from `GET /data/orders` and user `order` WS
@@ -239,7 +246,7 @@ fn clob_order_from_user_ws_order_value(v: &Value) -> Option<ClobOpenOrder> {
 pub fn spawn(
     fill_registry: Arc<FillWaitRegistry>,
     trading: Arc<TradingClient>,
-    mut market_watch: watch::Receiver<UserWsMarket>,
+    mut market_watch: watch::Receiver<UserWsBundle>,
     app_tx: mpsc::Sender<AppEvent>,
     open_ledger: Arc<UserOpenOrdersLedger>,
     user_trade_sync: Arc<UserTradeSync>,
@@ -283,11 +290,15 @@ pub fn spawn(
     })
 }
 
-async fn wait_nonempty_market(rx: &mut watch::Receiver<UserWsMarket>) -> Result<UserWsMarket> {
+fn bundle_has_markets(b: &UserWsBundle) -> bool {
+    !b.active.condition_id.is_empty()
+        || b.extras.iter().any(|e| !e.condition_id.is_empty())
+}
+
+async fn wait_nonempty_bundle(rx: &mut watch::Receiver<UserWsBundle>) -> Result<()> {
     loop {
-        let v = rx.borrow().clone();
-        if !v.condition_id.is_empty() {
-            return Ok(v);
+        if bundle_has_markets(&*rx.borrow()) {
+            return Ok(());
         }
         rx.changed()
             .await
@@ -295,14 +306,46 @@ async fn wait_nonempty_market(rx: &mut watch::Receiver<UserWsMarket>) -> Result<
     }
 }
 
-async fn send_initial_user_sub(
+fn desired_condition_ids(b: &UserWsBundle) -> HashSet<String> {
+    let mut s = HashSet::new();
+    if !b.active.condition_id.is_empty() {
+        s.insert(b.active.condition_id.clone());
+    }
+    for e in &b.extras {
+        if !e.condition_id.is_empty() {
+            s.insert(e.condition_id.clone());
+        }
+    }
+    s
+}
+
+fn resolve_trade_outcome(bundle: &UserWsBundle, asset_id: &str) -> Option<Outcome> {
+    let markets = std::iter::once(&bundle.active).chain(bundle.extras.iter());
+    for m in markets {
+        if m.condition_id.is_empty() {
+            continue;
+        }
+        if clob_asset_ids_match(asset_id, &m.up_token_id) {
+            return Some(Outcome::Up);
+        }
+        if clob_asset_ids_match(asset_id, &m.down_token_id) {
+            return Some(Outcome::Down);
+        }
+    }
+    None
+}
+
+async fn send_initial_user_sub_multi(
     ws: &mut UserWsStream,
     creds: &crate::trading::ApiCreds,
-    condition_id: &str,
+    markets: &[String],
 ) -> Result<()> {
+    if markets.is_empty() {
+        return Ok(());
+    }
     let sub = serde_json::json!({
         "type": "user",
-        "markets": [condition_id],
+        "markets": markets,
         "auth": {
             "apiKey": creds.api_key,
             "secret": creds.secret,
@@ -330,44 +373,80 @@ async fn send_market_operation(
     Ok(())
 }
 
+async fn sync_condition_subscriptions(
+    ws: &mut UserWsStream,
+    creds: &crate::trading::ApiCreds,
+    subscribed: &mut HashSet<String>,
+    desired: &HashSet<String>,
+    handshake_done: &mut bool,
+) -> Result<()> {
+    for id in subscribed.difference(desired) {
+        send_market_operation(ws, id, "unsubscribe").await?;
+    }
+    subscribed.retain(|id| desired.contains(id));
+
+    if desired.is_empty() {
+        *handshake_done = false;
+        return Ok(());
+    }
+
+    if !*handshake_done {
+        let mut ids: Vec<String> = desired.iter().cloned().collect();
+        ids.sort();
+        send_initial_user_sub_multi(ws, creds, &ids).await?;
+        *subscribed = desired.clone();
+        *handshake_done = true;
+        info!(n = subscribed.len(), "CLOB user WS initial subscribe (multi-market)");
+        return Ok(());
+    }
+
+    for id in desired.difference(subscribed).cloned().collect::<Vec<_>>() {
+        send_market_operation(ws, &id, "subscribe").await?;
+        subscribed.insert(id);
+    }
+    Ok(())
+}
+
 async fn run_session(
     ws: &mut UserWsStream,
     creds: &crate::trading::ApiCreds,
     registry: &FillWaitRegistry,
-    market_watch: &mut watch::Receiver<UserWsMarket>,
+    market_watch: &mut watch::Receiver<UserWsBundle>,
     app_tx: &mpsc::Sender<AppEvent>,
     open_ledger: &UserOpenOrdersLedger,
     user_trade_sync: &UserTradeSync,
 ) -> Result<()> {
-    let mut current_sub: Option<String> = None;
+    let mut subscribed: HashSet<String> = HashSet::new();
+    let mut handshake_done = false;
     let mut ping = tokio::time::interval(Duration::from_secs(10));
     ping.tick().await;
 
     let mut logged_first = false;
 
     loop {
-        let ctx = wait_nonempty_market(market_watch).await?;
-        let desired = ctx.condition_id.clone();
-        if current_sub.as_deref() != Some(desired.as_str()) {
-            if let Some(ref old_id) = current_sub {
-                send_market_operation(ws, old_id, "unsubscribe").await?;
-            }
-            if current_sub.is_none() {
-                send_initial_user_sub(ws, creds, &desired).await?;
-            } else {
-                send_market_operation(ws, &desired, "subscribe").await?;
-            }
-            info!(
-                market = %desired,
-                prev = ?current_sub.as_deref(),
-                "CLOB user WS market filter updated (same connection)"
-            );
-            current_sub = Some(desired);
-        }
+        wait_nonempty_bundle(market_watch).await?;
+        let mut desired = desired_condition_ids(&*market_watch.borrow());
+        sync_condition_subscriptions(
+            ws,
+            creds,
+            &mut subscribed,
+            &desired,
+            &mut handshake_done,
+        )
+        .await?;
 
         tokio::select! {
             r = market_watch.changed() => {
                 r.map_err(|_| anyhow::anyhow!("user WS: market watch closed"))?;
+                desired = desired_condition_ids(&*market_watch.borrow());
+                sync_condition_subscriptions(
+                    ws,
+                    creds,
+                    &mut subscribed,
+                    &desired,
+                    &mut handshake_done,
+                )
+                .await?;
                 continue;
             }
             _ = ping.tick() => {
@@ -400,15 +479,14 @@ async fn run_session(
                 }
                 let values = parse_user_channel_values(&txt);
                 registry.dispatch_trades_in_values(&values).await;
-                let ctxm = market_watch.borrow().clone();
-                if !ctxm.condition_id.is_empty() {
+                let bundle = market_watch.borrow().clone();
+                if bundle_has_markets(&bundle) {
                     for v in &values {
                         if let Some(f) = try_parse_user_channel_trade(v) {
-                            if !clob_asset_ids_match(&f.asset_id, &ctxm.up_token_id)
-                                && !clob_asset_ids_match(&f.asset_id, &ctxm.down_token_id)
-                            {
+                            let Some(outcome) = resolve_trade_outcome(&bundle, &f.asset_id) else {
                                 continue;
-                            }
+                            };
+                            let token_id = f.asset_id.clone();
                             if !user_trade_sync.before_ws_user_fill_apply(
                                 &f.clob_trade_id,
                                 &f.order_leg_id,
@@ -417,17 +495,13 @@ async fn run_session(
                             ) {
                                 continue;
                             }
-                            let outcome = if clob_asset_ids_match(&f.asset_id, &ctxm.up_token_id) {
-                                Outcome::Up
-                            } else {
-                                Outcome::Down
-                            };
                             let _ = app_tx
                                 .send(AppEvent::UserChannelFill {
                                     clob_trade_id: f.clob_trade_id,
                                     order_leg_id:  f.order_leg_id,
                                     side:          f.side,
                                     outcome,
+                                    token_id,
                                     qty:           f.qty,
                                     price:         f.price,
                                     ts:            f.match_ts,
