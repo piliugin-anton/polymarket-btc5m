@@ -141,7 +141,7 @@ fn merge_ui_and_extra_book_tokens(ui_pair: &[String], extra: &[String]) -> Vec<S
 }
 
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
-fn apply_app_event(
+async fn apply_app_event(
     ev:     AppEvent,
     state:  &mut AppState,
     trading:&Arc<TradingClient>,
@@ -189,7 +189,7 @@ fn apply_app_event(
                     }
                 }
             }
-            state.apply(e);
+            state.apply(e).await;
             try_dispatch_trailing_sell(
                 state,
                 trading,
@@ -645,7 +645,7 @@ async fn main() -> Result<()> {
                         down_token_id: m.down_token_id.clone(),
                     };
                     user_open_ledger_for_supervisor.roll_market(&uwm).await;
-                    user_trade_sync_for_supervisor.on_market_roll();
+                    user_trade_sync_for_supervisor.on_market_roll().await;
                     ui_book_tokens = vec![m.up_token_id.clone(), m.down_token_id.clone()];
                     let extra = book_token_rx_supervisor.borrow().clone();
                     let merged = merge_ui_and_extra_book_tokens(&ui_book_tokens, &extra);
@@ -984,7 +984,9 @@ async fn main() -> Result<()> {
                 &mut discovery_spawned,
                 &user_bundle_tx,
                 &book_token_tx,
-            ) {
+            )
+            .await
+            {
                 should_quit = true;
                 break;
             }
@@ -1026,7 +1028,9 @@ async fn main() -> Result<()> {
                                 &mut discovery_spawned,
                                 &user_bundle_tx,
                                 &book_token_tx,
-                            ) {
+                            )
+                            .await
+                            {
                                 should_quit = true;
                                 break;
                             }
@@ -1057,7 +1061,9 @@ async fn main() -> Result<()> {
                     &mut discovery_spawned,
                     &user_bundle_tx,
                     &book_token_tx,
-                ) {
+                )
+                .await
+                {
                     should_quit = true;
                     break;
                 }

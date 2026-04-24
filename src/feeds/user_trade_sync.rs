@@ -4,10 +4,15 @@
 //! 1) Every CLOB `Trade.id` is stored in `seen_trades` (hydration JSON + every applied WS event).
 //! 2) `ack_wait` / `ws_wait` short-lived queues match `(clob order id, qty, price)` when the two
 //!    channels race (POST /order does not return `Trade.id`).
+//!
+//! Shared across the TUI event loop, the user-channel WebSocket task, and the market supervisor.
+//! [`tokio::sync::Mutex`] is used so waiting tasks yield instead of blocking a runtime worker
+//! (unlike `std::sync::Mutex`). Atomics are not a fit here: we need a set plus bounded wait lists.
 
 use std::fmt;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use tokio::sync::Mutex;
 
 use crate::trading::norm_order_id_key;
 
@@ -50,16 +55,16 @@ impl UserTradeSync {
         }
     }
 
-    pub fn on_market_roll(&self) {
-        let mut g = self.inner.lock().expect("user trade sync");
+    pub async fn on_market_roll(&self) {
+        let mut g = self.inner.lock().await;
         g.seen_trades.clear();
         g.ack_wait.clear();
         g.ws_wait.clear();
     }
 
     /// Trade ids from `GET /data/trades` — later WS re-pushes are ignored.
-    pub fn seed_seen_from_hydration(&self, trade_ids: impl IntoIterator<Item = String>) {
-        let mut g = self.inner.lock().expect("user trade sync");
+    pub async fn seed_seen_from_hydration(&self, trade_ids: impl IntoIterator<Item = String>) {
+        let mut g = self.inner.lock().await;
         for id in trade_ids {
             if !id.is_empty() {
                 g.seen_trades.insert(id);
@@ -68,12 +73,12 @@ impl UserTradeSync {
     }
 
     /// `true` = apply the OrderAck P&L block. `false` = user WSS `trade` already matched the fill.
-    pub fn before_order_ack_apply(&self, clob_order_id: &str, qty: f64, price: f64) -> bool {
+    pub async fn before_order_ack_apply(&self, clob_order_id: &str, qty: f64, price: f64) -> bool {
         let o = norm_order_id_key(clob_order_id);
         if o.is_empty() {
             return true;
         }
-        let mut g = self.inner.lock().expect("user trade sync");
+        let mut g = self.inner.lock().await;
         prune_stale(&mut g.ack_wait);
         prune_stale(&mut g.ws_wait);
         if let Some(i) = g
@@ -88,12 +93,12 @@ impl UserTradeSync {
     }
 
     /// After a successful `OrderAck` P&L update.
-    pub fn after_order_ack_applied(&self, clob_order_id: &str, qty: f64, price: f64) {
+    pub async fn after_order_ack_applied(&self, clob_order_id: &str, qty: f64, price: f64) {
         let o = norm_order_id_key(clob_order_id);
         if o.is_empty() {
             return;
         }
-        let mut g = self.inner.lock().expect("user trade sync");
+        let mut g = self.inner.lock().await;
         prune_stale(&mut g.ack_wait);
         push_cap(
             &mut g.ack_wait,
@@ -102,20 +107,20 @@ impl UserTradeSync {
     }
 
     /// `true` = forward this WSS `trade` to the TUI (no duplicate).
-    pub fn before_ws_user_fill_apply(&self, clob_trade_id: &str, taker_or_leg_id: &str, qty: f64, price: f64) -> bool {
-        if !clob_trade_id.is_empty() {
-            let g = self.inner.lock().expect("user trade sync");
-            if g.seen_trades.contains(clob_trade_id) {
-                return false;
-            }
-        }
+    pub async fn before_ws_user_fill_apply(
+        &self,
+        clob_trade_id: &str,
+        taker_or_leg_id: &str,
+        qty: f64,
+        price: f64,
+    ) -> bool {
         let o = norm_order_id_key(taker_or_leg_id);
-        if o.is_empty() {
-            return true;
-        }
-        let mut g = self.inner.lock().expect("user trade sync");
+        let mut g = self.inner.lock().await;
         if !clob_trade_id.is_empty() && g.seen_trades.contains(clob_trade_id) {
             return false;
+        }
+        if o.is_empty() {
+            return true;
         }
         prune_stale(&mut g.ack_wait);
         prune_stale(&mut g.ws_wait);
@@ -132,7 +137,7 @@ impl UserTradeSync {
     }
 
     /// After [`crate::app::AppEvent::UserChannelFill`] mutates `AppState`.
-    pub fn after_ws_user_fill_committed(
+    pub async fn after_ws_user_fill_committed(
         &self,
         clob_trade_id: &str,
         taker_or_leg_id: &str,
@@ -143,7 +148,7 @@ impl UserTradeSync {
         if o.is_empty() {
             return;
         }
-        let mut g = self.inner.lock().expect("user trade sync");
+        let mut g = self.inner.lock().await;
         if !clob_trade_id.is_empty() {
             g.seen_trades.insert(clob_trade_id.to_string());
         }
@@ -179,18 +184,18 @@ fn push_cap(v: &mut Vec<WaitSlot>, slot: WaitSlot) {
 mod tests {
     use super::*;
 
-    #[test]
-    fn ack_then_ws_dedupes() {
+    #[tokio::test]
+    async fn ack_then_ws_dedupes() {
         let s = UserTradeSync::new();
-        s.after_order_ack_applied("0xabc1", 10.0, 0.55);
-        assert!(!s.before_ws_user_fill_apply("T-1", "0xabc1", 10.0, 0.55));
+        s.after_order_ack_applied("0xabc1", 10.0, 0.55).await;
+        assert!(!s.before_ws_user_fill_apply("T-1", "0xabc1", 10.0, 0.55).await);
     }
 
-    #[test]
-    fn ws_then_ack_dedupes() {
+    #[tokio::test]
+    async fn ws_then_ack_dedupes() {
         let s = UserTradeSync::new();
-        assert!(s.before_ws_user_fill_apply("T-2", "0xdef2", 5.0, 0.40));
-        s.after_ws_user_fill_committed("T-2", "0xdef2", 5.0, 0.40);
-        assert!(!s.before_order_ack_apply("0xdef2", 5.0, 0.40));
+        assert!(s.before_ws_user_fill_apply("T-2", "0xdef2", 5.0, 0.40).await);
+        s.after_ws_user_fill_committed("T-2", "0xdef2", 5.0, 0.40).await;
+        assert!(!s.before_order_ack_apply("0xdef2", 5.0, 0.40).await);
     }
 }

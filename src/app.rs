@@ -754,7 +754,7 @@ impl AppState {
     fn apply_background_trailing_fill(&mut self, _token_id: &str, _side: Side, _qty: f64) {}
 
     // ── Mutations ───────────────────────────────────────────────────
-    pub fn apply(&mut self, ev: AppEvent) {
+    pub async fn apply(&mut self, ev: AppEvent) {
         match ev {
             AppEvent::Tick => {
                 if self
@@ -850,7 +850,7 @@ impl AppState {
                     }
                     self.fills.push_back(f);
                 }
-                self.user_trade_sync.seed_seen_from_hydration(seen_seed);
+                self.user_trade_sync.seed_seen_from_hydration(seen_seed).await;
                 trim_fills_to_cap(&mut self.fills, 64);
                 let nu = net_shares_from_fills(&self.fills, Outcome::Up).max(0.0);
                 let nd = net_shares_from_fills(&self.fills, Outcome::Down).max(0.0);
@@ -916,11 +916,13 @@ impl AppState {
                     });
                     trim_fills_to_cap(&mut self.fills, 64);
                     self.user_trade_sync
-                        .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price);
+                        .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
+                        .await;
                 } else {
                     self.apply_background_trailing_fill(&token_id, side, qty);
                     self.user_trade_sync
-                        .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price);
+                        .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
+                        .await;
                 }
                 self.bump_trailing_tracked_shares(&token_id, side, qty);
                 if side == Side::Sell {
@@ -944,7 +946,7 @@ impl AppState {
             } => {
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
-                    if !self.user_trade_sync.before_order_ack_apply(oid, qty, price) {
+                    if !self.user_trade_sync.before_order_ack_apply(oid, qty, price).await {
                         do_pnl = false;
                     }
                 }
@@ -973,7 +975,7 @@ impl AppState {
                     }
                     trim_fills_to_cap(&mut self.fills, 64);
                     if let Some(oid) = clob_order_id {
-                        self.user_trade_sync.after_order_ack_applied(&oid, qty, price);
+                        self.user_trade_sync.after_order_ack_applied(&oid, qty, price).await;
                     }
                     self.bump_trailing_tracked_shares(&token_id, side, qty);
                     if side == Side::Sell {
@@ -1810,8 +1812,8 @@ mod tests {
     }
 
     /// Trailing on token `OLD_UP` stays in state when the UI `market` is already a different pair.
-    #[test]
-    fn trailing_session_survives_different_ui_market() {
+    #[tokio::test]
+    async fn trailing_session_survives_different_ui_market() {
         let mut s = test_state();
         let m_old = test_market("OLD_UP", "OLD_DOWN", "0xc0");
         let m_new = test_market("NEW_UP", "NEW_DOWN", "0xc1");
@@ -1824,13 +1826,14 @@ mod tests {
             trail_bps:        100,
             activation_bps:   0,
             market:           m_old,
-        });
+        })
+        .await;
         let b_old = BookSnapshot {
             asset_id: "OLD_UP".into(),
             bids:     vec![BookLevel { price: 0.49, size: 10.0 }],
             asks:     vec![BookLevel { price: 0.51, size: 10.0 }],
         };
-        s.apply(AppEvent::Book(b_old));
+        s.apply(AppEvent::Book(b_old)).await;
         assert!(
             s.trailing.contains_key("OLD_UP") || s.pending_trail_arms.contains_key("OLD_UP"),
             "expected pending or armed trail on OLD_UP"
@@ -1840,7 +1843,7 @@ mod tests {
             bids:     vec![BookLevel { price: 0.40, size: 5.0 }],
             asks:     vec![BookLevel { price: 0.42, size: 5.0 }],
         };
-        s.apply(AppEvent::Book(b_new));
+        s.apply(AppEvent::Book(b_new)).await;
         assert!(
             s.trailing.contains_key("OLD_UP") || s.pending_trail_arms.contains_key("OLD_UP"),
             "OLD_UP trail should not be dropped when NEW_UP book updates"

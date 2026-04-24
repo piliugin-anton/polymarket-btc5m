@@ -487,12 +487,15 @@ async fn run_session(
                                 continue;
                             };
                             let token_id = f.asset_id.clone();
-                            if !user_trade_sync.before_ws_user_fill_apply(
-                                &f.clob_trade_id,
-                                &f.order_leg_id,
-                                f.qty,
-                                f.price,
-                            ) {
+                            if !user_trade_sync
+                                .before_ws_user_fill_apply(
+                                    &f.clob_trade_id,
+                                    &f.order_leg_id,
+                                    f.qty,
+                                    f.price,
+                                )
+                                .await
+                            {
                                 continue;
                             }
                             let _ = app_tx
