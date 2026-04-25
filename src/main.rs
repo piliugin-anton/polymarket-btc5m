@@ -480,7 +480,7 @@ async fn main() -> Result<()> {
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
         market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
         market_buy_trail_bps = cfg.market_buy_trail_bps,
-        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when mid >= entry×(1+TP bps) from position)",
+        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position)",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
@@ -1863,7 +1863,7 @@ fn spawn_order(
                                 take_profit_bps,
                                 entry_px,
                                 outcome = ?outcome,
-                                "trailing: market BUY ok; arming when mid >= entry×(1+TP bps) (position avg or fill est.)"
+                                "trailing: market BUY ok; arming when bid >= entry×(1+TP bps) (position avg or fill est.)"
                             );
                             let token_id = match outcome {
                                 Outcome::Up => up_token.clone(),

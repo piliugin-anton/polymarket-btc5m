@@ -61,11 +61,11 @@ pub struct Config {
     pub market_sell_slippage_bps: u32,
     /// Bps margin: (1) with trailing **off** — GTD SELL after a market **Buy** at this edge
     /// ([`crate::fees::take_profit_limit_price_crypto_after_fees`]). (2) with trailing **on** — trail
-    /// **arms** when `mid >= entry * (1 + bps/10_000)` with `entry` from the live position
+    /// **arms** when `best_bid >= entry * (1 + bps/10_000)` with `entry` from the live position
     /// (`avg_entry`) or the fill estimate until the position is applied (`0` = arm as soon as bid
     /// reaches entry).
     pub market_buy_take_profit_bps: u32,
-    /// If positive after a market **Buy** (FAK), run a trailing stop on CLOB mid, then FAK SELL; trail width in bps from peak.
+    /// If positive after a market **Buy** (FAK), run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak.
     pub market_buy_trail_bps: u32,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,

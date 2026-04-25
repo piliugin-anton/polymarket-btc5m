@@ -178,7 +178,7 @@ impl Outcome {
     pub fn opposite(self) -> Self { match self { Outcome::Up => Outcome::Down, Outcome::Down => Outcome::Up } }
 }
 
-/// Client-side trailing for one outcome token — fed by CLOB mid (bid/ask average); see [`crate::trailing_stop`].
+/// Client-side trailing for one outcome token — fed by CLOB best bid; see [`crate::trailing_stop`].
 #[derive(Debug)]
 pub struct TrailingSession {
     pub token_id: String,
@@ -447,7 +447,7 @@ pub struct AppState {
 
     /// Trailing stops keyed by CLOB outcome `token_id` (supports multiple markets at once).
     pub trailing: HashMap<String, TrailingSession>,
-    /// Buy registered; waiting for **mid** to reach entry × (1 + TP bps) before arming the trail.
+    /// Buy registered; waiting for **best bid** to reach entry × (1 + TP bps) before arming the trail.
     pub pending_trail_arms: HashMap<String, PendingTrailArm>,
     /// Books for tokens that are not the active UI pair but still have trailing / pending arms.
     pub watched_books: HashMap<String, Arc<BookSnapshot>>,
@@ -743,7 +743,7 @@ impl AppState {
             },
         );
         self.status_line = format!(
-            "trailing {out} — {trail_bps} bps trail on mid, SELL up to {plan_sell_shares:.2} sh",
+            "trailing {out} — {trail_bps} bps trail on bid, SELL up to {plan_sell_shares:.2} sh",
             out = outcome.as_str()
         );
     }
@@ -761,7 +761,7 @@ impl AppState {
             None => return,
         };
         let bps = p0.activation_bps as f64 / 10_000.0;
-        let Some(mid) = self.mid_for_token(token_id) else {
+        let Some(bid) = self.best_bid_for_token(token_id) else {
             return;
         };
         let entry = if let Some(oc) = self.outcome_for_active_token(token_id) {
@@ -777,8 +777,8 @@ impl AppState {
         if !entry.is_finite() || entry <= 0.0 {
             return;
         }
-        let min_mid = entry * (1.0 + bps);
-        if mid + 1e-12 < min_mid {
+        let min_bid = entry * (1.0 + bps);
+        if bid + 1e-12 < min_bid {
             return;
         }
         self.pending_trail_arms.remove(&map_key);
@@ -802,7 +802,7 @@ impl AppState {
         }
     }
 
-    fn apply_trailing_book_tick(&mut self, asset_id: &str, mid: f64) {
+    fn apply_trailing_book_tick(&mut self, asset_id: &str, bid: f64) {
         let map_key = match trailing_map_key_for_asset(&self.trailing, asset_id) {
             Some(k) => k,
             None => return,
@@ -816,7 +816,7 @@ impl AppState {
             {
                 return;
             }
-            sess.stop.on_price(mid)
+            sess.stop.on_price(bid)
         };
         let TickOutcome::Triggered { .. } = tick else {
             return;
@@ -842,7 +842,7 @@ impl AppState {
                 entry_px,
             )
         };
-        if mid > entry_px {
+        if bid > entry_px {
             let pos_sh = if let Some(oc) = self.outcome_for_active_token(&map_key) {
                 self.position(oc).shares.max(0.0)
             } else {
@@ -859,13 +859,13 @@ impl AppState {
                     });
                 }
                 self.status_line = format!(
-                    "trailing: {} tripped (mid {mid:.2} > entry {entry_px:.2}) — SELL {sh:.2} sh",
+                    "trailing: {} tripped (bid {bid:.2} > entry {entry_px:.2}) — SELL {sh:.2} sh",
                     outcome.as_str()
                 );
             }
         } else {
             self.status_line = format!(
-                "trailing: {} tripped (mid {mid:.2} ≤ entry {entry_px:.2}) — no auto SELL",
+                "trailing: {} tripped (bid {bid:.2} ≤ entry {entry_px:.2}) — no auto SELL",
                 outcome.as_str()
             );
         }
@@ -956,8 +956,8 @@ impl AppState {
                 book_watch_cached = true;
 
                 self.try_promote_pending_trail_any(id_for_trail.as_str());
-                if let Some(mid) = self.mid_for_token(id_for_trail.as_str()) {
-                    self.apply_trailing_book_tick(id_for_trail.as_str(), mid);
+                if let Some(bid) = self.best_bid_for_token(id_for_trail.as_str()) {
+                    self.apply_trailing_book_tick(id_for_trail.as_str(), bid);
                 }
                 self.recompute_sentiment();
             }
@@ -1207,7 +1207,7 @@ impl AppState {
                         }
                     }
                     self.status_line = format!(
-                        "trailing: {} pending — arm when mid ≥ entry×(1+{activation_bps} bps) (from position)",
+                        "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
                         outcome.as_str()
                     );
                     self.try_promote_pending_trail_any(tid.as_str());
