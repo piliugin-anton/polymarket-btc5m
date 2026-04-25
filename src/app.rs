@@ -536,14 +536,6 @@ impl AppState {
         }
     }
 
-    /// Short label for the header (e.g. "BTC/USD" / "ETH/USD").
-    pub fn spot_pair_label(&self) -> String {
-        self.market_profile
-            .as_ref()
-            .map(|p| format!("{}/USD", p.asset.label))
-            .unwrap_or_else(|| "—/USD".to_string())
-    }
-
     /// Fraction digits for Chainlink spot / open / delta in the header (XRP needs finer quotes).
     pub fn spot_usd_decimal_places(&self) -> usize {
         match self.market_profile.as_ref().map(|p| p.asset.label) {
@@ -684,10 +676,6 @@ impl AppState {
 
     pub fn total_pnl(&self) -> f64 {
         self.realized_pnl + self.unrealized_pnl(Outcome::Up) + self.unrealized_pnl(Outcome::Down)
-    }
-
-    pub fn countdown_secs(&self) -> Option<i64> {
-        self.market.as_ref().map(|m| (m.closes_at - Utc::now()).num_seconds().max(0))
     }
 
     pub fn current_size(&self) -> f64 {
