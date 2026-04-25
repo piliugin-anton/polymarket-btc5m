@@ -558,6 +558,7 @@ fn parse_user_trade_timestamp(v: &serde_json::Value) -> DateTime<Utc> {
     let s = v
         .get("match_time")
         .or_else(|| v.get("matchTime"))
+        .or_else(|| v.get("matchtime"))
         .and_then(|s| s.as_str())
         .or_else(|| v.get("last_update").and_then(|s| s.as_str()))
         .or_else(|| v.get("lastUpdate").and_then(|s| s.as_str()))
