@@ -10,6 +10,7 @@
 //! Trading actions post results back through the same channel.
 
 use chrono::{DateTime, Utc};
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -615,6 +616,16 @@ impl AppState {
         if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
             return;
         }
+        // Second (or later) market buy on the same `token_id` promotes or installs again; merge
+        // with the existing session so `plan_sell_shares` caps the combined trailed inventory.
+        let tid_merge = token_id.clone();
+        let (plan_sell_shares, tracked_shares) = match self.trailing.remove(&tid_merge) {
+            Some(prev) => (
+                plan_sell_shares + prev.plan_sell_shares,
+                tracked_shares.max(prev.tracked_shares),
+            ),
+            None => (plan_sell_shares, tracked_shares),
+        };
         let p = (trail_bps as f64 / 10_000.0).max(1e-12);
         let stop = TrailingStop::new(
             TrailSide::Long,
@@ -1018,18 +1029,41 @@ impl AppState {
                     // Misconfiguration — main should not send; ignore.
                 } else {
                     let tid = token_id.clone();
-                    self.pending_trail_arms.insert(
-                        tid.clone(),
-                        PendingTrailArm {
-                            market,
-                            outcome,
-                            entry_price,
-                            plan_sell_shares,
-                            token_id,
-                            trail_bps,
-                            activation_bps,
-                        },
-                    );
+                    match self.pending_trail_arms.entry(tid.clone()) {
+                        Entry::Occupied(mut e) => {
+                            let p = e.get_mut();
+                            let add_plan = plan_sell_shares;
+                            let add_entry = entry_price;
+                            if add_plan > 1e-9 && add_entry.is_finite() && add_entry > 0.0 {
+                                let old_plan = p.plan_sell_shares;
+                                let old_entry = p.entry_price;
+                                let new_plan = old_plan + add_plan;
+                                if new_plan > 1e-9 {
+                                    p.plan_sell_shares = new_plan;
+                                    if old_plan > 1e-9
+                                        && old_entry.is_finite()
+                                        && old_entry > 0.0
+                                    {
+                                        p.entry_price =
+                                            (old_plan * old_entry + add_plan * add_entry) / new_plan;
+                                    } else {
+                                        p.entry_price = add_entry;
+                                    }
+                                }
+                            }
+                        }
+                        Entry::Vacant(e) => {
+                            e.insert(PendingTrailArm {
+                                market,
+                                outcome,
+                                entry_price,
+                                plan_sell_shares,
+                                token_id,
+                                trail_bps,
+                                activation_bps,
+                            });
+                        }
+                    }
                     self.status_line = format!(
                         "trailing: {} pending — arm when mid ≥ entry×(1+{activation_bps} bps) (from position)",
                         outcome.as_str()
@@ -1852,5 +1886,88 @@ mod tests {
             "OLD_UP trail should not be dropped when NEW_UP book updates"
         );
         assert!(s.mid_for_token("OLD_UP").is_some());
+    }
+
+    /// Two FAK buys on the same outcome token before arming: pending plans must add, not overwrite.
+    #[tokio::test]
+    async fn trailing_pending_merges_two_buys_same_token() {
+        let mut s = test_state();
+        let m = test_market("UP_M", "DOWN_M", "0xmerge1");
+        s.market = Some(m.clone());
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.50,
+            plan_sell_shares: 10.0,
+            token_id:         "UP_M".into(),
+            trail_bps:        100,
+            activation_bps:   500,
+            market:           m.clone(),
+        })
+        .await;
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.60,
+            plan_sell_shares: 5.0,
+            token_id:         "UP_M".into(),
+            trail_bps:        100,
+            activation_bps:   500,
+            market:           m.clone(),
+        })
+        .await;
+        let p = s
+            .pending_trail_arms
+            .get("UP_M")
+            .expect("merged pending trail");
+        assert!((p.plan_sell_shares - 15.0).abs() < 1e-9, "plan={}", p.plan_sell_shares);
+        let want_entry = (10.0 * 0.50 + 5.0 * 0.60) / 15.0;
+        assert!((p.entry_price - want_entry).abs() < 1e-9);
+    }
+
+    /// Second buy promotes while a trail is already armed: `plan_sell_shares` sums both legs.
+    #[tokio::test]
+    async fn trailing_install_merges_second_buy_while_armed() {
+        let mut s = test_state();
+        let m = test_market("U_MER", "D_MER", "0xmerge2");
+        s.market = Some(m.clone());
+        s.book_up = Some(BookSnapshot {
+            asset_id: "U_MER".into(),
+            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+        });
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.50,
+            plan_sell_shares: 10.0,
+            token_id:         "U_MER".into(),
+            trail_bps:        200,
+            activation_bps:   0,
+            market:           m.clone(),
+        })
+        .await;
+        assert!(
+            s.trailing.contains_key("U_MER"),
+            "first arm should promote immediately (activation_bps=0)"
+        );
+        assert!((s.trailing["U_MER"].plan_sell_shares - 10.0).abs() < 1e-9);
+
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.55,
+            plan_sell_shares: 5.0,
+            token_id:         "U_MER".into(),
+            trail_bps:        200,
+            activation_bps:   0,
+            market:           m.clone(),
+        })
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "U_MER".into(),
+            bids:     vec![BookLevel { price: 0.56, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.58, size: 100.0 }],
+        }))
+        .await;
+
+        let sess = s.trailing.get("U_MER").expect("session after second promote");
+        assert!((sess.plan_sell_shares - 15.0).abs() < 1e-9, "plan={}", sess.plan_sell_shares);
     }
 }
