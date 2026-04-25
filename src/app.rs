@@ -619,14 +619,65 @@ impl AppState {
     }
 
     /// If `token_id` belongs to the active UI market, return its UP/DOWN side.
+    ///
+    /// Uses [`clob_asset_ids_match`] so decimal / `0x` hex forms agree with user-channel and book
+    /// paths (strict `==` alone left live `position_*` updated while trailing still used stale
+    /// `tracked_shares`, causing SELLs after a manual exit).
     pub fn outcome_for_active_token(&self, token_id: &str) -> Option<Outcome> {
         let m = self.market.as_ref()?;
-        if token_id == m.up_token_id.as_str() {
+        if token_id == m.up_token_id.as_str() || clob_asset_ids_match(token_id, m.up_token_id.as_str())
+        {
             Some(Outcome::Up)
-        } else if token_id == m.down_token_id.as_str() {
+        } else if token_id == m.down_token_id.as_str()
+            || clob_asset_ids_match(token_id, m.down_token_id.as_str())
+        {
             Some(Outcome::Down)
         } else {
             None
+        }
+    }
+
+    /// Long shares available for trailing sizing: live REST/UI position when the trail’s market is
+    /// the active one; else active-token mapping; else `sess.tracked_shares` for background tails.
+    fn trail_live_shares(&self, sess: &TrailingSession) -> f64 {
+        if self.market.as_ref().is_some_and(|m| m.condition_id == sess.market.condition_id) {
+            return self.position(sess.outcome).shares.max(0.0);
+        }
+        if let Some(oc) = self.outcome_for_active_token(sess.token_id.as_str()) {
+            return self.position(oc).shares.max(0.0);
+        }
+        sess.tracked_shares.max(0.0)
+    }
+
+    /// Drop trailing / pending-arm rows when REST replay shows no position on that leg (manual sell
+    /// or fills missed on the user channel).
+    fn sync_trailing_inventory_with_positions(&mut self) {
+        let Some(active_cid) = self.market.as_ref().map(|m| m.condition_id.clone()) else {
+            return;
+        };
+        let clear_trailing: Vec<String> = self
+            .trailing
+            .iter()
+            .filter(|(_, sess)| {
+                sess.market.condition_id == active_cid
+                    && self.position(sess.outcome).shares <= 1e-9
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for tid in clear_trailing {
+            self.clear_trailing_on_sell_token(&tid);
+        }
+        let clear_pending: Vec<String> = self
+            .pending_trail_arms
+            .iter()
+            .filter(|(_, p)| {
+                p.market.condition_id == active_cid
+                    && self.position(p.outcome).shares <= 1e-9
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in clear_pending {
+            self.pending_trail_arms.remove(&k);
         }
     }
 
@@ -764,7 +815,18 @@ impl AppState {
         let Some(bid) = self.best_bid_for_token(token_id) else {
             return;
         };
-        let entry = if let Some(oc) = self.outcome_for_active_token(token_id) {
+        let entry = if self
+            .market
+            .as_ref()
+            .is_some_and(|m| m.condition_id == p0.market.condition_id)
+        {
+            let pos = self.position(p0.outcome);
+            if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                pos.avg_entry
+            } else {
+                p0.entry_price
+            }
+        } else if let Some(oc) = self.outcome_for_active_token(token_id) {
             let pos = self.position(oc);
             if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
                 pos.avg_entry
@@ -821,9 +883,20 @@ impl AppState {
         let TickOutcome::Triggered { .. } = tick else {
             return;
         };
-        let (token_id, market, outcome, plan, tracked, entry_px) = {
+        let (token_id, market, outcome, plan, entry_px) = {
             let sess = self.trailing.get(&map_key).expect("trailing session");
-            let entry_px = if let Some(oc) = self.outcome_for_active_token(&map_key) {
+            let entry_px = if self
+                .market
+                .as_ref()
+                .is_some_and(|m| m.condition_id == sess.market.condition_id)
+            {
+                let pos = self.position(sess.outcome);
+                if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                    pos.avg_entry
+                } else {
+                    sess.stop.entry_price()
+                }
+            } else if let Some(oc) = self.outcome_for_active_token(&map_key) {
                 let pos = self.position(oc);
                 if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
                     pos.avg_entry
@@ -838,17 +911,13 @@ impl AppState {
                 sess.market.clone(),
                 sess.outcome,
                 sess.plan_sell_shares,
-                sess.tracked_shares,
                 entry_px,
             )
         };
         if bid > entry_px {
-            let pos_sh = if let Some(oc) = self.outcome_for_active_token(&map_key) {
-                self.position(oc).shares.max(0.0)
-            } else {
-                tracked.max(0.0)
-            };
-            let sh = pos_sh.min(plan).min(tracked.max(0.0));
+            let sess_ref = self.trailing.get(&map_key).expect("trailing session");
+            let live = self.trail_live_shares(sess_ref);
+            let sh = live.min(plan);
             if sh > 1e-9 {
                 if !self.trailing_sell_queued_or_in_flight(&token_id) {
                     self.pending_trailing_sells.push_back(TrailingExit {
@@ -1028,6 +1097,7 @@ impl AppState {
                     );
                 }
                 if let Some(m) = self.market.clone() {
+                    self.sync_trailing_inventory_with_positions();
                     self.try_promote_pending_trail_token(m.up_token_id.as_str());
                     self.try_promote_pending_trail_token(m.down_token_id.as_str());
                 }
@@ -1305,28 +1375,33 @@ impl AppState {
                     let session_outcome = had_sess.as_ref().map(|s| s.outcome);
                     let mut re_armed = false;
                     if let Some(sess) = had_sess {
-                        let pos_sh = if let Some(oc) = self.outcome_for_active_token(&sess.token_id)
-                        {
-                            self.position(oc).shares
-                        } else {
-                            sess.tracked_shares
-                        };
+                        let pos_sh = self.trail_live_shares(&sess);
                         if pos_sh > 1e-9
                             && sess.trail_bps > 0
                             && sess.plan_sell_shares.is_finite()
                             && sess.plan_sell_shares > 0.0
                         {
-                            let entry = if let Some(oc) = self.outcome_for_active_token(&sess.token_id)
-                            {
-                                let pos = self.position(oc);
-                                if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                                    pos.avg_entry
+                            let entry = if self.market.as_ref().is_some_and(|m| {
+                                m.condition_id == sess.market.condition_id
+                            }) {
+                                    let pos = self.position(sess.outcome);
+                                    if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                        pos.avg_entry
+                                    } else {
+                                        sess.stop.entry_price()
+                                    }
+                                } else if let Some(oc) =
+                                    self.outcome_for_active_token(&sess.token_id)
+                                {
+                                    let pos = self.position(oc);
+                                    if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                        pos.avg_entry
+                                    } else {
+                                        sess.stop.entry_price()
+                                    }
                                 } else {
                                     sess.stop.entry_price()
-                                }
-                            } else {
-                                sess.stop.entry_price()
-                            };
+                                };
                             self.install_trailing_session(
                                 sess.market.clone(),
                                 sess.outcome,
@@ -2162,5 +2237,42 @@ mod tests {
             best > 0.51,
             "trailing must follow book updates when asset_id string form differs; best={best}"
         );
+    }
+
+    /// REST replay shows a flat book — drop armed / pending trails so we never FAK-sell air.
+    #[tokio::test]
+    async fn positions_loaded_clears_trailing_when_flat() {
+        let mut s = test_state();
+        let m = test_market("UPL", "DPL", "0xrestflat");
+        s.market = Some(m.clone());
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UPL".into(),
+            bids:     vec![BookLevel { price: 0.52, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.54, size: 100.0 }],
+        }));
+        s.position_up = Position {
+            shares:    8.0,
+            avg_entry: 0.50,
+        };
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome:          Outcome::Up,
+            entry_price:      0.50,
+            plan_sell_shares: 8.0,
+            token_id:         "UPL".into(),
+            trail_bps:        200,
+            activation_bps:   0,
+            market:           m.clone(),
+        })
+        .await;
+        assert!(s.trailing.contains_key("UPL"));
+        s.apply(AppEvent::PositionsLoaded {
+            position_up:         Position::default(),
+            position_down:       Position::default(),
+            fills_bootstrap:      vec![],
+            refresh_status_line: false,
+        })
+        .await;
+        assert!(!s.trailing.contains_key("UPL"));
+        assert!(!s.pending_trail_arms.contains_key("UPL"));
     }
 }
