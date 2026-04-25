@@ -8,7 +8,7 @@
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
@@ -196,15 +196,16 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 let t = txt.as_str();
                 if t.trim_start().starts_with('[') {
                     if let Ok(events) = serde_json::from_str::<Vec<RawEvent>>(t) {
+                        let mut touched: HashSet<String> = HashSet::new();
                         for ev in events {
-                            apply_raw_event(
-                                &mut books,
-                                ev,
-                                &mut out_bids,
-                                &mut out_asks,
-                                tx,
-                            )
-                            .await;
+                            if let Some(aid) = apply_raw_event_to_books(&mut books, ev) {
+                                touched.insert(aid);
+                            }
+                        }
+                        for aid in &touched {
+                            if let Some(entry) = books.get(aid) {
+                                send_snapshot(aid, entry, &mut out_bids, &mut out_asks, tx).await;
+                            }
                         }
                     } else {
                         warn_unparsed_clob(&txt);
@@ -213,21 +214,26 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 }
                 if t.contains("price_changes") && t.trim_start().starts_with('{') {
                     if let Ok(msg) = serde_json::from_str::<MarketPriceChangesMsg>(t) {
+                        let mut touched: HashSet<String> = HashSet::new();
                         for ch in &msg.price_changes {
                             let aid = canonical_clob_token_id(&ch.asset_id).into_owned();
                             let entry = books.entry(aid.clone()).or_default();
-                            let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else { continue };
+                            let (Ok(p), Ok(s)) = (ch.price.parse::<f64>(), ch.size.parse::<f64>()) else {
+                                continue;
+                            };
                             let key = price_to_key(p);
                             let map = if ch.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
-                            if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
-                            send_snapshot(
-                                &aid,
-                                entry,
-                                &mut out_bids,
-                                &mut out_asks,
-                                tx,
-                            )
-                            .await;
+                            if s == 0.0 {
+                                map.remove(&key);
+                            } else {
+                                map.insert(key, s);
+                            }
+                            touched.insert(aid);
+                        }
+                        for aid in &touched {
+                            if let Some(entry) = books.get(aid) {
+                                send_snapshot(aid, entry, &mut out_bids, &mut out_asks, tx).await;
+                            }
                         }
                     } else {
                         warn_unparsed_clob(t);
@@ -235,8 +241,11 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                     continue;
                 }
                 if let Ok(ev) = serde_json::from_str::<RawEvent>(t) {
-                    apply_raw_event(&mut books, ev, &mut out_bids, &mut out_asks, tx)
-                        .await;
+                    if let Some(aid) = apply_raw_event_to_books(&mut books, ev) {
+                        if let Some(entry) = books.get(&aid) {
+                            send_snapshot(&aid, entry, &mut out_bids, &mut out_asks, tx).await;
+                        }
+                    }
                     continue;
                 }
 
@@ -246,13 +255,13 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     }
 }
 
-async fn apply_raw_event(
+/// Apply a raw event to the local book maps. Returns the canonical asset ID if the
+/// event touched a book (i.e., `Book` or `PriceChange`); `None` for `Other`.
+/// Does NOT send a snapshot — callers batch and send after the whole message.
+fn apply_raw_event_to_books(
     books: &mut HashMap<String, (BTreeMap<i64, f64>, BTreeMap<i64, f64>)>,
     ev: RawEvent,
-    out_bids: &mut Vec<BookLevel>,
-    out_asks: &mut Vec<BookLevel>,
-    tx: &mpsc::Sender<BookSnapshot>,
-) {
+) -> Option<String> {
     match ev {
         RawEvent::Book { asset_id, bids, asks } => {
             let asset_id = canonical_clob_token_id(&asset_id).into_owned();
@@ -269,34 +278,26 @@ async fn apply_raw_event(
                     entry.1.insert(price_to_key(p), s);
                 }
             }
-            send_snapshot(
-                &asset_id,
-                entry,
-                out_bids,
-                out_asks,
-                tx,
-            )
-            .await;
+            Some(asset_id)
         }
         RawEvent::PriceChange { asset_id, changes } => {
             let asset_id = canonical_clob_token_id(&asset_id).into_owned();
             let entry = books.entry(asset_id.clone()).or_default();
             for c in &changes {
-                let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else { continue };
+                let (Ok(p), Ok(s)) = (c.price.parse::<f64>(), c.size.parse::<f64>()) else {
+                    continue;
+                };
                 let key = price_to_key(p);
                 let map = if c.side == "BUY" { &mut entry.0 } else { &mut entry.1 };
-                if s == 0.0 { map.remove(&key); } else { map.insert(key, s); }
+                if s == 0.0 {
+                    map.remove(&key);
+                } else {
+                    map.insert(key, s);
+                }
             }
-            send_snapshot(
-                &asset_id,
-                entry,
-                out_bids,
-                out_asks,
-                tx,
-            )
-            .await;
+            Some(asset_id)
         }
-        RawEvent::Other => {}
+        RawEvent::Other => None,
     }
 }
 
