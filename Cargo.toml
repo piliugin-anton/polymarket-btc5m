@@ -51,6 +51,12 @@ alloy-dyn-abi = { version = "0.8", features = ["eip712", "std"] }
 hex               = "0.4"
 qrcode            = "0.14"
 
+# Chainlink Data Streams (optional spot feed when CHAINLINK_API_KEY + CHAINLINK_USER_SECRET are set)
+chainlink-data-streams-sdk   = "1.0"
+chainlink-data-streams-report = "1.0"
+num-bigint  = "0.4"
+num-traits  = "0.2"
+
 [profile.release]
 opt-level        = 3
 lto              = "thin"

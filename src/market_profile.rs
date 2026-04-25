@@ -15,10 +15,22 @@ pub struct CryptoAsset {
     pub daily_event_prefix:      &'static str,
     /// Polymarket RTDS `crypto_prices_chainlink` filter, e.g. `btc/usd`.
     pub rtds_symbol:             &'static str,
+    /// Chainlink Data Streams feed ID (mainnet Premium Global crypto / USD). Used when
+    /// `CHAINLINK_API_KEY` and `CHAINLINK_USER_SECRET` are set. IDs match
+    /// [data.chain.link/streams](https://data.chain.link/streams).
+    pub data_streams_feed_id_hex: &'static str,
     /// `symbol` for `/api/crypto/crypto-price` (uppercase), e.g. `BTC`.
     pub crypto_price_symbol:     &'static str,
     /// `GET /series?slug=…&exclude_events=true` for wizard list (5m title / volume).
     pub series_slug_5m:          &'static str,
+}
+
+/// Lookup Chainlink Data Streams feed id for a Polymarket RTDS symbol (e.g. `eth/usd`).
+pub fn data_streams_feed_id_for_rtds_symbol(rtds_symbol: &str) -> Option<&'static str> {
+    CRYPTO_ASSETS
+        .iter()
+        .find(|a| a.rtds_symbol.eq_ignore_ascii_case(rtds_symbol))
+        .map(|a| a.data_streams_feed_id_hex)
 }
 
 pub const CRYPTO_ASSETS: &[CryptoAsset] = &[
@@ -27,6 +39,7 @@ pub const CRYPTO_ASSETS: &[CryptoAsset] = &[
         rolling_slug_prefix:  "btc",
         daily_event_prefix:   "bitcoin-up-or-down-on",
         rtds_symbol:          "btc/usd",
+        data_streams_feed_id_hex: "0x00039d9e45394f473ab1f050a1b963e6b05351e52d71e507509ada0c95ed75b8",
         crypto_price_symbol:  "BTC",
         series_slug_5m:       "btc-up-or-down-5m",
     },
@@ -35,6 +48,7 @@ pub const CRYPTO_ASSETS: &[CryptoAsset] = &[
         rolling_slug_prefix:  "eth",
         daily_event_prefix:   "ethereum-up-or-down-on",
         rtds_symbol:          "eth/usd",
+        data_streams_feed_id_hex: "0x000362205e10b3a147d02792eccee483dca6c7b44ecce7012cb8c6e0b68b3ae9",
         crypto_price_symbol:  "ETH",
         series_slug_5m:       "eth-up-or-down-5m",
     },
@@ -43,6 +57,7 @@ pub const CRYPTO_ASSETS: &[CryptoAsset] = &[
         rolling_slug_prefix:  "sol",
         daily_event_prefix:   "solana-up-or-down-on",
         rtds_symbol:          "sol/usd",
+        data_streams_feed_id_hex: "0x0003b778d3f6b2ac4991302b89cb313f99a42467d6c9c5f96f57c29c0d2bc24f",
         crypto_price_symbol:  "SOL",
         series_slug_5m:       "sol-up-or-down-5m",
     },
@@ -51,6 +66,7 @@ pub const CRYPTO_ASSETS: &[CryptoAsset] = &[
         rolling_slug_prefix:  "xrp",
         daily_event_prefix:   "xrp-up-or-down-on",
         rtds_symbol:          "xrp/usd",
+        data_streams_feed_id_hex: "0x0003c16c6aed42294f5cb4741f6e59ba2d728f0eae2eb9e6d3f555808c59fc45",
         crypto_price_symbol:  "XRP",
         series_slug_5m:       "xrp-up-or-down-5m",
     },

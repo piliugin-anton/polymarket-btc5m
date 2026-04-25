@@ -1,7 +1,8 @@
-//! Polymarket RTDS — Chainlink crypto/USD feed (symbol chosen after the TUI wizard).
+//! Spot crypto/USD price for the TUI: either **Polymarket RTDS** (unauthenticated) or,
+//! when `CHAINLINK_API_KEY` and `CHAINLINK_USER_SECRET` are set, **Chainlink Data Streams**
+//! over the official Rust SDK (see `chainlink_data_streams.rs`).
 //!
-//! No authentication. We subscribe to the `crypto_prices_chainlink` topic with
-//! `filters: "{\"symbol\":\"eth/usd\"}"` (see Polymarket RTDS crypto prices docs).
+//! RTDS: `crypto_prices_chainlink` with `filters: "{\"symbol\":\"eth/usd\"}"`.
 
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -50,9 +51,27 @@ struct DataPoint {
     #[serde(default)] timestamp: u64,
 }
 
+fn chainlink_data_streams_env_set() -> bool {
+    let k = std::env::var("CHAINLINK_API_KEY").ok().filter(|s| !s.trim().is_empty());
+    let s = std::env::var("CHAINLINK_USER_SECRET").ok().filter(|s| !s.trim().is_empty());
+    k.is_some() && s.is_some()
+}
+
 /// Waits for a **non-empty** `symbol` on `symbol_rx` (e.g. `btc/usd`), then connects, reconnects
 /// on drop/failure, and re-reads the watch value so symbol changes can take effect.
 pub fn spawn(
+    tx:         mpsc::Sender<PriceTick>,
+    symbol_rx: watch::Receiver<String>,
+) -> tokio::task::JoinHandle<()> {
+    if chainlink_data_streams_env_set() {
+        info!("using Chainlink Data Streams WebSocket (CHAINLINK_API_KEY + CHAINLINK_USER_SECRET)");
+        super::chainlink_data_streams::spawn(tx, symbol_rx)
+    } else {
+        spawn_rtds(tx, symbol_rx)
+    }
+}
+
+fn spawn_rtds(
     tx:         mpsc::Sender<PriceTick>,
     mut symbol_rx: watch::Receiver<String>,
 ) -> tokio::task::JoinHandle<()> {
@@ -68,7 +87,7 @@ pub fn spawn(
             if sym.is_empty() {
                 continue;
             }
-            if let Err(e) = run_once(&tx, &sym, &mut symbol_rx).await {
+            if let Err(e) = run_rtds_once(&tx, &sym, &mut symbol_rx).await {
                 warn!(error = %e, sym = %sym, "RTDS (Chainlink) disconnected — retry in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -76,7 +95,7 @@ pub fn spawn(
     })
 }
 
-async fn run_once(
+async fn run_rtds_once(
     tx: &mpsc::Sender<PriceTick>,
     rtds_symbol: &str,
     symbol_rx: &mut watch::Receiver<String>,

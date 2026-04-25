@@ -3,7 +3,7 @@
 //! Boots:
 //!   1. Tracing → stderr (filtered by RUST_LOG).
 //!   2. Trading client (derives L2 API creds on first use).
-//!   3. Chainlink RTDS task (BTC price).
+//!   3. Spot price task — Polymarket RTDS or Chainlink Data Streams WS when API credentials are set.
 //!   4. Market discovery (Gamma poll) + auto-roll task.
 //!   5. CLOB book subscription task — restarted on each market roll.
 //!   6. Crossterm event task.
