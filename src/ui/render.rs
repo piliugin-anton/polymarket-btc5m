@@ -352,7 +352,7 @@ fn draw_book_side(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, col
         // Asks: show lowest-at-bottom (closest to mid)
         for l in b.asks.iter().take(5).rev() {
             rows.push(Row::new(vec![
-                Cell::from(format!("{:.3}", l.price)).style(Style::default().fg(Color::LightRed)),
+                Cell::from(format!("{:.2}", l.price)).style(Style::default().fg(Color::LightRed)),
                 Cell::from(format!("× {:.0}", l.size)).style(Style::default().fg(Color::DarkGray)),
             ]));
         }
@@ -363,7 +363,7 @@ fn draw_book_side(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, col
         };
         if let Some(m) = mid {
             rows.push(Row::new(vec![
-                Cell::from(format!("── {:.3} ──", m))
+                Cell::from(format!("── {:.2} ──", m))
                     .style(Style::default().fg(colour).add_modifier(Modifier::BOLD | Modifier::DIM)),
                 Cell::from(""),
             ]));
@@ -371,7 +371,7 @@ fn draw_book_side(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, col
         // Bids
         for l in b.bids.iter().take(5) {
             rows.push(Row::new(vec![
-                Cell::from(format!("{:.3}", l.price)).style(Style::default().fg(Color::LightGreen)),
+                Cell::from(format!("{:.2}", l.price)).style(Style::default().fg(Color::LightGreen)),
                 Cell::from(format!("× {:.0}", l.size)).style(Style::default().fg(Color::DarkGray)),
             ]));
         }
@@ -423,14 +423,14 @@ fn draw_positions(f: &mut Frame, area: Rect, s: &AppState) {
 fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, colour: Color) {
     let p = s.position(outcome);
     let upnl = s.unrealized_pnl(outcome);
-    let mark = s.mark(outcome).map(|m| format!("{:.3}", m)).unwrap_or_else(|| "—".into());
+    let mark = s.mark(outcome).map(|m| format!("{:.2}", m)).unwrap_or_else(|| "—".into());
 
     let lines = vec![
         Line::from(vec![
             Span::styled(format!("  {}  ", outcome.as_str()),
                 Style::default().fg(colour).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
             Span::raw("  "),
-            Span::raw(format!("{:.2} sh @ {:.3}", p.shares, p.avg_entry)),
+            Span::raw(format!("{:.2} sh @ {:.2}", p.shares, p.avg_entry)),
         ]),
         Line::from(vec![
             Span::styled("       mark ", Style::default().fg(Color::DarkGray)),
@@ -454,7 +454,7 @@ fn draw_open_orders(f: &mut Frame, area: Rect, s: &AppState) {
             Cell::from(o.outcome.as_str()).style(Style::default().fg(
                 match o.outcome { Outcome::Up => Color::Green, Outcome::Down => Color::Red }
             )),
-            Cell::from(format!("{:.3}", o.price)),
+            Cell::from(format!("{:.2}", o.price)),
             Cell::from(format!("{:.2}", o.remaining)),
         ])
     }).collect();
@@ -484,7 +484,7 @@ fn draw_fills(f: &mut Frame, area: Rect, s: &AppState) {
                 match f.outcome { Outcome::Up => Color::Green, Outcome::Down => Color::Red }
             )),
             Cell::from(format!("{:.2}", f.qty)),
-            Cell::from(format!("@ {:.3}", f.price)),
+            Cell::from(format!("@ {:.2}", f.price)),
             Cell::from(format!("= ${:.2}", f.qty * f.price)),
             Cell::from(if f.realized.abs() > 1e-9 { format!("{:+.2}", f.realized) } else { String::new() })
                 .style(pnl_style(f.realized)),

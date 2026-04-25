@@ -791,13 +791,13 @@ impl AppState {
                     });
                 }
                 self.status_line = format!(
-                    "trailing: {} tripped (mid {mid:.3} > entry {entry_px:.3}) — SELL {sh:.2} sh",
+                    "trailing: {} tripped (mid {mid:.2} > entry {entry_px:.2}) — SELL {sh:.2} sh",
                     outcome.as_str()
                 );
             }
         } else {
             self.status_line = format!(
-                "trailing: {} tripped (mid {mid:.3} ≤ entry {entry_px:.3}) — no auto SELL",
+                "trailing: {} tripped (mid {mid:.2} ≤ entry {entry_px:.2}) — no auto SELL",
                 outcome.as_str()
             );
         }
@@ -926,7 +926,7 @@ impl AppState {
                 self.fak_net_down = self.position_down.shares.max(nd);
                 if refresh_status_line {
                     self.status_line = format!(
-                        "Positions from CLOB — UP {:.2} @ {:.3} / DOWN {:.2} @ {:.3}",
+                        "Positions from CLOB — UP {:.2} @ {:.2} / DOWN {:.2} @ {:.2}",
                         self.position_up.shares,
                         self.position_up.avg_entry,
                         self.position_down.shares,
@@ -999,7 +999,7 @@ impl AppState {
                     self.try_promote_pending_trail_any(token_id.as_str());
                 }
                 self.status_line = format!(
-                    "{} {qty:.2} {} @ {price:.3} (WSS trade)",
+                    "{} {qty:.2} {} @ {price:.2} (WSS trade)",
                     side_str(side),
                     outcome.as_str()
                 );
@@ -1053,7 +1053,7 @@ impl AppState {
                     }
                 }
                 self.status_line = format!(
-                    "{} {qty:.2} {} @ {price:.3} ✓",
+                    "{} {qty:.2} {} @ {price:.2} ✓",
                     side_str(side),
                     outcome.as_str()
                 );
