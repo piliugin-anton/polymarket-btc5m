@@ -343,6 +343,24 @@ pub fn collect_book_watch_token_ids(state: &AppState) -> Vec<String> {
     v
 }
 
+fn collect_book_watch_token_ids_as_set(state: &AppState) -> std::collections::HashSet<String> {
+    let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(m) = &state.market {
+        s.insert(m.up_token_id.clone());
+        s.insert(m.down_token_id.clone());
+    }
+    for k in state.trailing.keys() {
+        s.insert(k.clone());
+    }
+    for k in state.pending_trail_arms.keys() {
+        s.insert(k.clone());
+    }
+    for p in &state.pending_trailing_sells {
+        s.insert(p.token_id.clone());
+    }
+    s
+}
+
 #[derive(Debug)]
 pub struct AppState {
     pub ui_phase: UiPhase,
@@ -423,6 +441,9 @@ pub struct AppState {
     /// `token_id`s with a `run_trailing_exit_fak_sell` task in progress; capped by
     /// [`TRAILING_SELL_MAX_PARALLEL`].
     pub trailing_sell_in_flight: HashSet<String>,
+    /// Cached result of `collect_book_watch_token_ids` — updated on every `apply()` call so
+    /// `send_book_watch_if_changed` in `main.rs` can read it without recomputing.
+    pub cached_book_watch_tokens: Vec<String>,
 }
 
 impl AppState {
@@ -463,6 +484,7 @@ impl AppState {
             watched_books: HashMap::new(),
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
+            cached_book_watch_tokens: Vec::new(),
         }
     }
 
@@ -861,6 +883,7 @@ impl AppState {
 
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
+        let mut book_watch_cached = false;
         match ev {
             AppEvent::Tick => {
                 if self
@@ -895,12 +918,15 @@ impl AppState {
                         self.book_down = Some(Arc::clone(&snap));
                     }
                 }
-                let watch = collect_book_watch_token_ids(self);
-                if watch.contains(&id_for_trail) {
+                let watch_set = collect_book_watch_token_ids_as_set(self);
+                if watch_set.contains(id_for_trail.as_str()) {
                     self.watched_books.insert(id_for_trail.clone(), snap);
                 }
-                let keep: HashSet<String> = watch.into_iter().collect();
-                self.watched_books.retain(|k, _| keep.contains(k));
+                self.watched_books.retain(|k, _| watch_set.contains(k.as_str()));
+                let mut sorted: Vec<String> = watch_set.into_iter().collect();
+                sorted.sort();
+                self.cached_book_watch_tokens = sorted;
+                book_watch_cached = true;
 
                 self.try_promote_pending_trail_any(id_for_trail.as_str());
                 if let Some(mid) = self.mid_for_token(id_for_trail.as_str()) {
@@ -1302,6 +1328,9 @@ impl AppState {
                 }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
+        }
+        if !book_watch_cached {
+            self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
         }
     }
 }

@@ -35,7 +35,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use app::{
-    clamp_prob, collect_book_watch_token_ids, escrow_sell_shares_from_clob_orders,
+    clamp_prob, escrow_sell_shares_from_clob_orders,
     hydrate_positions_from_trades,     AppEvent, AppState, Outcome, resolve_market_order, resolve_trailing_sell, TrailingExit,
     MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
 };
@@ -143,11 +143,10 @@ fn merge_ui_and_extra_book_tokens(ui_pair: &[String], extra: &[String]) -> Vec<S
 
 /// Skip `watch` notify when the token set is unchanged (avoids supervisor work + CLOB WS restarts).
 fn send_book_watch_if_changed(state: &AppState, book_token_tx: &watch::Sender<Vec<String>>) {
-    let next = collect_book_watch_token_ids(state);
-    if next.as_slice() == book_token_tx.borrow().as_slice() {
+    if state.cached_book_watch_tokens.as_slice() == book_token_tx.borrow().as_slice() {
         return;
     }
-    let _ = book_token_tx.send(next);
+    let _ = book_token_tx.send(state.cached_book_watch_tokens.clone());
 }
 
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
