@@ -9,8 +9,7 @@ use chainlink_data_streams_report::feed_id::ID;
 use chainlink_data_streams_report::report::{decode_full_report, v3::ReportDataV3};
 use chainlink_data_streams_sdk::config::Config;
 use chainlink_data_streams_sdk::stream::Stream;
-use num_bigint::BigInt;
-use num_traits::Signed;
+use num_traits::ToPrimitive;
 use tokio::sync::{mpsc, watch};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -173,11 +172,15 @@ async fn run_once(
                                 continue;
                             }
                         };
-                        let price = bigint_18decimals_to_f64(&report_data.benchmark_price);
+                        // 18-decimal fixed point: i192 → f64 via `num_bigint` (no `to_string` / parse).
+                        const SCALE: f64 = 1e-18;
+                        let v = report_data.benchmark_price.to_f64().unwrap() * SCALE;
+                        let price = if v.is_finite() { v } else { 0.0 };
                         let ts_sec = response.report.observations_timestamp as u64;
                         let tick = PriceTick {
                             price,
-                            timestamp_ms: ts_sec.saturating_mul(1000),
+                            // Observations are seconds; ms fits easily in u64.
+                            timestamp_ms: ts_sec * 1000,
                         };
                         let _ = tx.send(tick).await;
                     }
@@ -189,24 +192,4 @@ async fn run_once(
             }
         }
     }
-}
-
-fn bigint_18decimals_to_f64(b: &BigInt) -> f64 {
-    // Crypto reference streams use 18 decimals (Chainlink Data Streams docs).
-    let neg = b.is_negative();
-    let digits = b.abs().to_string();
-    if digits == "0" {
-        return 0.0;
-    }
-    let v = if digits.len() <= 18 {
-        let pad = 18 - digits.len();
-        let frac = format!("{}{}", "0".repeat(pad), digits);
-        format!("0.{frac}").parse::<f64>().unwrap_or(0.0)
-    } else {
-        let split = digits.len() - 18;
-        format!("{}.{}" , &digits[..split], &digits[split..])
-            .parse::<f64>()
-            .unwrap_or(0.0)
-    };
-    if neg { -v } else { v }
 }
