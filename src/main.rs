@@ -647,7 +647,7 @@ async fn run_take_profit_consolidate_after_buy(
     position_shares:  f64,
     position_avg_entry: f64,
 ) {
-    let _tp_op = TP_RESTING_SELL_OP_LOCK.lock().await;
+    let tp_op = TP_RESTING_SELL_OP_LOCK.lock().await;
     let tid = match outcome {
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
@@ -767,6 +767,22 @@ async fn run_take_profit_consolidate_after_buy(
         }
     };
 
+    let tid = match outcome {
+        Outcome::Up   => market.up_token_id.clone(),
+        Outcome::Down => market.down_token_id.clone(),
+    };
+    let args = OrderArgs {
+        token_id:                  tid.clone(),
+        side:                      Side::Sell,
+        price:                     tp_px,
+        size:                      want_raw,
+        neg_risk:                  market.neg_risk,
+        tick_size:                 market.tick_size.clone(),
+        buy_notional_usdc:         None,
+        expiration_unix_secs:      exp_secs,
+        sell_skip_pre_post_settle: true,
+    };
+
     info!(
         outcome = ?outcome,
         want_shares = want_raw,
@@ -776,25 +792,97 @@ async fn run_take_profit_consolidate_after_buy(
         entry = position_avg_entry,
         tp_limit_px = tp_px,
         canceled_resting_sells = n_resting_sells,
-        "take-profit: placing consolidated GTD limit SELL (max of position, SELL escrow, buy ack; orders from WS ledger)",
+        "take-profit: placing consolidated GTD limit SELL (lock held until POST completes)",
     );
 
-    spawn_order(
-        trading,
-        user_open_ledger,
-        tx,
-        market,
-        outcome,
-        Side::Sell,
-        want_raw,
-        tp_px,
-        OrderType::Gtd,
-        None,
-        exp_secs,
-        0,
-        0,
-        true,
-    );
+    let resp_result = trading.place_order(args, OrderType::Gtd).await;
+
+    // Release the lock before post-placement I/O so the next consolidation
+    // sees a fully committed resting SELL when it reads the WS ledger.
+    drop(tp_op);
+
+    match resp_result {
+        Ok(resp) => {
+            info!(
+                outcome = ?outcome,
+                req_shares = want_raw,
+                limit_price = tp_px,
+                gtd_expiration_unix_secs = exp_secs,
+                success = resp.success,
+                status = ?resp.status,
+                order_id = ?resp.order_id,
+                making_amount = ?resp.making_amount,
+                taking_amount = ?resp.taking_amount,
+                error_msg = ?resp.error,
+                "CLOB take-profit GTD (limit sell) order response",
+            );
+            let ok_ui = resp.success
+                || resp.status.as_ref().is_some_and(|s| {
+                    s.eq_ignore_ascii_case("matched")
+                        || s.eq_ignore_ascii_case("delayed")
+                        || s.eq_ignore_ascii_case("live")
+                        || s.eq_ignore_ascii_case("open")
+                });
+            if ok_ui {
+                let ack = resp.fill_for_position_ack(Side::Sell, want_raw, tp_px, OrderType::Gtd);
+                if let Some((ack_qty, ack_price)) = ack {
+                    let _ = tx
+                        .send(AppEvent::OrderAck {
+                            side: Side::Sell,
+                            outcome,
+                            qty: ack_qty,
+                            price: ack_price,
+                            clob_order_id: resp.order_id.clone(),
+                            token_id: tid.clone(),
+                        })
+                        .await;
+                } else {
+                    let _ = tx
+                        .send(AppEvent::StatusInfo(format!(
+                            "SELL {} limit resting (no fill yet) — see Open Orders",
+                            outcome.as_str(),
+                        )))
+                        .await;
+                }
+                spawn_open_orders_refresh(trading.clone(), tx.clone(), market, user_open_ledger.clone());
+                let cli = trading.clone();
+                tokio::spawn(async move {
+                    if let Err(e) = cli.refresh_conditional_balance_allowance_cache(&tid).await {
+                        debug!(
+                            error = %e,
+                            token_id = %tid,
+                            "post-SELL delayed balance-allowance cache refresh failed"
+                        );
+                    }
+                });
+            } else {
+                let msg = resp.error.unwrap_or_else(|| format!("status={:?}", resp.status));
+                warn!(
+                    outcome = ?outcome,
+                    req_shares = want_raw,
+                    limit_price = tp_px,
+                    success = resp.success,
+                    status = ?resp.status,
+                    order_id = ?resp.order_id,
+                    error_msg = %msg,
+                    "CLOB take-profit GTD order rejected (HTTP OK, error in response body)",
+                );
+                let _ = tx.send(AppEvent::OrderErrModal(msg)).await;
+            }
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                outcome = ?outcome,
+                req_shares = want_raw,
+                limit_price = tp_px,
+                "CLOB take-profit GTD order request failed",
+            );
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("take-profit GTD: {e:#}")))
+                .await;
+        }
+    }
 }
 
 use tracing::{debug, error, info, warn};
