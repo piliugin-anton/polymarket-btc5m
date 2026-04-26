@@ -450,8 +450,6 @@ fn order_ids_match(a: &str, b: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct UserTradeFill {
     pub size_shares: f64,
-    pub status: String,
-    pub asset_id: String,
 }
 
 /// One JSON value or a batch array from the CLOB user WebSocket.
@@ -638,20 +636,13 @@ impl FillWaitRegistry {
     }
 
     async fn dispatch_trade_value(&self, v: &serde_json::Value) {
-        let status = v
+        if v
             .get("status")
             .and_then(|s| s.as_str())
-            .unwrap_or("")
-            .to_string();
-        if status.eq_ignore_ascii_case("FAILED") {
+            .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
+        {
             return;
         }
-
-        let asset_id = v
-            .get("asset_id")
-            .and_then(|x| x.as_str())
-            .unwrap_or("")
-            .to_string();
 
         let mut legs: Vec<(String, f64)> = Vec::new();
 
@@ -691,11 +682,7 @@ impl FillWaitRegistry {
                 continue;
             }
             if let Some(waiters) = guard.remove(&key) {
-                let msg = UserTradeFill {
-                    size_shares: sz,
-                    status: status.clone(),
-                    asset_id: asset_id.clone(),
-                };
+                let msg = UserTradeFill { size_shares: sz };
                 for w in waiters {
                     let _ = w.send(msg.clone());
                 }
@@ -2887,6 +2874,5 @@ mod fill_wait_registry_tests {
         r.dispatch_trades_in_values(&values).await;
         let fill = rx.await.expect("oneshot");
         assert!((fill.size_shares - 10.0).abs() < 1e-9);
-        assert_eq!(fill.status, "MATCHED");
     }
 }
