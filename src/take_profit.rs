@@ -15,26 +15,31 @@ pub fn clob_order_remaining_size(o: &ClobOpenOrder) -> f64 {
     }
 }
 
-/// GTD take-profit sell size after a market BUY consolidate: max of UI position, escrow in resting
-/// SELL on that outcome (when any), and this BUY’s acked fill.
+/// GTD take-profit sell size after a market BUY consolidate.
+///
+/// - `had_resting_sells`: sum old TP escrow (`sell_rem_pre`) + this fill (`buy_ack_qty`).
+/// - no existing TP: use total position (`position_shares`), with `buy_ack_qty` as floor for stale state.
 pub fn consolidate_tp_want_shares(
     position_shares: f64,
     sell_rem_pre: f64,
     buy_ack_qty: f64,
     had_resting_sells: bool,
 ) -> f64 {
-    let mut want = if position_shares.is_finite() {
-        position_shares.max(0.0)
+    if had_resting_sells {
+        let old = if sell_rem_pre.is_finite() { sell_rem_pre.max(0.0) } else { 0.0 };
+        let new = if buy_ack_qty.is_finite() { buy_ack_qty.max(0.0) } else { 0.0 };
+        old + new
     } else {
-        0.0
-    };
-    if had_resting_sells && sell_rem_pre.is_finite() && sell_rem_pre > 1e-9 {
-        want = want.max(sell_rem_pre);
+        let mut want = if position_shares.is_finite() {
+            position_shares.max(0.0)
+        } else {
+            0.0
+        };
+        if buy_ack_qty.is_finite() && buy_ack_qty > 1e-9 {
+            want = want.max(buy_ack_qty);
+        }
+        want
     }
-    if buy_ack_qty.is_finite() && buy_ack_qty > 1e-9 {
-        want = want.max(buy_ack_qty);
-    }
-    want
 }
 
 /// Outcomes (UP/DOWN) with **≥ 2** resting **SELL** rows on that token — user-WS merge trigger.
@@ -117,22 +122,31 @@ mod tests {
     }
 
     #[test]
-    fn consolidate_prefers_max_of_position_escrow_and_ack() {
+    fn consolidate_sums_escrow_and_ack_when_had_resting_sells() {
+        // old TP escrow + new fill = sum regardless of stale position_shares
         assert!(
             (consolidate_tp_want_shares(15.0, 10.0, 5.0, true) - 15.0).abs() < 1e-9,
-            "position wins"
+            "10 escrow + 5 fill = 15"
         );
         assert!(
-            (consolidate_tp_want_shares(2.0, 10.0, 5.0, true) - 10.0).abs() < 1e-9,
-            "escrow when had sells"
+            (consolidate_tp_want_shares(2.0, 10.0, 5.0, true) - 15.0).abs() < 1e-9,
+            "stale position 2 ignored; 10 + 5 = 15"
         );
+        assert!(
+            (consolidate_tp_want_shares(99.0, 10.0, 5.0, true) - 15.0).abs() < 1e-9,
+            "position_shares not used when had_resting_sells"
+        );
+    }
+
+    #[test]
+    fn consolidate_no_resting_uses_position_with_ack_floor() {
         assert!(
             (consolidate_tp_want_shares(3.0, 0.0, 10.0, false) - 10.0).abs() < 1e-9,
             "buy ack floor without resting sells"
         );
         assert!(
             (consolidate_tp_want_shares(12.0, 100.0, 5.0, false) - 12.0).abs() < 1e-9,
-            "sell_rem ignored when no resting sells path"
+            "sell_rem ignored when no resting sells; position 12 > ack 5"
         );
     }
 
@@ -140,6 +154,12 @@ mod tests {
     fn consolidate_non_finite_position_still_picks_ack() {
         let v = consolidate_tp_want_shares(f64::NAN, 0.0, 6.0, false);
         assert!((v - 6.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn consolidate_non_finite_sell_rem_uses_only_ack() {
+        let v = consolidate_tp_want_shares(0.0, f64::NAN, 6.0, true);
+        assert!((v - 6.0).abs() < 1e-9, "NaN escrow falls back to buy_ack");
     }
 
     #[test]
