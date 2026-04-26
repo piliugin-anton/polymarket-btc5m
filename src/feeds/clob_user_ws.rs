@@ -26,11 +26,13 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
+use crate::trading::Side;
 use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
 use crate::trading::{
-    canonical_clob_token_id, clob_asset_ids_match, parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
+    canonical_clob_token_id, clob_asset_ids_match, parse_clob_side_str, parse_user_channel_values,
+    try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
 };
 
 type UserWsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
@@ -316,6 +318,34 @@ pub fn spawn(
     })
 }
 
+/// Outcomes that have at least two resting **SELL** rows on the active UP/DOWN tokens (merge candidates).
+fn outcomes_with_duplicate_resting_sells(
+    rows: &[ClobOpenOrder],
+    up_token_id: &str,
+    down_token_id: &str,
+) -> Vec<Outcome> {
+    let mut up_n = 0usize;
+    let mut down_n = 0usize;
+    for o in rows {
+        if parse_clob_side_str(&o.side) != Some(Side::Sell) {
+            continue;
+        }
+        if clob_asset_ids_match(&o.asset_id, up_token_id) {
+            up_n += 1;
+        } else if clob_asset_ids_match(&o.asset_id, down_token_id) {
+            down_n += 1;
+        }
+    }
+    let mut out = Vec::new();
+    if up_n >= 2 {
+        out.push(Outcome::Up);
+    }
+    if down_n >= 2 {
+        out.push(Outcome::Down);
+    }
+    out
+}
+
 fn bundle_has_markets(b: &UserWsBundle) -> bool {
     !b.active.condition_id.is_empty()
         || b.extras.iter().any(|e| !e.condition_id.is_empty())
@@ -547,6 +577,21 @@ async fn run_session(
                 }
                 if let Some(orders) = open_ledger.apply_order_values(&values).await {
                     let _ = app_tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
+                    // Fixed take-profit: if the ledger now shows multiple resting SELL on one outcome,
+                    // ask main to merge them into a single GTD (sum of remaining sizes).
+                    let active = &bundle.active;
+                    if !active.condition_id.is_empty() {
+                        let raw = open_ledger.snapshot_clob_orders().await;
+                        for outcome in outcomes_with_duplicate_resting_sells(
+                            &raw,
+                            active.up_token_id.as_str(),
+                            active.down_token_id.as_str(),
+                        ) {
+                            let _ = app_tx
+                                .send(AppEvent::MergeTakeProfitRestingSells { outcome })
+                                .await;
+                        }
+                    }
                 }
             }
         }

@@ -60,7 +60,7 @@ use std::{
     mem,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, LazyLock,
     },
     time::{Duration, Instant},
 };
@@ -68,6 +68,10 @@ use std::{
 /// Set when we `execute!(PushKeyboardEnhancementFlags)` so `FocusGained` can pop/push to resync
 /// after the terminal loses track of modifier/lock state (see `events::normalize_terminal_key_event`).
 static KEYBOARD_PROTOCOL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Serializes post-buy TP consolidate and user-WS-driven merge of multiple resting SELL on one outcome.
+static TP_RESTING_SELL_OP_LOCK: LazyLock<Arc<tokio::sync::Mutex<()>>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Mutex::new(())));
 
 fn keyboard_protocol_flags() -> KeyboardEnhancementFlags {
     KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -225,6 +229,40 @@ async fn apply_app_event(
                         )
                         .await;
                     });
+                }
+                AppEvent::MergeTakeProfitRestingSells { outcome } => {
+                    if cfg.market_buy_trail_bps == 0 && cfg.market_buy_take_profit_bps > 0 {
+                        if let Some(market) = state.market.clone() {
+                            let pos = match outcome {
+                                Outcome::Up => state.position_up.clone(),
+                                Outcome::Down => state.position_down.clone(),
+                            };
+                            if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                let tpb = cfg.market_buy_take_profit_bps;
+                                let trading2 = Arc::clone(trading);
+                                let ledger2 = user_open_ledger.clone();
+                                let tx2 = tx.clone();
+                                tokio::spawn(async move {
+                                    run_merge_resting_tp_sells_from_ws(
+                                        trading2,
+                                        ledger2,
+                                        tx2,
+                                        market,
+                                        outcome,
+                                        tpb,
+                                        pos.avg_entry,
+                                    )
+                                    .await;
+                                });
+                            } else {
+                                debug!(
+                                    outcome = ?outcome,
+                                    avg = pos.avg_entry,
+                                    "merge TP SELL: skipped — invalid position avg entry",
+                                );
+                            }
+                        }
+                    }
                 }
                 ev => {
                     if let AppEvent::StartTrading(p) = &ev {
@@ -479,6 +517,122 @@ async fn run_trailing_exit_fak_sell(
     }
 }
 
+/// User WS saw **≥2** resting SELL on one outcome: cancel all of them and place one GTD for the
+/// **sum of their remaining sizes** at the fee-aware TP price from `position_avg_entry`.
+#[allow(clippy::too_many_arguments)]
+async fn run_merge_resting_tp_sells_from_ws(
+    trading:            Arc<TradingClient>,
+    user_open_ledger:   Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    tx:                 mpsc::Sender<AppEvent>,
+    market:             gamma::ActiveMarket,
+    outcome:            Outcome,
+    take_profit_bps:    u32,
+    position_avg_entry: f64,
+) {
+    let _op = TP_RESTING_SELL_OP_LOCK.lock().await;
+    if take_profit_bps == 0 {
+        return;
+    }
+    let tid = match outcome {
+        Outcome::Up => market.up_token_id.clone(),
+        Outcome::Down => market.down_token_id.clone(),
+    };
+    let orders = user_open_ledger.snapshot_clob_orders().await;
+    let sells: Vec<&ClobOpenOrder> = orders
+        .iter()
+        .filter(|o| {
+            trading::parse_clob_side_str(&o.side) == Some(Side::Sell)
+                && clob_asset_ids_match(&o.asset_id, tid.as_str())
+        })
+        .collect();
+    if sells.len() < 2 {
+        return;
+    }
+    let n_sells = sells.len();
+    let total_rem: f64 = sells
+        .iter()
+        .map(|o| {
+            let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
+            let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
+            if orig.is_finite() {
+                (orig - matched).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .sum();
+    if total_rem + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+        debug!(
+            outcome = ?outcome,
+            total_rem,
+            "merge TP SELL: skipped — combined resting size below min",
+        );
+        return;
+    }
+    for o in &sells {
+        if let Err(e) = trading.cancel_order(&o.id).await {
+            warn!(order_id = %o.id, error = %e, "merge TP SELL: cancel failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("merge take-profit: cancel {e:#}")))
+                .await;
+            return;
+        }
+        debug!(order_id = %o.id, "merge TP SELL: canceled resting SELL");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+
+    if !position_avg_entry.is_finite() || position_avg_entry <= 0.0 {
+        return;
+    }
+    let tp_px = clamp_prob(take_profit_limit_price_crypto_after_fees(
+        position_avg_entry,
+        take_profit_bps,
+    ));
+    if tp_px >= 0.99 {
+        info!(
+            limit_price = tp_px,
+            outcome = ?outcome,
+            "merge TP SELL: skipped — limit price >= 0.99",
+        );
+        return;
+    }
+    let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "merge TP SELL: GTD expiration failed");
+            let _ = tx
+                .send(AppEvent::OrderErrModal(format!("merge take-profit: {e}")))
+                .await;
+            return;
+        }
+    };
+
+    info!(
+        outcome = ?outcome,
+        merged_shares = total_rem,
+        n_resting = n_sells,
+        tp_limit_px = tp_px,
+        "merge TP SELL: placing single GTD (user WS duplicate resting SELL)",
+    );
+
+    spawn_order(
+        trading,
+        user_open_ledger,
+        tx,
+        market,
+        outcome,
+        Side::Sell,
+        total_rem,
+        tp_px,
+        OrderType::Gtd,
+        None,
+        exp_secs,
+        0,
+        0,
+        true,
+    );
+}
+
 /// After a market BUY (FAK) with fixed take-profit: optionally cancel resting SELL on the same
 /// outcome, then place one GTD take-profit sized to the merged position (VWAP from UI state).
 ///
@@ -498,6 +652,7 @@ async fn run_take_profit_consolidate_after_buy(
     position_shares:  f64,
     position_avg_entry: f64,
 ) {
+    let _tp_op = TP_RESTING_SELL_OP_LOCK.lock().await;
     let tid = match outcome {
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
@@ -663,7 +818,7 @@ async fn run_take_profit_consolidate_after_buy(
 }
 
 use tracing::{debug, error, info, warn};
-use trading::{clob_asset_ids_match, OrderArgs, OrderType, Side, TradingClient};
+use trading::{clob_asset_ids_match, ClobOpenOrder, OrderArgs, OrderType, Side, TradingClient};
 
 #[tokio::main]
 async fn main() -> Result<()> {

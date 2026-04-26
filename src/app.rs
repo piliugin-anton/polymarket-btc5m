@@ -154,6 +154,9 @@ pub enum AppEvent {
         /// Same `qty` as the preceding [`AppEvent::OrderAck`] for this FAK BUY (CLOB fill estimate).
         buy_ack_qty:     f64,
     },
+    /// User-channel `order` updates show **≥2** resting SELL on the same outcome — merge into one
+    /// GTD (handled in `main::apply_app_event`).
+    MergeTakeProfitRestingSells { outcome: Outcome },
     /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
     RequestTrailingArm {
@@ -1346,6 +1349,9 @@ impl AppState {
             }
             AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
+            }
+            AppEvent::MergeTakeProfitRestingSells { .. } => {
+                // Dispatched from `main::apply_app_event` (user WS merge path).
             }
             AppEvent::TrailingExitDispatchDone {
                 token_id,
