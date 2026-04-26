@@ -188,10 +188,6 @@ impl BookSide {
         Self { levels: Vec::with_capacity(32) }
     }
 
-    fn clear(&mut self) {
-        self.levels.clear();
-    }
-
     /// Replace entire side from an iterator in arbitrary order.
     /// Pushes all non-zero entries then sorts once — O(n log n) but with minimal
     /// constant; much faster than n individual `upsert` calls when n is large.
@@ -220,8 +216,6 @@ impl BookSide {
             }
         }
     }
-
-    fn len(&self) -> usize { self.levels.len() }
 }
 
 struct TokenBook {
