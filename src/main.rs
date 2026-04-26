@@ -483,6 +483,7 @@ async fn run_trailing_exit_fak_sell(
 /// Open orders come from [`feeds::clob_user_ws::UserOpenOrdersLedger`] (user WS + last REST
 /// merge). Sell size uses UI `position_shares` (no `GET /balance-allowance` here); `place_order`
 /// still performs its own balance reads on retries if needed.
+#[allow(clippy::too_many_arguments)]
 async fn run_take_profit_consolidate_after_buy(
     trading:          Arc<TradingClient>,
     user_open_ledger: Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
