@@ -202,6 +202,7 @@ async fn apply_app_event(
                     market,
                     outcome,
                     take_profit_bps,
+                    buy_ack_qty,
                 } => {
                     let pos = match outcome {
                         Outcome::Up => state.position_up.clone(),
@@ -218,6 +219,7 @@ async fn apply_app_event(
                             market,
                             outcome,
                             take_profit_bps,
+                            buy_ack_qty,
                             pos.shares,
                             pos.avg_entry,
                         )
@@ -482,7 +484,8 @@ async fn run_trailing_exit_fak_sell(
 ///
 /// Open orders come from [`feeds::clob_user_ws::UserOpenOrdersLedger`] (user WS + last REST
 /// merge). Sell size uses UI `position_shares` (no `GET /balance-allowance` here); `place_order`
-/// still performs its own balance reads on retries if needed.
+/// still performs its own balance reads on retries if needed. `buy_ack_qty` matches the preceding
+/// [`AppEvent::OrderAck`] for this FAK BUY (floor when UI position lags CLOB).
 #[allow(clippy::too_many_arguments)]
 async fn run_take_profit_consolidate_after_buy(
     trading:          Arc<TradingClient>,
@@ -491,6 +494,7 @@ async fn run_take_profit_consolidate_after_buy(
     market:           gamma::ActiveMarket,
     outcome:          Outcome,
     take_profit_bps:  u32,
+    buy_ack_qty:      f64,
     position_shares:  f64,
     position_avg_entry: f64,
 ) {
@@ -508,6 +512,19 @@ async fn run_take_profit_consolidate_after_buy(
                 && clob_asset_ids_match(&o.asset_id, tid.as_str())
         })
         .collect();
+
+    let sell_rem_pre: f64 = sell_same_outcome
+        .iter()
+        .map(|o| {
+            let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
+            let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
+            if orig.is_finite() {
+                (orig - matched).max(0.0)
+            } else {
+                0.0
+            }
+        })
+        .sum();
 
     let had_resting_sells = !sell_same_outcome.is_empty();
     let n_resting_sells = sell_same_outcome.len();
@@ -546,11 +563,19 @@ async fn run_take_profit_consolidate_after_buy(
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
-    let want_raw = if position_shares.is_finite() {
+    // TP size: merged UI position, at least this BUY's acked fill, and at least resting SELL
+    // inventory on this token (covers spendable-only position drift vs escrowed legs).
+    let mut want_raw = if position_shares.is_finite() {
         position_shares.max(0.0)
     } else {
         0.0
     };
+    if had_resting_sells && sell_rem_pre.is_finite() && sell_rem_pre > 1e-9 {
+        want_raw = want_raw.max(sell_rem_pre);
+    }
+    if buy_ack_qty.is_finite() && buy_ack_qty > 1e-9 {
+        want_raw = want_raw.max(buy_ack_qty);
+    }
 
     if want_raw + 1e-9 < MIN_LIMIT_ORDER_SHARES {
         info!(
@@ -611,10 +636,12 @@ async fn run_take_profit_consolidate_after_buy(
         outcome = ?outcome,
         want_shares = want_raw,
         position_shares,
+        buy_ack_qty,
+        sell_escrow_remaining_pre_cancel = sell_rem_pre,
         entry = position_avg_entry,
         tp_limit_px = tp_px,
         canceled_resting_sells = n_resting_sells,
-        "take-profit: placing consolidated GTD limit SELL (size from UI position; open orders from WS ledger)",
+        "take-profit: placing consolidated GTD limit SELL (max of position, SELL escrow, buy ack; orders from WS ledger)",
     );
 
     spawn_order(
@@ -1819,6 +1846,9 @@ fn spawn_order(
                     } else {
                         resp.fill_for_position_ack(side, shares, price, otype)
                     };
+                    let buy_ack_qty_tp = ack.as_ref().and_then(|(q, _)| {
+                        (q.is_finite() && *q > 1e-9).then_some(*q)
+                    });
                     if let Some((ack_qty, ack_price)) = ack
                     {
                         let token_id_ack = match outcome {
@@ -1882,6 +1912,20 @@ fn spawn_order(
                         && matches!(side, Side::Buy)
                         && otype == OrderType::Fak
                     {
+                        let Some(buy_ack_qty) = buy_ack_qty_tp else {
+                            info!(
+                                take_profit_bps,
+                                outcome = ?outcome,
+                                "take-profit: skipped — no FAK fill ack (cannot align TP with position)",
+                            );
+                            let _ = tx
+                                .send(AppEvent::StatusInfo(
+                                    "take-profit skipped: no fill ack for FAK BUY (see logs)"
+                                        .into(),
+                                ))
+                                .await;
+                            return;
+                        };
                         if price >= 0.99 {
                             info!(
                                 limit_price = price,
@@ -1893,6 +1937,7 @@ fn spawn_order(
                         info!(
                             take_profit_bps,
                             outcome = ?outcome,
+                            buy_ack_qty,
                             "take-profit: market BUY succeeded; evaluating GTD limit sell",
                         );
                         let Some((_, _, amounts_from_api)) =
@@ -1932,6 +1977,7 @@ fn spawn_order(
                                 market: market_for_refresh.clone(),
                                 outcome,
                                 take_profit_bps,
+                                buy_ack_qty,
                             })
                             .await;
                     }

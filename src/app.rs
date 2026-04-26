@@ -151,6 +151,8 @@ pub enum AppEvent {
         market:            crate::gamma::ActiveMarket,
         outcome:         Outcome,
         take_profit_bps: u32,
+        /// Same `qty` as the preceding [`AppEvent::OrderAck`] for this FAK BUY (CLOB fill estimate).
+        buy_ack_qty:     f64,
     },
     /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
