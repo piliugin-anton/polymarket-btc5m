@@ -97,7 +97,7 @@ const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
 
 /// GTD limit orders: 1 initial attempt + 3 retries on network error or CLOB soft rejection.
 const LIMIT_ORDER_MAX_ATTEMPTS: u32 = 4;
-const LIMIT_ORDER_RETRY_MS:     u64 = 500;
+const LIMIT_ORDER_RETRY_MS:     u64 = 300;
 
 /// Build CLOB user-channel subscription set (active UI + trailing tail markets).
 fn build_user_ws_bundle(state: &AppState) -> UserWsBundle {

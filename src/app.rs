@@ -854,25 +854,28 @@ impl AppState {
     }
 
     fn apply_trailing_book_tick(&mut self, asset_id: &str, bid: f64) {
-        let map_key = match trailing_map_key_for_asset(&self.trailing, asset_id) {
-            Some(k) => k,
-            None => return,
-        };
+        // Hot path: find the session with a single direct lookup — no String allocation.
+        // canonical_clob_token_id is only called when the direct hit misses (non-canonical form).
         let tick = {
-            let Some(sess) = self.trailing.get(&map_key) else {
+            let Some(sess) = self.trailing.get(asset_id)
+                .or_else(|| {
+                    let c = canonical_clob_token_id(asset_id);
+                    if c.as_ref() != asset_id { self.trailing.get(c.as_ref()) } else { None }
+                })
+                .or_else(|| self.trailing.values().find(|s| clob_asset_ids_match(&s.token_id, asset_id)))
+            else {
                 return;
             };
-            if asset_id != sess.token_id.as_str()
-                && !clob_asset_ids_match(asset_id, &sess.token_id)
-            {
-                return;
-            }
             sess.stop.on_price(bid)
         };
         let TickOutcome::Triggered { .. } = tick else {
             return;
         };
-        let (token_id, market, outcome, plan, entry_px) = {
+        // Triggered (rare): look up key once; merge the two former post-trigger lookups into one.
+        let Some(map_key) = trailing_map_key_for_asset(&self.trailing, asset_id) else {
+            return;
+        };
+        let (token_id, market, outcome, plan, entry_px, live) = {
             let sess = self.trailing.get(&map_key).expect("trailing session");
             let entry_px = if self
                 .market
@@ -895,17 +898,17 @@ impl AppState {
             } else {
                 sess.stop.entry_price()
             };
+            let live = self.trail_live_shares(sess);
             (
                 sess.token_id.clone(),
                 sess.market.clone(),
                 sess.outcome,
                 sess.plan_sell_shares,
                 entry_px,
+                live,
             )
         };
         if bid > entry_px {
-            let sess_ref = self.trailing.get(&map_key).expect("trailing session");
-            let live = self.trail_live_shares(sess_ref);
             let sh = live.min(plan);
             if sh > 1e-9 {
                 if !self.trailing_sell_queued_or_in_flight(&token_id) {
@@ -1003,15 +1006,14 @@ impl AppState {
                         self.book_down = Some(Arc::clone(&snap));
                     }
                 }
-                let watch_set = collect_book_watch_token_ids_as_set(self);
-                if watch_set.contains(id_for_trail.as_str()) {
+                // Use the cached sorted watch list — binary search, no HashSet allocation.
+                // cached_book_watch_tokens is rebuilt at the end of apply() to capture any
+                // state changes made by try_promote_pending_trail_any / apply_trailing_book_tick.
+                if self.cached_book_watch_tokens.binary_search(&id_for_trail).is_ok() {
                     self.watched_books.insert(id_for_trail.clone(), snap);
+                    let tokens = &self.cached_book_watch_tokens;
+                    self.watched_books.retain(|k, _| tokens.binary_search(k).is_ok());
                 }
-                self.watched_books.retain(|k, _| watch_set.contains(k.as_str()));
-                let mut sorted: Vec<String> = watch_set.into_iter().collect();
-                sorted.sort();
-                self.cached_book_watch_tokens = sorted;
-                book_watch_cached = true;
 
                 self.try_promote_pending_trail_any(id_for_trail.as_str());
                 if let Some(bid) = self.best_bid_for_token(id_for_trail.as_str()) {
