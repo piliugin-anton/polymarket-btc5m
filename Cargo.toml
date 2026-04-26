@@ -21,7 +21,7 @@ reqwest = { version = "0.13", default-features = false, features = ["json", "rus
 # ── serde ───────────────────────────────────────────────────────────
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-sonic-rs   = "0.3"
+sonic-rs   = "0.5"
 fast-float = "0.2"
 
 # ── TUI ─────────────────────────────────────────────────────────────
@@ -54,8 +54,8 @@ hex               = "0.4"
 qrcode            = "0.14"
 
 # Chainlink Data Streams (optional spot feed when CHAINLINK_API_KEY + CHAINLINK_USER_SECRET are set)
-chainlink-data-streams-sdk   = "1.0"
-chainlink-data-streams-report = "1.0"
+chainlink-data-streams-sdk   = "1.2"
+chainlink-data-streams-report = "1.2"
 num-bigint  = "0.4"
 num-traits  = "0.2"
 
