@@ -364,23 +364,6 @@ pub fn collect_book_watch_token_ids(state: &AppState) -> Vec<String> {
     v
 }
 
-fn collect_book_watch_token_ids_as_set(state: &AppState) -> std::collections::HashSet<String> {
-    let mut s: std::collections::HashSet<String> = std::collections::HashSet::new();
-    if let Some(m) = &state.market {
-        s.insert(m.up_token_id.clone());
-        s.insert(m.down_token_id.clone());
-    }
-    for k in state.trailing.keys() {
-        s.insert(k.clone());
-    }
-    for k in state.pending_trail_arms.keys() {
-        s.insert(k.clone());
-    }
-    for p in &state.pending_trailing_sells {
-        s.insert(p.token_id.clone());
-    }
-    s
-}
 
 #[derive(Debug)]
 pub struct AppState {
@@ -968,7 +951,6 @@ impl AppState {
 
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
-        let mut book_watch_cached = false;
         match ev {
             AppEvent::Tick => {
                 if self
@@ -1433,9 +1415,7 @@ impl AppState {
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
-        if !book_watch_cached {
-            self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
-        }
+        self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
     }
 }
 
