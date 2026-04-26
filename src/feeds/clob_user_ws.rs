@@ -112,6 +112,26 @@ impl UserOpenOrdersLedger {
         )
     }
 
+    /// Resting orders for the ledger’s current market — from in-memory state (user WS `order`
+    /// events merged with the last REST snapshot). No `GET /data/orders`.
+    pub async fn snapshot_clob_orders(&self) -> Vec<ClobOpenOrder> {
+        let g = self.inner.lock().await;
+        g.by_id.values().cloned().collect()
+    }
+
+    /// Same source as [`Self::snapshot_clob_orders`], formatted for the Open Orders panel.
+    pub async fn open_orders_ui_snapshot(&self) -> Option<Vec<OpenOrderRow>> {
+        let g = self.inner.lock().await;
+        if g.market.is_empty() || (g.up.is_empty() && g.down.is_empty()) {
+            return None;
+        }
+        Some(open_orders_from_clob(
+            g.by_id.values().cloned().collect(),
+            g.up.as_str(),
+            g.down.as_str(),
+        ))
+    }
+
     /// Apply CLOB `order` events; returns new UI rows if anything changed.
     async fn apply_order_values(&self, values: &[Value]) -> Option<Vec<OpenOrderRow>> {
         let mut changed = false;

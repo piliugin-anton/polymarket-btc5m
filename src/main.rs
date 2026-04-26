@@ -479,6 +479,10 @@ async fn run_trailing_exit_fak_sell(
 
 /// After a market BUY (FAK) with fixed take-profit: optionally cancel resting SELL on the same
 /// outcome, then place one GTD take-profit sized to the merged position (VWAP from UI state).
+///
+/// Open orders come from [`feeds::clob_user_ws::UserOpenOrdersLedger`] (user WS + last REST
+/// merge). Sell size uses UI `position_shares` (no `GET /balance-allowance` here); `place_order`
+/// still performs its own balance reads on retries if needed.
 async fn run_take_profit_consolidate_after_buy(
     trading:          Arc<TradingClient>,
     user_open_ledger: Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
@@ -493,18 +497,8 @@ async fn run_take_profit_consolidate_after_buy(
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
     };
-    let cond = market.condition_id.clone();
 
-    let orders = match trading.fetch_open_orders_for_market(&cond).await {
-        Ok(o) => o,
-        Err(e) => {
-            warn!(error = %e, "take-profit consolidate: fetch open orders failed");
-            let _ = tx
-                .send(AppEvent::OrderErrModal(format!("take-profit: open orders: {e:#}")))
-                .await;
-            return;
-        }
-    };
+    let orders = user_open_ledger.snapshot_clob_orders().await;
 
     let sell_same_outcome: Vec<_> = orders
         .iter()
@@ -547,37 +541,12 @@ async fn run_take_profit_consolidate_after_buy(
     }
 
     if had_resting_sells {
+        // Let user-channel `order` events update the ledger after cancels before POST TP.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        if let Err(e) = trading.refresh_conditional_balance_allowance_cache(&tid).await {
-            debug!(
-                error = %e,
-                token_id = %tid,
-                "take-profit consolidate: post-cancel balance refresh failed"
-            );
-        }
     }
 
-    let mut bal = match trading.fetch_conditional_balance_shares(&tid).await {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(error = %e, "take-profit consolidate: balance read failed");
-            let _ = tx
-                .send(AppEvent::OrderErrModal(format!("take-profit: balance: {e:#}")))
-                .await;
-            return;
-        }
-    };
-
-    if bal + 1e-9 < MIN_LIMIT_ORDER_SHARES && had_resting_sells {
-        tokio::time::sleep(Duration::from_millis(450)).await;
-        let _ = trading.refresh_conditional_balance_allowance_cache(&tid).await;
-        if let Ok(b2) = trading.fetch_conditional_balance_shares(&tid).await {
-            bal = b2;
-        }
-    }
-
-    let want_raw = if position_shares.is_finite() && bal.is_finite() {
-        position_shares.min(bal).max(0.0)
+    let want_raw = if position_shares.is_finite() {
+        position_shares.max(0.0)
     } else {
         0.0
     };
@@ -585,23 +554,19 @@ async fn run_take_profit_consolidate_after_buy(
     if want_raw + 1e-9 < MIN_LIMIT_ORDER_SHARES {
         info!(
             want_raw,
-            bal,
             position_shares,
             outcome = ?outcome,
-            "take-profit: skipped — spendable size below min after consolidate",
+            "take-profit: skipped — position size below min after consolidate",
         );
         let _ = tx
             .send(AppEvent::StatusInfo(format!(
-                "take-profit skipped: spendable {want_raw:.2} sh < min {:.0} sh",
+                "take-profit skipped: position {want_raw:.2} sh < min {:.0} sh",
                 MIN_LIMIT_ORDER_SHARES
             )))
             .await;
-        spawn_open_orders_refresh(
-            trading.clone(),
-            tx.clone(),
-            market.clone(),
-            user_open_ledger.clone(),
-        );
+        if let Some(rows) = user_open_ledger.open_orders_ui_snapshot().await {
+            let _ = tx.send(AppEvent::OpenOrdersLoaded { orders: rows }).await;
+        }
         return;
     }
 
@@ -645,11 +610,10 @@ async fn run_take_profit_consolidate_after_buy(
         outcome = ?outcome,
         want_shares = want_raw,
         position_shares,
-        cond_bal = bal,
         entry = position_avg_entry,
         tp_limit_px = tp_px,
         canceled_resting_sells = n_resting_sells,
-        "take-profit: placing consolidated GTD limit SELL",
+        "take-profit: placing consolidated GTD limit SELL (size from UI position; open orders from WS ledger)",
     );
 
     spawn_order(
