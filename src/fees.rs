@@ -79,4 +79,14 @@ mod tests {
         let c0 = e + POLYMARKET_CRYPTO_TAKER_FEE_RATE * e * (1.0 - e);
         assert!((net - c0).abs() < 1e-6, "net={net} c0={c0}");
     }
+
+    #[test]
+    fn take_profit_limit_increases_with_bps_at_fixed_entry() {
+        let e = 0.45;
+        let t0 = take_profit_limit_price_crypto_after_fees(e, 0);
+        let t50 = take_profit_limit_price_crypto_after_fees(e, 50);
+        let t200 = take_profit_limit_price_crypto_after_fees(e, 200);
+        assert!(t50 > t0, "t50={t50} t0={t0}");
+        assert!(t200 > t50, "t200={t200} t50={t50}");
+    }
 }

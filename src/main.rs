@@ -19,6 +19,7 @@ mod balances;
 mod bridge_deposit;
 mod config;
 mod fees;
+mod take_profit;
 mod data_api;
 mod redeem;
 mod events;
@@ -41,6 +42,9 @@ use app::{
 };
 use feeds::clob_user_ws::{UserWsBundle, UserWsMarket};
 use fees::take_profit_limit_price_crypto_after_fees;
+use take_profit::{
+    clob_order_remaining_size, consolidate_tp_want_shares, merge_duplicate_sells_total_if_eligible,
+};
 use config::Config;
 use crossterm::{
     event::{
@@ -549,18 +553,9 @@ async fn run_merge_resting_tp_sells_from_ws(
         return;
     }
     let n_sells = sells.len();
-    let total_rem: f64 = sells
-        .iter()
-        .map(|o| {
-            let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
-            let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
-            if orig.is_finite() {
-                (orig - matched).max(0.0)
-            } else {
-                0.0
-            }
-        })
-        .sum();
+    let Some(total_rem) = merge_duplicate_sells_total_if_eligible(&sells) else {
+        return;
+    };
     if total_rem + 1e-9 < MIN_LIMIT_ORDER_SHARES {
         debug!(
             outcome = ?outcome,
@@ -670,15 +665,7 @@ async fn run_take_profit_consolidate_after_buy(
 
     let sell_rem_pre: f64 = sell_same_outcome
         .iter()
-        .map(|o| {
-            let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
-            let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
-            if orig.is_finite() {
-                (orig - matched).max(0.0)
-            } else {
-                0.0
-            }
-        })
+        .map(|o| clob_order_remaining_size(o))
         .sum();
 
     let had_resting_sells = !sell_same_outcome.is_empty();
@@ -718,19 +705,12 @@ async fn run_take_profit_consolidate_after_buy(
         tokio::time::sleep(Duration::from_millis(150)).await;
     }
 
-    // TP size: merged UI position, at least this BUY's acked fill, and at least resting SELL
-    // inventory on this token (covers spendable-only position drift vs escrowed legs).
-    let mut want_raw = if position_shares.is_finite() {
-        position_shares.max(0.0)
-    } else {
-        0.0
-    };
-    if had_resting_sells && sell_rem_pre.is_finite() && sell_rem_pre > 1e-9 {
-        want_raw = want_raw.max(sell_rem_pre);
-    }
-    if buy_ack_qty.is_finite() && buy_ack_qty > 1e-9 {
-        want_raw = want_raw.max(buy_ack_qty);
-    }
+    let want_raw = consolidate_tp_want_shares(
+        position_shares,
+        sell_rem_pre,
+        buy_ack_qty,
+        had_resting_sells,
+    );
 
     if want_raw + 1e-9 < MIN_LIMIT_ORDER_SHARES {
         info!(

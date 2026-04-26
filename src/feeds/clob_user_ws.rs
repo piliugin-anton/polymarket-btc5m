@@ -26,12 +26,12 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 use tracing::{debug, info, warn};
 
 use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
-use crate::trading::Side;
+use crate::take_profit::outcomes_with_duplicate_resting_sells;
 use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
 use crate::trading::{
-    canonical_clob_token_id, clob_asset_ids_match, parse_clob_side_str, parse_user_channel_values,
+    canonical_clob_token_id, clob_asset_ids_match, parse_user_channel_values,
     try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, TradingClient, norm_order_id_key,
 };
 
@@ -316,34 +316,6 @@ pub fn spawn(
             }
         }
     })
-}
-
-/// Outcomes that have at least two resting **SELL** rows on the active UP/DOWN tokens (merge candidates).
-fn outcomes_with_duplicate_resting_sells(
-    rows: &[ClobOpenOrder],
-    up_token_id: &str,
-    down_token_id: &str,
-) -> Vec<Outcome> {
-    let mut up_n = 0usize;
-    let mut down_n = 0usize;
-    for o in rows {
-        if parse_clob_side_str(&o.side) != Some(Side::Sell) {
-            continue;
-        }
-        if clob_asset_ids_match(&o.asset_id, up_token_id) {
-            up_n += 1;
-        } else if clob_asset_ids_match(&o.asset_id, down_token_id) {
-            down_n += 1;
-        }
-    }
-    let mut out = Vec::new();
-    if up_n >= 2 {
-        out.push(Outcome::Up);
-    }
-    if down_n >= 2 {
-        out.push(Outcome::Down);
-    }
-    out
 }
 
 fn bundle_has_markets(b: &UserWsBundle) -> bool {
