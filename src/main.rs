@@ -95,6 +95,10 @@ const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(80);
 /// Retries (no added sleep here; each attempt awaits the full `place_order` future).
 const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
 
+/// GTD limit orders: 1 initial attempt + 3 retries on network error or CLOB soft rejection.
+const LIMIT_ORDER_MAX_ATTEMPTS: u32 = 4;
+const LIMIT_ORDER_RETRY_MS:     u64 = 500;
+
 /// Build CLOB user-channel subscription set (active UI + trailing tail markets).
 fn build_user_ws_bundle(state: &AppState) -> UserWsBundle {
     let active = state
@@ -521,6 +525,63 @@ async fn run_trailing_exit_fak_sell(
     }
 }
 
+/// POST a GTD limit order, retrying up to [`LIMIT_ORDER_MAX_ATTEMPTS`] times on network errors
+/// or CLOB soft rejections (HTTP 200 with `success: false` / non-live status).
+async fn place_limit_with_retries(
+    trading: &TradingClient,
+    args: OrderArgs,
+    outcome: Outcome,
+) -> Result<trading::PostOrderResponse> {
+    let mut result: Result<trading::PostOrderResponse> =
+        Err(anyhow::anyhow!("GTD limit: no attempt made"));
+    for attempt in 0..LIMIT_ORDER_MAX_ATTEMPTS {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(LIMIT_ORDER_RETRY_MS)).await;
+        }
+        result = trading.place_order(args.clone(), OrderType::Gtd).await;
+        let retry = match &result {
+            Ok(resp) => {
+                let ok = resp.success
+                    || resp.status.as_ref().is_some_and(|s| {
+                        s.eq_ignore_ascii_case("matched")
+                            || s.eq_ignore_ascii_case("delayed")
+                            || s.eq_ignore_ascii_case("live")
+                            || s.eq_ignore_ascii_case("open")
+                    });
+                if !ok && attempt + 1 < LIMIT_ORDER_MAX_ATTEMPTS {
+                    warn!(
+                        outcome = ?outcome,
+                        attempt,
+                        error = ?resp.error,
+                        status = ?resp.status,
+                        "GTD limit order rejected by CLOB; retrying",
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+            Err(e) => {
+                if attempt + 1 < LIMIT_ORDER_MAX_ATTEMPTS {
+                    warn!(
+                        outcome = ?outcome,
+                        attempt,
+                        error = %e,
+                        "GTD limit order request failed; retrying",
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        if !retry {
+            break;
+        }
+    }
+    result
+}
+
 /// User WS saw **≥2** resting SELL on one outcome: cancel all of them and place one GTD for the
 /// **sum of their remaining sizes** at the fee-aware TP price from `position_avg_entry`.
 #[allow(clippy::too_many_arguments)]
@@ -795,7 +856,7 @@ async fn run_take_profit_consolidate_after_buy(
         "take-profit: placing consolidated GTD limit SELL (lock held until POST completes)",
     );
 
-    let resp_result = trading.place_order(args, OrderType::Gtd).await;
+    let resp_result = place_limit_with_retries(&trading, args, outcome).await;
 
     // Compute ok_ui and, if the order went live, optimistically insert it into the
     // WS ledger *before* releasing the lock.  A concurrent consolidation that acquires
@@ -2016,7 +2077,12 @@ fn spawn_order(
             sell_skip_pre_post_settle: is_take_profit_placement,
         };
         let cli = trading.clone();
-        match cli.place_order(args, otype).await {
+        let place_result = if otype == OrderType::Gtd {
+            place_limit_with_retries(&cli, args, outcome).await
+        } else {
+            cli.place_order(args, otype).await
+        };
+        match place_result {
             Ok(resp) => {
                 match otype {
                     OrderType::Fak => {
