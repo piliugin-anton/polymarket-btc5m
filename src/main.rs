@@ -651,7 +651,7 @@ async fn run_merge_resting_tp_sells_from_ws(
         );
         return;
     }
-    let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at) {
+    let exp_secs = match gamma::clob_gtd_expiration_secs_at_window_end(market.closes_at) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "merge TP SELL: GTD expiration failed");
@@ -816,7 +816,7 @@ async fn run_take_profit_consolidate_after_buy(
         return;
     }
 
-    let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at) {
+    let exp_secs = match gamma::clob_gtd_expiration_secs_at_window_end(market.closes_at) {
         Ok(s) => s,
         Err(e) => {
             warn!(error = %e, "take-profit consolidate: GTD expiration failed");
@@ -1974,7 +1974,7 @@ fn dispatch_action(
                 return;
             }
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
-            let exp_secs = match gamma::clob_gtd_expiration_secs_one_s_before_window_end(market.closes_at)
+            let exp_secs = match gamma::clob_gtd_expiration_secs_at_window_end(market.closes_at)
             {
                 Ok(s) => s,
                 Err(e) => {

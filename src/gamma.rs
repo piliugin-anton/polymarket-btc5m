@@ -77,16 +77,16 @@ pub struct ActiveMarket {
     pub crypto_price_query_end_utc:   String,
 }
 
-/// Signed CLOB `expiration` (UTC unix seconds) for a **GTD** limit that should stop resting **1
-/// second before** the 5m window ends (`window_end`).
+/// Signed CLOB `expiration` (UTC unix seconds) for a **GTD** limit that should stop resting at
+/// the 5m window end (`window_end`).
 ///
 /// Polymarket applies a **+60s security offset** on GTD: resting ends around `expiration - 60`.
-/// So we use `(window_end - 1s) + 60` as the signed field. See Polymarket “Create Order” → GTD.
-pub fn clob_gtd_expiration_secs_one_s_before_window_end(window_end: DateTime<Utc>) -> Result<u64> {
-    let target = window_end - Duration::seconds(1);
+/// So we use `window_end + 60` as the signed field. See Polymarket “Create Order” → GTD.
+pub fn clob_gtd_expiration_secs_at_window_end(window_end: DateTime<Utc>) -> Result<u64> {
+    let target = window_end;
     let now = Utc::now();
     if target <= now {
-        bail!("too close to window end for a GTD limit (need the window to close >1s from now)");
+        bail!(“too close to window end for a GTD limit (window must end in the future)”);
     }
     let signed = target
         .timestamp()
