@@ -86,7 +86,7 @@ pub fn clob_gtd_expiration_secs_at_window_end(window_end: DateTime<Utc>) -> Resu
     let target = window_end;
     let now = Utc::now();
     if target <= now {
-        bail!(“too close to window end for a GTD limit (window must end in the future)”);
+        bail!("too close to window end for a GTD limit (window must end in the future)");
     }
     let signed = target
         .timestamp()
