@@ -1631,6 +1631,7 @@ pub fn hydrate_positions_from_trades(
         .iter()
         .filter(|t| {
             t.is_valid_fill()
+                && t.trader_side.is_some()
                 && (clob_asset_ids_match(&t.asset_id, up_token_id)
                     || clob_asset_ids_match(&t.asset_id, down_token_id))
         })

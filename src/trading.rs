@@ -356,11 +356,12 @@ pub struct ClobTrade {
 }
 
 impl ClobTrade {
-    /// Returns `false` for trades that permanently failed on-chain and should not be counted as fills.
+    /// Returns `true` only for fully settled trades (`CONFIRMED`).
+    /// Absent status (older payloads) is treated as valid to preserve historical data.
     pub fn is_valid_fill(&self) -> bool {
-        !matches!(
+        matches!(
             self.status.as_deref().map(|s| s.to_ascii_uppercase()).as_deref(),
-            Some("FAILED")
+            None | Some("CONFIRMED")
         )
     }
 }
@@ -491,7 +492,7 @@ pub struct UserChannelTradeFill {
 }
 
 /// Parse a user-channel `event_type: trade` object for [`UserChannelTradeFill`].
-/// Returns `None` for `FAILED`, missing ids, or non-trades.
+/// Returns `None` for non-CONFIRMED trades, trades without `trader_side` (not owned by us), missing ids, or non-trades.
 pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannelTradeFill> {
     let et = v
         .get("event_type")
@@ -500,11 +501,8 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
     if !et.is_some_and(|s| s.eq_ignore_ascii_case("trade")) {
         return None;
     }
-    if v
-        .get("status")
-        .and_then(|s| s.as_str())
-        .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
-    {
+    let status = v.get("status").and_then(|s| s.as_str());
+    if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED")) {
         return None;
     }
     let clob_trade_id = v
@@ -535,6 +533,9 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         .or_else(|| v.get("traderSide"))
         .and_then(|s| s.as_str())
         .map(|s| s.trim().to_ascii_uppercase());
+    if trader_side.is_none() {
+        return None;
+    }
     let taker = v
         .get("taker_order_id")
         .or_else(|| v.get("takerOrderId"))
@@ -568,7 +569,7 @@ pub fn try_parse_user_channel_trade(v: &serde_json::Value) -> Option<UserChannel
         }
         (oid.to_string(), q)
     } else {
-        // TAKER (default) or missing trader_side: use top-level size + taker order id.
+        // TAKER: use top-level size + taker order id.
         let tid = taker?.to_string();
         let szs = v.get("size").and_then(|s| s.as_str())?;
         let q: f64 = szs.parse().ok()?;
@@ -657,11 +658,8 @@ impl FillWaitRegistry {
     }
 
     async fn dispatch_trade_value(&self, v: &serde_json::Value) {
-        if v
-            .get("status")
-            .and_then(|s| s.as_str())
-            .is_some_and(|s| s.eq_ignore_ascii_case("FAILED"))
-        {
+        let status = v.get("status").and_then(|s| s.as_str());
+        if !status.is_some_and(|s| s.eq_ignore_ascii_case("CONFIRMED")) {
             return;
         }
 
@@ -2906,7 +2904,7 @@ mod fill_wait_registry_tests {
         let oid = "0x06bc63e346ed4ceddce9efd6b3af37c8f8f440c92fe7da6b2d0f9e4ccbc50c42";
         let rx = r.register_buy_fill_waiter(oid).await;
         let sample = format!(
-            r#"{{"event_type":"trade","taker_order_id":"{oid}","size":"10","status":"MATCHED","asset_id":"52114319501245915516"}}"#
+            r#"{{"event_type":"trade","taker_order_id":"{oid}","size":"10","status":"CONFIRMED","asset_id":"52114319501245915516"}}"#
         );
         let values = parse_user_channel_values(&sample);
         r.dispatch_trades_in_values(&values).await;
