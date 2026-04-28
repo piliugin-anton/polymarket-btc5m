@@ -1078,6 +1078,8 @@ async fn main() -> Result<()> {
                 let _ = tx.send(AppEvent::OrderErr(
                     "run `polymarket-crypto debug-auth` for the full auth dump".into()
                 )).await;
+            } else if let Err(e) = t.refresh_collateral_balance_allowance_cache().await {
+                debug!(error = %e, "CLOB collateral balance-allowance update at startup failed");
             }
         });
     }
@@ -1223,16 +1225,6 @@ async fn main() -> Result<()> {
                     restart_book_ws(&merged, &mut book_handle);
                     let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
 
-            let tw = trading_for_positions.clone();
-            let up_pw = m.up_token_id.clone();
-            let down_pw = m.down_token_id.clone();
-            tokio::spawn(async move {
-                let ids = [up_pw.as_str(), down_pw.as_str()];
-                if let Err(e) = tw.prewarm_order_context(&ids).await {
-                    debug!(error = %e, "CLOB order context prewarm failed");
-                }
-            });
-
             let t = trading_for_positions.clone();
             let txp = tx_for_books.clone();
             let up_id = m.up_token_id.clone();
@@ -1271,6 +1263,10 @@ async fn main() -> Result<()> {
                 if let Err(e) = cli.ensure_creds().await {
                     debug!(error = %e, "positions sync skipped: no CLOB creds");
                     return;
+                }
+                let pre_ids = [up_id.as_str(), down_id.as_str()];
+                if let Err(e) = cli.prewarm_order_context(&pre_ids).await {
+                    debug!(error = %e, "CLOB order context prewarm failed (continuing to position sync)");
                 }
                 let up = cli
                     .fetch_conditional_balance_shares(&up_id)

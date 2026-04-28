@@ -1,6 +1,8 @@
-//! On-chain balance panel: USDC.e cash + claimable CTF payout (standard markets).
+//! On-chain balance panel: trading cash + claimable CTF payout (standard markets).
 //!
-//! * **Cash** — `USDC.e.balanceOf(funder)` (Polymarket collateral token on Polygon).
+//! * **Cash** — `USDC.e.balanceOf(funder)` **plus** [pUSD](https://docs.polymarket.com/resources/contracts)
+//!   (`CollateralToken` proxy). After CLOB V2 (Apr 2026), Polymarket collateral is pUSD; funds can
+//!   show as zero USDC.e while pUSD holds the spendable balance ([migration](https://docs.polymarket.com/v2-migration)).
 //! * **Claimable** — standard redeemable rows: `eth_call` on CTF using payout vectors plus
 //!   `balanceOf(funder, asset)` where `asset` is the outcome token id from the Data API (same id
 //!   the CLOB uses). Rows whose token id does not match derived CTF positions fall back to
@@ -28,6 +30,8 @@ use crate::data_api::{self, DataPosition};
 use crate::redeem::{parse_condition_id, parse_token_id_u256};
 
 const USDC_E: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+/// Polymarket USD (pUSD) — CLOB V2 collateral ([contracts](https://docs.polymarket.com/resources/contracts)).
+const PUSD: Address = address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 const CTF: Address = address!("0x4D97DCd97eC945f40cF65f87097ACe5EA0476045");
 /// [Multicall3](https://github.com/mds1/multicall) on Polygon (same address on most EVM chains).
 const MULTICALL3: Address = address!("0xcA11bde05977b3631167028862bE2a173976CA11");
@@ -234,19 +238,21 @@ fn claimable_standard_total_from_maps(
             total += api_fb;
             continue;
         };
-        let pos1 = position_id(USDC_E, collection_id(cid, 1));
-        let pos2 = position_id(USDC_E, collection_id(cid, 2));
+        let pos1_usdc = position_id(USDC_E, collection_id(cid, 1));
+        let pos2_usdc = position_id(USDC_E, collection_id(cid, 2));
+        let pos1_pusd = position_id(PUSD, collection_id(cid, 1));
+        let pos2_pusd = position_id(PUSD, collection_id(cid, 2));
         let b = balances.get(&tid).copied().unwrap_or(U256::ZERO);
 
         if d.is_zero() {
             total += api_fb;
             continue;
         }
-        if tid != pos1 && tid != pos2 {
+        if tid != pos1_usdc && tid != pos2_usdc && tid != pos1_pusd && tid != pos2_pusd {
             total += api_fb;
             continue;
         }
-        let n = if tid == pos1 { n0 } else { n1 };
+        let n = if tid == pos1_usdc || tid == pos1_pusd { n0 } else { n1 };
         let slot_usdc = u256_to_usdc_f64(b * n / d);
         if slot_usdc > 1e-9 {
             total += slot_usdc;
@@ -265,7 +271,7 @@ async fn fetch_onchain_cash_and_claim_std(
 ) -> Result<(f64, f64)> {
     let prep = prepare_standard_claimable_parsed(redeemable_rows);
     if prep.parsed.is_empty() {
-        let cash = usdc_e_cash_f64(http_rpc, rpc_url, funder).await?;
+        let cash = collateral_cash_usdc_f64(http_rpc, rpc_url, funder).await?;
         return Ok((cash, 0.0));
     }
 
@@ -278,6 +284,11 @@ async fn fetch_onchain_cash_and_claim_std(
     let mut calls: Vec<(Address, bool, Vec<u8>)> = Vec::new();
     calls.push((
         USDC_E,
+        true,
+        IERC20::balanceOfCall { account: funder }.abi_encode(),
+    ));
+    calls.push((
+        PUSD,
         true,
         IERC20::balanceOfCall { account: funder }.abi_encode(),
     ));
@@ -321,15 +332,25 @@ async fn fetch_onchain_cash_and_claim_std(
     let results = rpc_aggregate3_calls(http_rpc, rpc_url, &calls).await?;
 
     let mut i = 0usize;
-    let (cash_ok, cash_raw) = &results[i];
+    let (usdc_ok, usdc_raw) = &results[i];
     i += 1;
-    let cash = if *cash_ok {
-        decode_uint256_return(cash_raw)
+    let (pusd_ok, pusd_raw) = &results[i];
+    i += 1;
+    let usdc_amt = if *usdc_ok {
+        decode_uint256_return(usdc_raw)
             .map(u256_to_usdc_f64)
             .unwrap_or(0.0)
     } else {
         0.0
     };
+    let pusd_amt = if *pusd_ok {
+        decode_uint256_return(pusd_raw)
+            .map(u256_to_usdc_f64)
+            .unwrap_or(0.0)
+    } else {
+        0.0
+    };
+    let cash = usdc_amt + pusd_amt;
 
     let mut payouts: HashMap<B256, (U256, U256, U256)> = HashMap::with_capacity(conds.len());
     for cond in &conds {
@@ -371,11 +392,23 @@ async fn fetch_onchain_cash_and_claim_std(
     Ok((cash, claim_std))
 }
 
-async fn usdc_e_cash_f64(http: &Client, rpc_url: &str, funder: Address) -> Result<f64> {
+async fn erc20_balance_usdc_f64(
+    http: &Client,
+    rpc_url: &str,
+    token: Address,
+    funder: Address,
+) -> Result<f64> {
     let calldata = IERC20::balanceOfCall { account: funder }.abi_encode();
-    let raw = rpc_eth_call(http, rpc_url, USDC_E, &calldata).await?;
+    let raw = rpc_eth_call(http, rpc_url, token, &calldata).await?;
     let v = decode_uint256_return(&raw)?;
     Ok(u256_to_usdc_f64(v))
+}
+
+/// Spendable trading cash: bridged USDC.e plus pUSD (post–CLOB V2 collateral).
+async fn collateral_cash_usdc_f64(http: &Client, rpc_url: &str, funder: Address) -> Result<f64> {
+    let usdc = erc20_balance_usdc_f64(http, rpc_url, USDC_E, funder).await?;
+    let pusd = erc20_balance_usdc_f64(http, rpc_url, PUSD, funder).await?;
+    Ok(usdc + pusd)
 }
 
 fn sum_neg_risk_claimable_usdc(rows: &[DataPosition]) -> f64 {

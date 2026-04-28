@@ -1,9 +1,10 @@
 //! Trading layer — EIP-712 order construction + CLOB REST submission.
 //!
-//! EIP-712 order shape follows **`GET https://clob.polymarket.com/version`** (see Polymarket
-//! `clob-client-v2` `resolveVersion`): production currently returns **`1`**, i.e. domain
-//! `version: "1"` and the V1 `Order` struct (incl. `taker`, `expiration`, `nonce`, `feeRateBps`).
-//! When the API reports **`2`**, we use the V2 struct from the migration docs.
+//! EIP-712 order shape follows **`GET https://clob.polymarket.com/version`** (Polymarket
+//! `clob-client-v2` `resolveVersion`). **`1`**: domain `version: "1"`, V1 `Order` (incl. `taker`,
+//! `expiration`, `nonce`, `feeRateBps`) + `GET /fee-rate`. **`2`**: domain `version: "2"`, V2
+//! `Order` (`timestamp`, `metadata`, `builder`; no fee in the typed data). GTD still sends
+//! `expiration` on the JSON body; it is not part of the V2 EIP-712 hash (same as official SDK).
 //!
 //! L1 (EIP-712 wallet sig) is used ONCE to derive API credentials. After that
 //! every order-posting request is authed with L2 (HMAC-SHA256 over
@@ -957,8 +958,9 @@ impl TradingClient {
         Ok(version)
     }
 
-    /// Prime `/version` and (if CLOB returns signing v1) `/fee-rate` caches used by
-    /// [`Self::place_order`], so the first order avoids cold RTTs.
+    /// Prime `/version`, (if signing v1) `/fee-rate`, and **`GET /balance-allowance/update`** for each
+    /// `token_id` (CONDITIONAL) so the first `GET /balance-allowance` reads are not stuck at stale `0`
+    /// without calling update on every SELL ([clob-client#128](https://github.com/Polymarket/clob-client/issues/128)).
     pub async fn prewarm_order_context(&self, token_ids: &[&str]) -> Result<()> {
         self.ensure_creds().await?;
         let v = self.fetch_clob_order_version().await?;
@@ -966,6 +968,9 @@ impl TradingClient {
             for tid in token_ids {
                 let _ = self.fetch_fee_rate_bps(tid).await?;
             }
+        }
+        for tid in token_ids {
+            let _ = self.update_conditional_balance_allowance(tid).await;
         }
         Ok(())
     }
@@ -1320,15 +1325,57 @@ impl TradingClient {
         self.update_conditional_balance_allowance(token_id).await
     }
 
+    /// `GET /balance-allowance/update` for **COLLATERAL** (pUSD / legacy cache). Call once at app
+    /// startup after L2 creds exist — not on every SELL or read.
+    pub async fn refresh_collateral_balance_allowance_cache(&self) -> Result<()> {
+        self.update_collateral_balance_allowance().await
+    }
+
+    async fn update_collateral_balance_allowance(&self) -> Result<()> {
+        let creds = self.ensure_creds().await?;
+        let ts = chrono::Utc::now().timestamp();
+        let path = "/balance-allowance/update";
+        let mut url = url::Url::parse(&format!("{CLOB_HOST}{path}"))
+            .context("parse /balance-allowance/update URL (COLLATERAL)")?;
+        url.query_pairs_mut()
+            .append_pair("asset_type", "COLLATERAL")
+            .append_pair("signature_type", &(self.config.sig_type as u8).to_string());
+
+        let l2_sig = l2_hmac(&creds.secret, ts, "GET", path, "")?;
+
+        let resp = self
+            .http
+            .get(url.as_str())
+            .header("POLY_ADDRESS", format!("{:#x}", self.signer.address()))
+            .header("POLY_API_KEY", &creds.api_key)
+            .header("POLY_PASSPHRASE", &creds.passphrase)
+            .header("POLY_TIMESTAMP", ts.to_string())
+            .header("POLY_SIGNATURE", l2_sig)
+            .send()
+            .await
+            .context("GET /balance-allowance/update COLLATERAL")?;
+        let status = resp.status();
+        if !status.is_success() {
+            let txt = resp.text().await.unwrap_or_default();
+            return Err(anyhow!(
+                "CLOB GET /balance-allowance/update (COLLATERAL) failed: {} — {}",
+                status,
+                snip(&txt)
+            ));
+        }
+        Ok(())
+    }
+
     /// Conditional (outcome token) balance for `token_id`, in **human shares** (raw / 1e6).
     ///
     /// Uses L2 auth — same as `clob-client-v2` `getBalanceAllowance` with
     /// `asset_type: CONDITIONAL`.
     ///
-    /// Sends `GET /balance-allowance/update` first so the read sees a fresher snapshot (Polymarket
-    /// `updateBalanceAllowance`). **SELL** placement uses the same GET without that poke (faster path).
+    /// Optional `GET /balance-allowance/update` before the read when `refresh_allowance_cache` is true.
+    /// Hot paths (e.g. SELL sizing in [`Self::place_order`]) pass `false`; cache is primed at startup
+    /// and via [`Self::prewarm_order_context`] / [`Self::refresh_conditional_balance_allowance_cache`].
     pub async fn fetch_conditional_balance_shares(&self, token_id: &str) -> Result<f64> {
-        self.fetch_conditional_balance_shares_impl(token_id, true).await
+        self.fetch_conditional_balance_shares_impl(token_id, false).await
     }
 
     async fn fetch_conditional_balance_shares_impl(
@@ -1382,7 +1429,7 @@ impl TradingClient {
     ///
     /// Raw amounts use **6 decimals** (same as conditional shares in this client). The allowance
     /// is the ERC-20 approval the funder granted to Polymarket contracts — often near-unlimited.
-    #[allow(dead_code)] // Balance panel uses on-chain USDC.e (`balances`); kept for debugging / scripts.
+    #[allow(dead_code)] // Balance panel uses on-chain USDC.e + pUSD (`balances`); this CLOB read is optional / debug.
     pub async fn fetch_collateral_cash_and_cashout_usdc(&self) -> Result<(f64, f64)> {
         let creds = self.ensure_creds().await?;
         let ts = chrono::Utc::now().timestamp();
@@ -1537,10 +1584,10 @@ impl TradingClient {
             args.price = snap_limit_order_price_to_tick(args.price, &args.tick_size);
         }
 
-        // SELL: `GET /balance-allowance` (no preceding `.../update` — see clob-client#128). Market
-        // **FAK** and take-profit **GTD** (`OrderArgs::sell_skip_pre_post_settle`) skip settle sleep +
-        // balance read on the first attempt so POST starts immediately; retries + clamp recover
-        // stale CLOB cache / allowance errors. Other **GTD** sells keep read+clamp every attempt.
+        // SELL: `GET /balance-allowance` only (no preceding `.../update`); cache is warmed at app start
+        // and per market in [`Self::prewarm_order_context`]. Market **FAK** and take-profit **GTD**
+        // (`OrderArgs::sell_skip_pre_post_settle`) skip settle sleep on the first attempt so POST
+        // starts quickly; retries + clamp recover stale cache / allowance errors.
         let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
             SELL_ORDER_PREP_SETTLE_MS.len() as u32
         } else {
@@ -1587,11 +1634,6 @@ impl TradingClient {
 
             let creds = self.ensure_creds().await?;
             let api_version = self.fetch_clob_order_version().await?;
-            if order_type == OrderType::Gtd && api_version != 1 {
-                bail!(
-                    "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
-                );
-            }
             // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
             let fee_bps = if api_version == 1 {
                 self.fetch_fee_rate_bps(&args.token_id).await?
@@ -2571,6 +2613,7 @@ mod take_profit_reconcile_tests {
             size: size.to_string(),
             price: "0.5".to_string(),
             match_time: "0".to_string(),
+            status: None,
             taker_order_id: None,
             maker_orders: vec![],
             trader_side: None,
@@ -2636,6 +2679,7 @@ mod buy_fill_order_id_tests {
             size: "5.25".into(),
             price: "0.5".into(),
             match_time: "0".into(),
+            status: None,
             taker_order_id: Some(oid.to_string()),
             maker_orders: vec![],
             trader_side: Some("TAKER".into()),
@@ -2654,6 +2698,7 @@ mod buy_fill_order_id_tests {
             size: "99".into(),
             price: "0.5".into(),
             match_time: "0".into(),
+            status: None,
             taker_order_id: None,
             maker_orders: vec![ClobMakerOrder {
                 order_id: oid.to_string(),
@@ -2674,6 +2719,7 @@ mod buy_fill_order_id_tests {
             size: "5".into(),
             price: "0.5".into(),
             match_time: "0".into(),
+            status: None,
             taker_order_id: Some("other".into()),
             maker_orders: vec![],
             trader_side: Some("TAKER".into()),
