@@ -175,8 +175,7 @@ async fn run_rtds_once(
                                     }
                                     if let (Some(v), Some(ts)) = (p.value, p.timestamp) {
                                         let _ = tx.send(PriceTick { price: v, timestamp_ms: ts }).await;
-                                    }
-                                    if let Some(last) = p.data.last() {
+                                    } else if let Some(last) = p.data.last() {
                                         let _ = tx.send(PriceTick {
                                             price: last.value,
                                             timestamp_ms: last.timestamp,
