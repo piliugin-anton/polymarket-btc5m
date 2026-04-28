@@ -42,13 +42,6 @@ struct Payload {
     #[serde(default)] symbol:    String,
     #[serde(default)] value:     Option<f64>,
     #[serde(default)] timestamp: Option<u64>,
-    #[serde(default)] data:      Vec<DataPoint>,
-}
-
-#[derive(Debug, Deserialize)]
-struct DataPoint {
-    #[serde(default)] value:     f64,
-    #[serde(default)] timestamp: u64,
 }
 
 fn chainlink_data_streams_env_set() -> bool {
@@ -175,11 +168,6 @@ async fn run_rtds_once(
                                     }
                                     if let (Some(v), Some(ts)) = (p.value, p.timestamp) {
                                         let _ = tx.send(PriceTick { price: v, timestamp_ms: ts }).await;
-                                    } else if let Some(last) = p.data.last() {
-                                        let _ = tx.send(PriceTick {
-                                            price: last.value,
-                                            timestamp_ms: last.timestamp,
-                                        }).await;
                                     }
                                 }
                             }
