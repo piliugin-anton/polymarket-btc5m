@@ -1,9 +1,10 @@
 //! Trading layer — EIP-712 order construction + CLOB REST submission.
 //!
-//! EIP-712 order shape follows **`GET https://clob.polymarket.com/version`** (see Polymarket
-//! `clob-client-v2` `resolveVersion`): production currently returns **`1`**, i.e. domain
-//! `version: "1"` and the V1 `Order` struct (incl. `taker`, `expiration`, `nonce`, `feeRateBps`).
-//! When the API reports **`2`**, we use the V2 struct from the migration docs.
+//! EIP-712 order shape follows **`GET https://clob.polymarket.com/version`** (Polymarket
+//! `clob-client-v2` `resolveVersion`). **`1`**: domain `version: "1"`, V1 `Order` (incl. `taker`,
+//! `expiration`, `nonce`, `feeRateBps`) + `GET /fee-rate`. **`2`**: domain `version: "2"`, V2
+//! `Order` (`timestamp`, `metadata`, `builder`; no fee in the typed data). GTD still sends
+//! `expiration` on the JSON body; it is not part of the V2 EIP-712 hash (same as official SDK).
 //!
 //! L1 (EIP-712 wallet sig) is used ONCE to derive API credentials. After that
 //! every order-posting request is authed with L2 (HMAC-SHA256 over
@@ -1587,11 +1588,6 @@ impl TradingClient {
 
             let creds = self.ensure_creds().await?;
             let api_version = self.fetch_clob_order_version().await?;
-            if order_type == OrderType::Gtd && api_version != 1 {
-                bail!(
-                    "GTD orders need CLOB signing API version 1 (EIP-712 includes expiration); server returned {api_version}"
-                );
-            }
             // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
             let fee_bps = if api_version == 1 {
                 self.fetch_fee_rate_bps(&args.token_id).await?
