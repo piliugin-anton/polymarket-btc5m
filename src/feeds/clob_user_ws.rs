@@ -507,7 +507,7 @@ async fn run_session(
                     }
                 };
                 let txt = match m {
-                    Message::Text(t) => t.to_string(),
+                    Message::Text(t) => t,
                     Message::Close(f) => {
                         info!(?f, "CLOB user WS peer closed");
                         return Ok(());

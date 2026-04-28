@@ -298,14 +298,19 @@ async fn apply_app_event(
                             }
                         }
                     }
+                    // Trailing stops trip only on book ticks — only run the dispatch check
+                    // after Book events so we skip the call on every Price/Tick/etc. message.
+                    let is_book_ev = matches!(ev, AppEvent::Book(_));
                     state.apply(ev).await;
-                    try_dispatch_trailing_sell(
-                        state,
-                        trading,
-                        tx,
-                        user_open_ledger,
-                        cfg,
-                    );
+                    if is_book_ev {
+                        try_dispatch_trailing_sell(
+                            state,
+                            trading,
+                            tx,
+                            user_open_ledger,
+                            cfg,
+                        );
+                    }
                     send_user_bundle_if_changed(state, user_bundle_tx);
                     send_book_watch_if_changed(state, book_token_tx);
                 }
@@ -1496,11 +1501,21 @@ async fn main() -> Result<()> {
                                 .await;
                         }
                         Err(e) => {
-                            debug!(
-                                error = %e,
-                                market = %cond_h,
-                                "data-api GET /holders failed"
-                            );
+                            let emsg = e.to_string();
+                            if emsg.contains("429") || emsg.contains("Too Many") {
+                                // Rate-limited: back off 1 s before the next attempt.
+                                debug!(
+                                    market = %cond_h,
+                                    "data-api GET /holders 429 rate-limit — backing off 1s"
+                                );
+                                tokio::time::sleep(Duration::from_secs(1)).await;
+                            } else {
+                                debug!(
+                                    error = %e,
+                                    market = %cond_h,
+                                    "data-api GET /holders failed"
+                                );
+                            }
                         }
                     }
                     interval.tick().await;

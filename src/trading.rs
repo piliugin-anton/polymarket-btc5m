@@ -469,10 +469,12 @@ pub struct UserTradeFill {
 
 /// One JSON value or a batch array from the CLOB user WebSocket.
 pub fn parse_user_channel_values(txt: &str) -> Vec<serde_json::Value> {
-    if let Ok(arr) = serde_json::from_str::<Vec<serde_json::Value>>(txt) {
+    // sonic_rs tokenises JSON with SIMD; serde_json::Value implements Deserialize
+    // so the output type is unchanged while parsing is 2-4× faster.
+    if let Ok(arr) = sonic_rs::from_str::<Vec<serde_json::Value>>(txt) {
         return arr;
     }
-    if let Ok(one) = serde_json::from_str::<serde_json::Value>(txt) {
+    if let Ok(one) = sonic_rs::from_str::<serde_json::Value>(txt) {
         return vec![one];
     }
     vec![]

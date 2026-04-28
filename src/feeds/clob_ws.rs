@@ -481,13 +481,10 @@ async fn emit_snapshot(
     // Asks: low → high (ascending key order = natural Vec order)
     out_asks.extend(asks.levels.iter().map(|&(k, s)| BookLevel { price: key_to_price(k), size: s }));
 
-    let nb    = out_bids.len();
-    let na    = out_asks.len();
-    let b_cap = (nb * 2).clamp(8, 4096);
-    let a_cap = (na * 2).clamp(8, 4096);
-    // Swap out the filled Vecs, leave pre-sized empty ones for the next snapshot.
-    let snap_bids = std::mem::replace(out_bids, Vec::with_capacity(b_cap));
-    let snap_asks = std::mem::replace(out_asks, Vec::with_capacity(a_cap));
+    // Swap the filled Vecs into the snapshot; the empty replacements allocate on
+    // the next extend() call via ExactSizeIterator, sizing to exactly the level count.
+    let snap_bids = std::mem::replace(out_bids, Vec::new());
+    let snap_asks = std::mem::replace(out_asks, Vec::new());
     let _ = tx
         .send(BookSnapshot {
             asset_id: asset_id.to_owned(),

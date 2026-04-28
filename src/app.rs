@@ -33,7 +33,7 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 
 /// Map key in [`AppState::trailing`] for this CLOB asset.
-/// Hot path: O(1) on canonical ids (see `canonical_clob_token_id`); then legacy U256/hex form.
+/// Two hash lookups: direct, then canonical form. Keys are always canonical, so this covers all cases.
 fn trailing_map_key_for_asset(
     trailing: &HashMap<String, TrailingSession>,
     asset_id: &str,
@@ -45,10 +45,7 @@ fn trailing_map_key_for_asset(
     if c.as_ref() != asset_id && trailing.contains_key(c.as_ref()) {
         return Some(c.into_owned());
     }
-    trailing
-        .keys()
-        .find(|k| clob_asset_ids_match(k, asset_id))
-        .cloned()
+    None
 }
 
 /// Map key in [`AppState::pending_trail_arms`] for this CLOB asset.
@@ -63,10 +60,7 @@ fn pending_trail_map_key_for_asset(
     if c.as_ref() != asset_id && pending.contains_key(c.as_ref()) {
         return Some(c.into_owned());
     }
-    pending
-        .keys()
-        .find(|k| clob_asset_ids_match(k, asset_id))
-        .cloned()
+    None
 }
 
 /// How long an [`AppState::order_error_toast`] stays visible.
@@ -706,16 +700,15 @@ impl AppState {
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
     fn clear_trailing_on_sell_token(&mut self, token_id: &str) {
-        self.trailing
-            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
-        self.pending_trail_arms
-            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
-        self.watched_books
-            .retain(|k, _| *k != token_id && !clob_asset_ids_match(k, token_id));
-        self.pending_trailing_sells
-            .retain(|e| e.token_id != token_id && !clob_asset_ids_match(&e.token_id, token_id));
-        self.trailing_sell_in_flight
-            .retain(|k| *k != token_id && !clob_asset_ids_match(k, token_id));
+        // All map/set keys are stored in canonical decimal form; canonicalize once so
+        // every comparison below is a plain string equality — no U256 bignum fallback.
+        let canonical = canonical_clob_token_id(token_id);
+        let tid = canonical.as_ref();
+        self.trailing.retain(|k, _| k != tid);
+        self.pending_trail_arms.retain(|k, _| k != tid);
+        self.watched_books.retain(|k, _| k != tid);
+        self.pending_trailing_sells.retain(|e| e.token_id != tid);
+        self.trailing_sell_in_flight.retain(|k| k != tid);
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1343,10 +1336,9 @@ impl AppState {
                 error,
             } => {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
-                self.trailing_sell_in_flight
-                    .retain(|k| *k != token_id && !clob_asset_ids_match(k, &token_id));
-                self.pending_trailing_sells
-                    .retain(|p| p.token_id != token_id && !clob_asset_ids_match(&p.token_id, &token_id));
+                // token_id is canonical; all keys/entries are canonical — direct equality suffices.
+                self.trailing_sell_in_flight.retain(|k| *k != token_id);
+                self.pending_trailing_sells.retain(|p| p.token_id != token_id);
                 let tid = token_id.clone();
                 if !success {
                     let had_sess = trailing_map_key_for_asset(&self.trailing, tid.as_str())
