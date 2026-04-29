@@ -273,14 +273,12 @@ pub struct OpenOrderRow {
 
 #[derive(Debug, Clone)]
 pub struct Fill {
-    pub ts:            DateTime<Utc>,
-    pub side:          Side,
-    pub outcome:       Outcome,
-    pub qty:           f64,
-    pub price:         f64,
-    pub realized:      f64, // only non-zero when the fill closes part of a position
-    /// CLOB `Trade.id` from REST or user WebSocket (for de-dupe only; not shown in the TUI).
-    pub clob_trade_id: Option<String>,
+    pub ts:       DateTime<Utc>,
+    pub side:     Side,
+    pub outcome:  Outcome,
+    pub qty:      f64,
+    pub price:    f64,
+    pub realized: f64, // only non-zero when the fill closes part of a position
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1038,19 +1036,10 @@ impl AppState {
                 self.position_up = position_up;
                 self.position_down = position_down;
                 self.fills.clear();
-                let mut seen_seed: Vec<String> = Vec::new();
-                for f in fills_bootstrap {
-                    if let Some(ref tid) = f.clob_trade_id {
-                        if !tid.is_empty() {
-                            seen_seed.push(tid.clone());
-                        }
-                    }
-                    self.fills.push_back(f);
-                }
-                self.user_trade_sync.seed_seen_from_hydration(seen_seed).await;
-                trim_fills_to_cap(&mut self.fills, 64);
-                let nu = net_shares_from_fills(&self.fills, Outcome::Up).max(0.0);
-                let nd = net_shares_from_fills(&self.fills, Outcome::Down).max(0.0);
+                // fills_bootstrap is always empty — fills come from the user WS only.
+                let _ = fills_bootstrap;
+                let nu = 0.0_f64;
+                let nd = 0.0_f64;
                 self.fak_net_up = self.position_up.shares.max(nu);
                 self.fak_net_down = self.position_down.shares.max(nd);
                 if refresh_status_line {
@@ -1124,11 +1113,6 @@ impl AppState {
                         qty,
                         price,
                         realized,
-                        clob_trade_id: if clob_trade_id.is_empty() {
-                            None
-                        } else {
-                            Some(clob_trade_id.clone())
-                        },
                     });
                     trim_fills_to_cap(&mut self.fills, 64);
                     self.user_trade_sync
@@ -1185,7 +1169,6 @@ impl AppState {
                             qty,
                             price,
                             realized,
-                            clob_trade_id: None,
                         });
                     } else {
                         self.apply_background_trailing_fill(&token_id, side, qty);
@@ -1691,7 +1674,6 @@ pub fn hydrate_positions_from_trades(
             qty,
             price,
             realized,
-            clob_trade_id: Some(t.id.clone()),
         });
     }
 
@@ -1934,7 +1916,6 @@ mod tests {
             qty: 10.09,
             price: 0.5,
             realized: 0.0,
-            clob_trade_id: None,
         });
         let (shares, _, _) =
             resolve_market_order(&state, Outcome::Up, Side::Sell, 1.0, 0, 0).unwrap();

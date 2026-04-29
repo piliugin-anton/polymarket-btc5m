@@ -68,16 +68,6 @@ impl UserTradeSync {
         g.ws_wait.clear();
     }
 
-    /// Trade ids from `GET /data/trades` — later WS re-pushes are ignored.
-    pub async fn seed_seen_from_hydration(&self, trade_ids: impl IntoIterator<Item = String>) {
-        let mut g = self.inner.lock().await;
-        for id in trade_ids {
-            if !id.is_empty() {
-                g.seen_trades.insert(id);
-            }
-        }
-    }
-
     /// `true` = apply the OrderAck P&L block. `false` = user WSS `trade` already matched the fill.
     pub async fn before_order_ack_apply(&self, clob_order_id: &str, qty: f64, price: f64) -> bool {
         let o = norm_order_id_key(clob_order_id);
