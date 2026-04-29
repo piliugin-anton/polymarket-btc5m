@@ -1020,8 +1020,8 @@ impl AppState {
             AppEvent::PriceToBeatRefresh { slug, price_to_beat } => {
                 if let Some(m) = &mut self.market {
                     if m.slug == slug {
-                        m.price_to_beat = price_to_beat;
-                        if price_to_beat.is_some() {
+                        if let Some(ptb) = price_to_beat {
+                            m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
                         }
                     }
