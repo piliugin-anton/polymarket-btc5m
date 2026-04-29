@@ -21,6 +21,7 @@ use crate::data_api::DataPosition;
 
 const RELAYER_HOST: &str = "https://relayer-v2.polymarket.com";
 const USDC_POLYGON: Address = address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+const USD_POLYGON: Address = address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 const CTF: Address = address!("0x4D97DCd97eC945f40cf65f87097ACe5EA0476045");
 const NEG_RISK_ADAPTER: Address = address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
 
@@ -83,7 +84,7 @@ fn derive_polymarket_safe(eoa: Address) -> Address {
 
 fn encode_standard_redeem(condition_id: B256) -> Vec<u8> {
     Ctf::redeemPositionsCall {
-        collateralToken: USDC_POLYGON,
+        collateralToken: USD_POLYGON, //USDC_POLYGON
         parentCollectionId: B256::ZERO,
         conditionId: condition_id,
         indexSets: vec![U256::from(1u64), U256::from(2u64)],
