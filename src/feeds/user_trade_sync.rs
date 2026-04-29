@@ -103,6 +103,10 @@ impl UserTradeSync {
     }
 
     /// `true` = forward this WSS `trade` to the TUI (no duplicate).
+    ///
+    /// Claims `clob_trade_id` in `seen_trades` immediately on the forward path so a second
+    /// delivery of the same CONFIRMED event (Polymarket re-sends on reconnect or flushes
+    /// duplicates) is blocked right here in the WS task before it reaches the event queue.
     pub async fn before_ws_user_fill_apply(
         &self,
         clob_trade_id: &str,
@@ -115,6 +119,11 @@ impl UserTradeSync {
         if !clob_trade_id.is_empty() && g.seen_trades.contains(clob_trade_id) {
             return false;
         }
+        // Claim the trade ID now — a second CONFIRMED delivery is blocked immediately
+        // without waiting for after_ws_user_fill_committed to run in the event loop.
+        if !clob_trade_id.is_empty() {
+            g.seen_trades.insert(clob_trade_id.to_string());
+        }
         if o.is_empty() {
             return true;
         }
@@ -124,9 +133,6 @@ impl UserTradeSync {
             w.oid == o && close_enough(w.qty, qty) && close_enough(w.price, price)
         }) {
             g.ack_wait.remove(i);
-            if !clob_trade_id.is_empty() {
-                g.seen_trades.insert(clob_trade_id.to_string());
-            }
             return false;
         }
         true
@@ -242,28 +248,36 @@ mod tests {
     #[tokio::test]
     async fn event_loop_guard_ack_raced_ahead_of_ws_fill() {
         let s = UserTradeSync::new();
-        // WS pre-check passes (no ack yet)
+        // WS pre-check passes (no ack yet) and claims T-3 in seen_trades
         assert!(s.before_ws_user_fill_apply("T-3", "0xorder3", 8.0, 0.60).await);
         // OrderAck is processed first in the event loop before UserChannelFill is handled
         assert!(s.before_order_ack_apply("0xorder3", 8.0, 0.60).await);
         s.after_order_ack_applied("0xorder3", 8.0, 0.60).await;
         // Now UserChannelFill reaches the event-loop handler — ack_claimed_for_ws_fill catches it
         assert!(s.ack_claimed_for_ws_fill("0xorder3", 8.0, 0.60, "T-3").await);
-        // trade ID recorded in seen_trades, so a WS reconnect replay is also blocked
+        // trade ID already in seen_trades from the pre-check claim
         assert!(s.fill_already_committed("T-3").await);
     }
 
-    // Race: WS reconnect replays the same trade before after_ws_user_fill_committed runs.
+    // Same CONFIRMED event delivered twice (Polymarket WS re-sends): second is blocked
+    // immediately in the WS task pre-check because the first claimed the trade ID.
     #[tokio::test]
-    async fn event_loop_guard_ws_reconnect_replay() {
+    async fn ws_duplicate_confirmed_blocked_in_pretask() {
         let s = UserTradeSync::new();
-        // First delivery passes pre-check
+        // First CONFIRMED delivery — claimed and forwarded
         assert!(s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
-        // Reconnect delivers same trade before commit — passes pre-check again
-        assert!(s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
-        // Event loop processes first UserChannelFill, commits it
-        s.after_ws_user_fill_committed("T-4", "0xorder4", 3.0, 0.45).await;
-        // Event loop processes second UserChannelFill — fill_already_committed blocks it
-        assert!(s.fill_already_committed("T-4").await);
+        // Second CONFIRMED delivery for same trade ID — blocked right here, never queued
+        assert!(!s.before_ws_user_fill_apply("T-4", "0xorder4", 3.0, 0.45).await);
+    }
+
+    // Event-loop safety net: if two events somehow reach the queue, fill_already_committed
+    // blocks the second after the first is committed.
+    #[tokio::test]
+    async fn event_loop_guard_catches_duplicate_in_queue() {
+        let s = UserTradeSync::new();
+        // Simulate first event being committed (seen_trades updated)
+        s.after_ws_user_fill_committed("T-5", "0xorder5", 2.0, 0.30).await;
+        // Second event reaches the event-loop handler
+        assert!(s.fill_already_committed("T-5").await);
     }
 }
