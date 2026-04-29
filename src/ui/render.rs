@@ -408,11 +408,12 @@ fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcom
     let p = s.position(outcome);
     let upnl = s.unrealized_pnl(outcome);
     let mark = s.mark(outcome).map(|m| format!("{:.2}", m)).unwrap_or_else(|| "—".into());
+    let label_colour = if p.shares > 1e-9 { colour } else { Color::DarkGray };
 
     let lines = vec![
         Line::from(vec![
             Span::styled(format!("  {}  ", outcome.as_str()),
-                Style::default().fg(colour).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
+                Style::default().fg(label_colour).add_modifier(Modifier::BOLD | Modifier::REVERSED)),
             Span::raw("  "),
             Span::raw(format!("{:.2} sh @ {:.2}", p.shares, p.avg_entry)),
         ]),
