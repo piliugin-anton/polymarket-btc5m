@@ -88,7 +88,15 @@ impl UserOpenOrdersLedger {
         g.by_id.clear();
     }
 
-    /// Full replace from `GET /data/orders` (e.g. initial market load, `spawn_open_orders_refresh`).
+    /// Remove all resting orders immediately (e.g. after a successful `cancel_all`).
+    /// Returns the now-empty UI row list so the caller can push `OpenOrdersLoaded`.
+    pub async fn clear_resting_orders(&self) -> Vec<crate::app::OpenOrderRow> {
+        let mut g = self.inner.lock().await;
+        g.by_id.clear();
+        crate::app::open_orders_from_clob(vec![], g.up.as_str(), g.down.as_str())
+    }
+
+    /// Full replace from `GET /data/orders` (initial market load only).
     pub async fn replace_from_rest(
         &self,
         market: &str,

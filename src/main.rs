@@ -307,7 +307,6 @@ async fn apply_app_event(
                             state,
                             trading,
                             tx,
-                            user_open_ledger,
                             cfg,
                         );
                     }
@@ -330,7 +329,6 @@ fn try_dispatch_trailing_sell(
     state: &mut AppState,
     trading: &Arc<TradingClient>,
     tx: &mpsc::Sender<AppEvent>,
-    user_open_ledger: &std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     cfg: &Config,
 ) {
     if state.pending_trailing_sells.is_empty() {
@@ -373,10 +371,9 @@ fn try_dispatch_trailing_sell(
         started += 1;
         let exit = ex;
         let trading2 = trading.clone();
-        let ledger2 = user_open_ledger.clone();
         let tx2 = tx.clone();
         tokio::spawn(async move {
-            run_trailing_exit_fak_sell(trading2, ledger2, tx2, exit, shares, price, otype).await;
+            run_trailing_exit_fak_sell(trading2, tx2, exit, shares, price, otype).await;
         });
     }
     state.pending_trailing_sells = newq;
@@ -384,14 +381,12 @@ fn try_dispatch_trailing_sell(
 
 async fn run_trailing_exit_fak_sell(
     trading: Arc<TradingClient>,
-    user_open_ledger: std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     tx: mpsc::Sender<AppEvent>,
     exit: TrailingExit,
     shares: f64,
     price: f64,
     otype: OrderType,
 ) {
-    let market_for_refresh = exit.market.clone();
     let token_id = exit.token_id.clone();
     let outcome = exit.outcome;
     info!(
@@ -474,12 +469,6 @@ async fn run_trailing_exit_fak_sell(
                             token_id:      token_id.clone(),
                         })
                         .await;
-                    spawn_open_orders_refresh(
-                        trading.clone(),
-                        tx.clone(),
-                        market_for_refresh.clone(),
-                        user_open_ledger.clone(),
-                    );
                     let cli2 = trading.clone();
                     let tid = token_id.clone();
                     tokio::spawn(async move {
@@ -698,7 +687,6 @@ async fn run_merge_resting_tp_sells_from_ws(
 
     spawn_order(
         trading,
-        user_open_ledger,
         tx,
         market,
         outcome,
@@ -965,7 +953,6 @@ async fn run_take_profit_consolidate_after_buy(
                         )))
                         .await;
                 }
-                spawn_open_orders_refresh(trading.clone(), tx.clone(), market, user_open_ledger.clone());
                 let cli = trading.clone();
                 tokio::spawn(async move {
                     if let Err(e) = cli.refresh_conditional_balance_allowance_cache(&tid).await {
@@ -1936,21 +1923,16 @@ fn dispatch_action(
             let t  = trading.clone();
             let tx = tx.clone();
             let open_ledger = user_open_ledger.clone();
-            let market = state.market.clone();
             tokio::spawn(async move {
                 match t.cancel_all().await {
                     Ok(_) => {
                         let _ = tx
                             .send(AppEvent::StatusInfo("all open orders cancelled".into()))
                             .await;
-                        if let Some(m) = market {
-                            spawn_open_orders_refresh(
-                                t.clone(),
-                                tx.clone(),
-                                m,
-                                open_ledger,
-                            );
-                        }
+                        // Clear in-memory ledger immediately — WS CANCELLATION events confirm
+                        // individual orders as they arrive, but UI should reflect the cancel now.
+                        let orders = open_ledger.clear_resting_orders().await;
+                        let _ = tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
                     }
                     Err(e) => {
                         let _ = tx.send(AppEvent::OrderErrModal(e.to_string())).await;
@@ -1979,7 +1961,6 @@ fn dispatch_action(
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
                 trading.clone(),
-                user_open_ledger.clone(),
                 tx.clone(),
                 market,
                 outcome,
@@ -2026,7 +2007,6 @@ fn dispatch_action(
             };
             spawn_order(
                 trading.clone(),
-                user_open_ledger.clone(),
                 tx.clone(),
                 market,
                 outcome,
@@ -2044,35 +2024,10 @@ fn dispatch_action(
     }
 }
 
-fn spawn_open_orders_refresh(
-    trading:      Arc<TradingClient>,
-    tx:           mpsc::Sender<AppEvent>,
-    market:       gamma::ActiveMarket,
-    open_ledger:  std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
-) {
-    let condition_id = market.condition_id.clone();
-    let up_id = market.up_token_id.clone();
-    let down_id = market.down_token_id.clone();
-    tokio::spawn(async move {
-        tokio::time::sleep(Duration::from_millis(400)).await;
-        let cli = trading.clone();
-        if cli.ensure_creds().await.is_err() {
-            return;
-        }
-        let Ok(rows) = cli.fetch_open_orders_for_market(&condition_id).await else {
-            return;
-        };
-        let orders = open_ledger
-            .replace_from_rest(&condition_id, &up_id, &down_id, rows)
-            .await;
-        let _ = tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
-    });
-}
 
 #[allow(clippy::too_many_arguments)]
 fn spawn_order(
     trading:  Arc<TradingClient>,
-    user_open_ledger: std::sync::Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
     tx:       mpsc::Sender<AppEvent>,
     market:   gamma::ActiveMarket,
     outcome:  Outcome,
@@ -2230,13 +2185,6 @@ fn spawn_order(
                             )))
                             .await;
                     }
-                    spawn_open_orders_refresh(
-                        trading.clone(),
-                        tx.clone(),
-                        market_for_refresh.clone(),
-                        user_open_ledger.clone(),
-                    );
-
                     if matches!(side, Side::Buy | Side::Sell) {
                         let cli = trading.clone();
                         let tid = match outcome {
