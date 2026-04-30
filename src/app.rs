@@ -21,7 +21,10 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
 use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
-use crate::trading::{canonical_clob_token_id, clob_asset_ids_match, ClobOpenOrder, ClobTrade, OrderType, Side};
+use crate::trading::{
+    canonical_clob_token_id, clob_asset_ids_match, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade,
+    OrderType, Side,
+};
 use tracing::debug;
 
 /// Minimum outcome shares for a limit (GTD) order — enforced in the UI before submit.
@@ -258,6 +261,23 @@ impl Position {
             }
             Side::Sell => self.reduce(qty, price),
         }
+    }
+
+    /// BUY from exchange-reported **total USDC** and share count (e.g. L2 `makingAmount` / `takingAmount`
+    /// on a taker buy). `total_usdc` is the full debit for that lot—**no** extra taker-fee line, unlike
+    /// [`Self::add`], so REST-replay cost basis matches `postOrder` / wallet.
+    fn apply_buy_with_total_usdc(&mut self, qty: f64, total_usdc: f64) -> f64 {
+        if !qty.is_finite() || qty <= 0.0 || !total_usdc.is_finite() || total_usdc <= 0.0 {
+            return 0.0;
+        }
+        let new_total = self.shares + qty;
+        if new_total.abs() < 1e-9 {
+            *self = Default::default();
+            return 0.0;
+        }
+        self.avg_entry = (self.shares * self.avg_entry + total_usdc) / new_total;
+        self.shares = new_total;
+        0.0
     }
 }
 
@@ -1510,40 +1530,124 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
     }
 }
 
-/// User's BUY/SELL on [`ClobTrade::asset_id`] from L2 `GET /data/trades`.
-///
-/// Top-level `side` is the **taker's** side ([`methods-l2`](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
-/// When `trader_side` is MAKER, prefer [`ClobMakerOrder::side`] on the leg whose `asset_id` matches
-/// this trade row (same as WebSocket `maker_orders[].side`).
-fn user_fill_side_from_clob_trade(t: &ClobTrade) -> Option<Side> {
-    let taker_side = parse_clob_side(&t.side)?;
-    let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
-    let is_maker = matches!(role.as_deref(), Some("MAKER") | Some("M"));
+/// Which [`ClobMakerOrder`] row describes **this** REST trade row (`asset_id` + maker role).
+fn maker_leg_for_trade_row(t: &ClobTrade) -> Option<&ClobMakerOrder> {
+    let is_maker = matches!(
+        t.trader_side
+            .as_deref()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .as_deref(),
+        Some("MAKER") | Some("M")
+    );
     if !is_maker {
-        return Some(taker_side);
+        return None;
     }
     for mo in &t.maker_orders {
         let aid = mo.asset_id.as_deref().filter(|s| !s.is_empty());
-        let asset_match = aid.is_some_and(|a| clob_asset_ids_match(a, &t.asset_id));
-        if asset_match {
-            if let Some(ref s) = mo.side {
-                if let Some(ps) = parse_clob_side(s) {
-                    return Some(ps);
+        if aid.is_some_and(|a| clob_asset_ids_match(a, &t.asset_id)) {
+            return Some(mo);
+        }
+    }
+    if t.maker_orders.len() == 1 {
+        return t.maker_orders.first();
+    }
+    None
+}
+
+/// Taker (or role unknown) row, not the maker leg.
+fn trade_row_is_not_maker(t: &ClobTrade) -> bool {
+    !matches!(
+        t.trader_side
+            .as_deref()
+            .map(|s| s.trim().to_ascii_uppercase())
+            .as_deref(),
+        Some("MAKER") | Some("M")
+    )
+}
+
+/// Apply one REST-replayed fill. Taker **BUY** with both `makingAmount` and `takingAmount` uses
+/// reported USDC for cost basis so `avg_entry` / uPnL match the exchange; otherwise [`Position::apply_fill`].
+/// Returns realized PnL and the `price` to store on the [`Fill`] row (USDC per share for the buy-usdc path).
+fn hydrate_apply_position_fill(
+    pos: &mut Position,
+    t: &ClobTrade,
+    side: Side,
+    qty: f64,
+    price: f64,
+) -> (f64, f64) {
+    if side == Side::Buy && trade_row_is_not_maker(t) {
+        let mk = t.making_amount.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let tk = t.taking_amount.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        if let (Some(mk_s), Some(tk_s)) = (mk, tk) {
+            if let (Ok(usdc), Ok(share_amt)) = (mk_s.parse::<f64>(), tk_s.parse::<f64>()) {
+                if usdc.is_finite() && usdc > 0.0 && share_amt.is_finite() && share_amt > 0.0 {
+                    let tol = f64::max(1e-6, 1e-4 * qty.max(share_amt).max(1.0));
+                    if (share_amt - qty).abs() <= tol {
+                        let r = pos.apply_buy_with_total_usdc(qty, usdc);
+                        let fill_px = (usdc / qty).max(1e-12);
+                        return (r, fill_px);
+                    }
                 }
             }
         }
     }
-    if t.maker_orders.len() == 1 {
-        if let Some(ref s) = t.maker_orders[0].side {
-            if let Some(ps) = parse_clob_side(s) {
-                return Some(ps);
-            }
-        }
+    (pos.apply_fill(side, qty, price), price)
+}
+
+/// Side, shares, and price **for the authenticated user** on this `GET /data/trades` row.
+///
+/// When you are **MAKER**, your fill is [`ClobMakerOrder::matched_amount`] on the leg for this
+/// [`ClobTrade::asset_id`], not top-level `size`. When you are **TAKER**, prefer `takingAmount` /
+/// `makingAmount` (same as [`PostOrderResponse`]) for share count; `size` alone can disagree.
+/// ([L2 getTrades](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
+fn rest_trade_user_fill(t: &ClobTrade) -> Option<(Side, f64, f64)> {
+    let taker_side = parse_clob_side(&t.side)?;
+    let Ok(price_top) = t.price.parse::<f64>() else {
+        return None;
+    };
+    if !price_top.is_finite() || price_top <= 0.0 {
+        return None;
     }
-    Some(match taker_side {
+
+    let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+    let is_maker = matches!(role.as_deref(), Some("MAKER") | Some("M"));
+
+    if !is_maker {
+        let qty = taker_trade_fill_shares(t, taker_side)?;
+        return Some((taker_side, qty, price_top));
+    }
+
+    if let Some(leg) = maker_leg_for_trade_row(t) {
+        let side = leg
+            .side
+            .as_deref()
+            .and_then(parse_clob_side)
+            .unwrap_or_else(|| match taker_side {
+                Side::Buy => Side::Sell,
+                Side::Sell => Side::Buy,
+            });
+        let amt = leg.matched_amount.trim();
+        let qty = amt.parse::<f64>().ok()?;
+        if !qty.is_finite() || qty <= 0.0 {
+            return None;
+        }
+        let px = match leg.price.as_ref().and_then(|s| s.trim().parse::<f64>().ok()) {
+            Some(p) if p.is_finite() && p > 0.0 => p,
+            _ => price_top,
+        };
+        return Some((side, qty, px));
+    }
+
+    // Legacy / sparse payloads: no maker leg — fall back to inverted taker + top `size` (best effort).
+    let qty = t.size.parse::<f64>().ok()?;
+    if !qty.is_finite() || qty <= 0.0 {
+        return None;
+    }
+    let side = match taker_side {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
-    })
+    };
+    Some((side, qty, price_top))
 }
 
 fn parse_trade_timestamp(s: &str) -> DateTime<Utc> {
@@ -1760,32 +1864,24 @@ pub fn hydrate_positions_from_trades(
         } else {
             Outcome::Down
         };
-        let Some(side) = user_fill_side_from_clob_trade(t) else {
-            debug!(id = %t.id, side = %t.side, "skip trade with unknown side");
-            continue;
-        };
-        let Ok(qty) = t.size.parse::<f64>() else {
-            debug!(id = %t.id, "skip trade with bad size");
-            continue;
-        };
-        let Ok(price) = t.price.parse::<f64>() else {
-            debug!(id = %t.id, "skip trade with bad price");
+        let Some((side, qty, price)) = rest_trade_user_fill(t) else {
+            debug!(id = %t.id, side = %t.side, "skip trade: bad side/qty/price for REST row");
             continue;
         };
         if !qty.is_finite() || qty <= 0.0 || !price.is_finite() {
             continue;
         }
         let ts = parse_trade_timestamp(&t.match_time);
-        let realized = match outcome {
-            Outcome::Up => up.apply_fill(side, qty, price),
-            Outcome::Down => down.apply_fill(side, qty, price),
+        let (realized, fill_price) = match outcome {
+            Outcome::Up => hydrate_apply_position_fill(&mut up, t, side, qty, price),
+            Outcome::Down => hydrate_apply_position_fill(&mut down, t, side, qty, price),
         };
         fills_chrono.push(Fill {
             ts,
             side,
             outcome,
             qty,
-            price,
+            price: fill_price,
             realized,
             clob_trade_id: if t.id.is_empty() {
                 None
@@ -1956,10 +2052,12 @@ mod tests {
             maker_orders: vec![],
             // `hydrate_positions_from_trades` only replays fills with a known role (matches CLOB user rows).
             trader_side: Some("TAKER".into()),
+            making_amount: None,
+            taking_amount: None,
         }
     }
 
-    /// REST replay: `maker_orders[].side` is the maker's side on that token (L2 `getTrades`).
+    /// REST replay: `maker_orders[].side` + **`matched_amount`** (not top-level `size`, which is taker).
     #[test]
     fn hydrate_maker_prefers_maker_order_side() {
         let up = "111";
@@ -1967,7 +2065,7 @@ mod tests {
             id: "1".into(),
             asset_id: up.to_string(),
             side: "SELL".into(),
-            size: "10".into(),
+            size: "9999".into(),
             price: "0.5".into(),
             match_time: "0".into(),
             status: None,
@@ -1977,13 +2075,71 @@ mod tests {
                 matched_amount: "10".into(),
                 asset_id: Some(up.to_string()),
                 side: Some("BUY".into()),
+                price: None,
             }],
             trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
         };
         let (pu, _, fills) =
             hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
-        assert!(fills.iter().all(|f| f.side == Side::Buy), "fills={:?}", fills);
+        assert!(fills.iter().all(|f| f.side == Side::Buy && (f.qty - 10.0).abs() < 1e-6), "fills={:?}", fills);
+    }
+
+    #[test]
+    fn hydrate_maker_uses_leg_price_when_present() {
+        let up = "111";
+        let t = ClobTrade {
+            id: "1".into(),
+            asset_id: up.to_string(),
+            side: "BUY".into(),
+            size: "100".into(),
+            price: "0.50".into(),
+            match_time: "0".into(),
+            status: None,
+            taker_order_id: None,
+            maker_orders: vec![ClobMakerOrder {
+                order_id: "o1".into(),
+                matched_amount: "4".into(),
+                asset_id: Some(up.to_string()),
+                side: Some("SELL".into()),
+                price: Some("0.48".into()),
+            }],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let (_, _, fills) =
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+        let f = &fills[0];
+        assert!((f.qty - 4.0).abs() < 1e-9);
+        assert!((f.price - 0.48).abs() < 1e-9);
+    }
+
+    /// REST: as taker on BUY, `size` can disagree with true share count; `takingAmount` matches postOrder.
+    #[test]
+    fn hydrate_taker_buy_prefers_taking_amount() {
+        let up = "111";
+        let t = ClobTrade {
+            id: "1".into(),
+            asset_id: up.to_string(),
+            side: "BUY".into(),
+            size: "2.5".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            status: None,
+            taker_order_id: None,
+            maker_orders: vec![],
+            trader_side: Some("TAKER".into()),
+            making_amount: Some("5.40".into()),
+            taking_amount: Some("10".into()),
+        };
+        let (pu, _, fills) =
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+        assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
+        assert!((pu.avg_entry - 0.54).abs() < 1e-6, "avg_entry={}", pu.avg_entry);
+        assert!(fills.iter().all(|f| (f.qty - 10.0).abs() < 1e-6 && (f.price - 0.54).abs() < 1e-6), "fills={:?}", fills);
     }
 
     #[test]

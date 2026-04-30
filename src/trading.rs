@@ -332,6 +332,9 @@ pub struct ClobMakerOrder {
     /// **Maker's** order side on that token ([L2 docs](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
     #[serde(default)]
     pub side: Option<String>,
+    /// Match price for this leg (string decimal); falls back to trade-level `price` if absent.
+    #[serde(default)]
+    pub price: Option<String>,
 }
 
 /// Polymarket `clob-client-v2` `GET /data/trades` — one row per user fill (L2 auth).
@@ -360,6 +363,13 @@ pub struct ClobTrade {
     /// `"TAKER"` | `"MAKER"` — disambiguates which leg to use with `order_id`.
     #[serde(default, rename = "trader_side", alias = "traderSide")]
     pub trader_side: Option<String>,
+    /// Polymarket L2 `Trade` — same semantics as [`PostOrderResponse`]: for the **taker**,
+    /// `takingAmount` is often the outcome **shares** on BUY, `makingAmount` on SELL. Top-level
+    /// `size` can still reflect a different unit.
+    #[serde(default, rename = "makingAmount", alias = "making_amount")]
+    pub making_amount: Option<String>,
+    #[serde(default, rename = "takingAmount", alias = "taking_amount")]
+    pub taking_amount: Option<String>,
 }
 
 impl ClobTrade {
@@ -371,6 +381,28 @@ impl ClobTrade {
             None | Some("MATCHED") | Some("CONFIRMED") | Some("MINED")
         )
     }
+}
+
+/// Share quantity when this row’s [`ClobTrade::side`] is the **taker’s** side on `asset_id`.
+/// Aligns with [`PostOrderResponse`]: **BUY** → `takingAmount` (outcome shares), **SELL** → `makingAmount` (shares);
+/// falls back to top-level `size` when those are absent.
+pub fn taker_trade_fill_shares(t: &ClobTrade, taker_side: Side) -> Option<f64> {
+    let prefer = match taker_side {
+        Side::Buy => t.taking_amount.as_deref(),
+        Side::Sell => t.making_amount.as_deref(),
+    };
+    if let Some(s) = prefer {
+        let s = s.trim();
+        if !s.is_empty() {
+            if let Ok(q) = s.parse::<f64>() {
+                if q.is_finite() && q > 0.0 {
+                    return Some(q);
+                }
+            }
+        }
+    }
+    let q = t.size.parse::<f64>().ok()?;
+    (q.is_finite() && q > 0.0).then_some(q)
 }
 
 #[derive(Debug, Deserialize)]
@@ -976,8 +1008,8 @@ fn buy_fill_shares_from_trades_for_order(
             Some("TAKER") => {
                 if let Some(ref toid) = t.taker_order_id {
                     if order_ids_match(toid, buy_order_id) {
-                        if let Ok(sz) = t.size.parse::<f64>() {
-                            if sz.is_finite() && sz > 0.0 {
+                        if let Some(side) = parse_clob_side_str(&t.side) {
+                            if let Some(sz) = taker_trade_fill_shares(t, side) {
                                 sum += sz;
                             }
                         }
@@ -1003,8 +1035,8 @@ fn buy_fill_shares_from_trades_for_order(
                 let mut matched_taker = false;
                 if let Some(ref toid) = t.taker_order_id {
                     if order_ids_match(toid, buy_order_id) {
-                        if let Ok(sz) = t.size.parse::<f64>() {
-                            if sz.is_finite() && sz > 0.0 {
+                        if let Some(side) = parse_clob_side_str(&t.side) {
+                            if let Some(sz) = taker_trade_fill_shares(t, side) {
                                 sum += sz;
                                 matched_taker = true;
                             }
@@ -1043,12 +1075,20 @@ fn net_shares_on_token_from_trades(trades: &[ClobTrade], token_id: &str) -> f64 
         let Some(side) = parse_clob_side_str(&t.side) else {
             continue;
         };
-        let Ok(qty) = t.size.parse::<f64>() else {
+        let role = t.trader_side.as_deref().map(|s| s.trim().to_ascii_uppercase());
+        let qty = if matches!(role.as_deref(), Some("MAKER") | Some("M")) {
+            let Ok(qty) = t.size.parse::<f64>() else {
+                continue;
+            };
+            if !qty.is_finite() || qty <= 0.0 {
+                continue;
+            }
+            qty
+        } else if let Some(q) = taker_trade_fill_shares(t, side) {
+            q
+        } else {
             continue;
         };
-        if !qty.is_finite() || qty <= 0.0 {
-            continue;
-        }
         match side {
             Side::Buy => sh += qty,
             Side::Sell => sh -= qty,
@@ -2856,6 +2896,8 @@ mod take_profit_reconcile_tests {
             taker_order_id: None,
             maker_orders: vec![],
             trader_side: None,
+            making_amount: None,
+            taking_amount: None,
         }
     }
 
@@ -2909,6 +2951,27 @@ mod buy_fill_order_id_tests {
     }
 
     #[test]
+    fn taker_buy_fill_uses_taking_amount_over_size() {
+        let oid = "0xdeadbeef";
+        let trades = vec![ClobTrade {
+            id: "t1".into(),
+            asset_id: "tok1".into(),
+            side: "BUY".into(),
+            size: "2.5".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            status: None,
+            taker_order_id: Some(oid.to_string()),
+            maker_orders: vec![],
+            trader_side: Some("TAKER".into()),
+            making_amount: None,
+            taking_amount: Some("10".into()),
+        }];
+        let f = buy_fill_shares_from_trades_for_order(&trades, oid, "tok1").unwrap();
+        assert!((f - 10.0).abs() < 1e-9);
+    }
+
+    #[test]
     fn taker_buy_fill_by_taker_order_id() {
         let oid = "0xdeadbeef";
         let trades = vec![ClobTrade {
@@ -2922,6 +2985,8 @@ mod buy_fill_order_id_tests {
             taker_order_id: Some(oid.to_string()),
             maker_orders: vec![],
             trader_side: Some("TAKER".into()),
+            making_amount: None,
+            taking_amount: None,
         }];
         let f = buy_fill_shares_from_trades_for_order(&trades, oid, "tok1").unwrap();
         assert!((f - 5.25).abs() < 1e-9);
@@ -2945,6 +3010,8 @@ mod buy_fill_order_id_tests {
                 ..Default::default()
             }],
             trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
         }];
         let f = buy_fill_shares_from_trades_for_order(&trades, oid, "tok1").unwrap();
         assert!((f - 3.5).abs() < 1e-9);
@@ -2963,6 +3030,8 @@ mod buy_fill_order_id_tests {
             taker_order_id: Some("other".into()),
             maker_orders: vec![],
             trader_side: Some("TAKER".into()),
+            making_amount: None,
+            taking_amount: None,
         }];
         assert!(buy_fill_shares_from_trades_for_order(&trades, "want-this", "tok1").is_none());
     }
