@@ -554,6 +554,8 @@ pub struct UserChannelTradeFill {
     pub qty:           f64,
     pub price:         f64,
     pub match_ts:      DateTime<Utc>,
+    /// `trader_side == MAKER` on the user-channel row (resting fill vs aggressive / FAK).
+    pub from_maker_leg: bool,
 }
 
 /// Parse a user-channel `trade` object for [`UserChannelTradeFill`].
@@ -729,6 +731,7 @@ pub fn try_parse_user_channel_trade(
         qty,
         price,
         match_ts: ts,
+        from_maker_leg: is_maker,
     })
 }
 

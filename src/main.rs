@@ -1182,6 +1182,8 @@ async fn main() -> Result<()> {
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
     let data_api_user = cfg.funder;
+    let buy_trail_bps_supervisor = cfg.market_buy_trail_bps;
+    let buy_trail_activation_bps_supervisor = cfg.market_buy_take_profit_bps;
     let user_open_ledger = std::sync::Arc::new(feeds::clob_user_ws::UserOpenOrdersLedger::new());
     let user_trade_sync = std::sync::Arc::new(feeds::user_trade_sync::UserTradeSync::new());
     // Supervisor moves a clone; `user_open_ledger` / `user_trade_sync` stay in `main` for TUI.
@@ -1248,7 +1250,13 @@ async fn main() -> Result<()> {
                     let extra = book_token_rx_supervisor.borrow().clone();
                     let merged = merge_ui_and_extra_book_tokens(&ui_book_tokens, &extra);
                     restart_book_ws(&merged, &mut book_handle);
-                    let _ = tx_for_books.send(AppEvent::MarketRoll(m.clone())).await;
+                    let _ = tx_for_books
+                        .send(AppEvent::MarketRoll {
+                            market:                   m.clone(),
+                            buy_trail_bps:            buy_trail_bps_supervisor,
+                            buy_trail_activation_bps: buy_trail_activation_bps_supervisor,
+                        })
+                        .await;
 
             let t = trading_for_positions.clone();
             let txp = tx_for_books.clone();
@@ -2018,8 +2026,8 @@ fn dispatch_action(
                 OrderType::Gtd,
                 buy_notional,
                 exp_secs,
-                0,
-                0,
+                cfg.market_buy_take_profit_bps,
+                cfg.market_buy_trail_bps,
                 false,
             );
         }
@@ -2328,38 +2336,25 @@ fn spawn_order(
 
                     if trail_bps > 0
                         && matches!(side, Side::Buy)
-                        && otype == OrderType::Fak
+                        && matches!(otype, OrderType::Fak | OrderType::Gtd)
                     {
                         if price >= 0.99 {
                             info!(
                                 limit_price = price,
                                 outcome = ?outcome,
-                                "trailing: skipped — market FAK limit price >= 0.99",
+                                order_type = ?otype,
+                                "trailing: skipped — BUY limit price >= 0.99",
                             );
-                        } else {
-                            let Some((plan_sell_sh, entry_px, _amounts_from_api)) =
-                                resp.take_profit_fill_for_market_buy(shares, price)
-                            else {
-                                info!(
-                                    outcome = ?outcome,
-                                    success = resp.success,
-                                    status = ?resp.status,
-                                    "trailing: skipped — could not estimate fill",
-                                );
-                                let _ = tx
-                                    .send(AppEvent::StatusInfo(
-                                        "trailing skipped: no fill estimate (unexpected for FAK)"
-                                            .into(),
-                                    ))
-                                    .await;
-                                return;
-                            };
+                        } else if let Some((plan_sell_sh, entry_px, _amounts_from_api)) =
+                            resp.take_profit_fill_for_market_buy(shares, price)
+                        {
                             info!(
                                 trail_bps,
                                 take_profit_bps,
                                 entry_px,
                                 outcome = ?outcome,
-                                "trailing: market BUY ok; arming when bid >= entry×(1+TP bps) (position avg or fill est.)"
+                                order_type = ?otype,
+                                "trailing: BUY matched; arming when bid >= entry×(1+TP bps) (position avg or fill est.)"
                             );
                             let token_id = match outcome {
                                 Outcome::Up => up_token.clone(),
@@ -2411,6 +2406,14 @@ fn spawn_order(
                                     market:      market_for_refresh.clone(),
                                 })
                                 .await;
+                        } else {
+                            debug!(
+                                outcome = ?outcome,
+                                order_type = ?otype,
+                                success = resp.success,
+                                status = ?resp.status,
+                                "trailing: BUY resting or no fill in POST response — will arm on maker fill (WSS) if configured",
+                            );
                         }
                     }
                 } else {

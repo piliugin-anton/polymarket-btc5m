@@ -65,7 +65,10 @@ pub struct Config {
     /// (`avg_entry`) or the fill estimate until the position is applied (`0` = arm as soon as bid
     /// reaches entry).
     pub market_buy_take_profit_bps: u32,
-    /// If positive after a market **Buy** (FAK), run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak.
+    /// If positive after a **Buy** (FAK market or GTD limit when the POST response includes a fill),
+    /// run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak. Resting
+    /// limit buys arm the same trail when the fill arrives on the user channel as a **maker** leg
+    /// (`MARKET_BUY_TRAIL_BPS` + values from the last market roll).
     pub market_buy_trail_bps: u32,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,

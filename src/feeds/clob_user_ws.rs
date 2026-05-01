@@ -595,6 +595,7 @@ async fn run_session(
                                     qty:           f.qty,
                                     price:         f.price,
                                     ts:            f.match_ts,
+                                    from_maker_leg: f.from_maker_leg,
                                 })
                                 .await;
                         }

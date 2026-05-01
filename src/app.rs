@@ -83,7 +83,12 @@ pub enum AppEvent {
     Tick,                         // 1-Hz clock
     Price(PriceTick),
     Book(BookSnapshot),
-    MarketRoll(ActiveMarket),
+    /// New active market + buy-side trail settings (from env at roll; used for maker WSS fills).
+    MarketRoll {
+        market:                   ActiveMarket,
+        buy_trail_bps:            u32,
+        buy_trail_activation_bps: u32,
+    },
     /// Same slug as the active market — Polymarket crypto-price / Gamma refined `price_to_beat` (e.g. after a window roll). Must not trigger a full roll (positions would reset).
     PriceToBeatRefresh { slug: String, price_to_beat: Option<f64> },
     /// CLOB positions for the current market: balances + cost basis replayed from `GET /data/trades`.
@@ -106,6 +111,8 @@ pub enum AppEvent {
         qty:              f64,
         price:            f64,
         ts:               DateTime<Utc>,
+        /// `trader_side == MAKER` on the user-channel trade — resting limit fills (vs taker / FAK).
+        from_maker_leg: bool,
     },
     /// Resting orders for the active market (`GET /data/orders`).
     OpenOrdersLoaded { orders: Vec<OpenOrderRow> },
@@ -469,6 +476,9 @@ pub struct AppState {
     /// Cached result of `collect_book_watch_token_ids` — updated on every `apply()` call so
     /// `send_book_watch_if_changed` in `main.rs` can read it without recomputing.
     pub cached_book_watch_tokens: Vec<String>,
+    /// Last [`AppEvent::MarketRoll`] — arms trailing on **maker** user-channel BUY fills (resting limits).
+    pub buy_trail_bps:            u32,
+    pub buy_trail_activation_bps: u32,
 }
 
 impl AppState {
@@ -513,7 +523,65 @@ impl AppState {
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
             cached_book_watch_tokens: Vec::new(),
+            buy_trail_bps:            0,
+            buy_trail_activation_bps: 0,
         }
+    }
+
+    /// Merge a pending trailing arm (same rules as [`AppEvent::RequestTrailingArm`]).
+    fn merge_pending_trailing_buy_arm(
+        &mut self,
+        outcome:         Outcome,
+        entry_price:     f64,
+        plan_sell_shares: f64,
+        token_id:        String,
+        trail_bps:       u32,
+        activation_bps:  u32,
+        market:          ActiveMarket,
+    ) {
+        let token_id = canonical_clob_token_id(&token_id).into_owned();
+        if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
+            return;
+        }
+        let tid = token_id.clone();
+        let entry_key = pending_trail_map_key_for_asset(&self.pending_trail_arms, tid.as_str())
+            .unwrap_or_else(|| tid.clone());
+        match self.pending_trail_arms.entry(entry_key) {
+            Entry::Occupied(mut e) => {
+                let p = e.get_mut();
+                let add_plan = plan_sell_shares;
+                let add_entry = entry_price;
+                if add_plan > 1e-9 && add_entry.is_finite() && add_entry > 0.0 {
+                    let old_plan = p.plan_sell_shares;
+                    let old_entry = p.entry_price;
+                    let new_plan = old_plan + add_plan;
+                    if new_plan > 1e-9 {
+                        p.plan_sell_shares = new_plan;
+                        if old_plan > 1e-9 && old_entry.is_finite() && old_entry > 0.0 {
+                            p.entry_price = (old_plan * old_entry + add_plan * add_entry) / new_plan;
+                        } else {
+                            p.entry_price = add_entry;
+                        }
+                    }
+                }
+            }
+            Entry::Vacant(e) => {
+                e.insert(PendingTrailArm {
+                    market,
+                    outcome,
+                    entry_price,
+                    plan_sell_shares,
+                    token_id,
+                    trail_bps,
+                    activation_bps,
+                });
+            }
+        }
+        self.status_line = format!(
+            "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
+            outcome.as_str()
+        );
+        self.try_promote_pending_trail_any(tid.as_str());
     }
 
     /// True if `token_id` already has a queued trailing exit or an in-flight FAK SELL.
@@ -1047,7 +1115,11 @@ impl AppState {
                 }
                 self.recompute_sentiment();
             }
-            AppEvent::MarketRoll(m) => {
+            AppEvent::MarketRoll {
+                market,
+                buy_trail_bps,
+                buy_trail_activation_bps,
+            } => {
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
@@ -1055,9 +1127,11 @@ impl AppState {
                 // Deposit modal (`f`) stays open across rolls.
                 self.input_mode = InputMode::Normal;
                 self.order_error_toast = None;
-                self.status_line = format!("New market: {}", m.question);
+                self.status_line = format!("New market: {}", market.question);
                 self.latched_price_to_beat = None;
-                self.market = Some(m);
+                self.market = Some(market);
+                self.buy_trail_bps = buy_trail_bps;
+                self.buy_trail_activation_bps = buy_trail_activation_bps;
                 self.book_up = None; self.book_down = None;
                 self.position_up = Default::default();
                 self.position_down = Default::default();
@@ -1164,6 +1238,7 @@ impl AppState {
                 qty,
                 price,
                 ts,
+                from_maker_leg,
             } => {
                 // Event-loop de-dupe guards — run here (sequentially with OrderAck) to close two
                 // races that the WS-task pre-check in `before_ws_user_fill_apply` cannot prevent:
@@ -1212,6 +1287,26 @@ impl AppState {
                         trim_fills_to_cap(&mut self.fills, 64);
                     }
                     self.reconcile_position_shares_with_fill_deque(ui_oc);
+                    if matches!(side, Side::Buy)
+                        && from_maker_leg
+                        && self.buy_trail_bps > 0
+                        && qty > 1e-12
+                        && price.is_finite()
+                        && price > 0.0
+                        && price < 0.99
+                    {
+                        if let Some(m) = self.market.clone() {
+                            self.merge_pending_trailing_buy_arm(
+                                ui_oc,
+                                price,
+                                qty,
+                                token_id.clone(),
+                                self.buy_trail_bps,
+                                self.buy_trail_activation_bps,
+                                m,
+                            );
+                        }
+                    }
                     self.user_trade_sync
                         .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
                         .await;
@@ -1304,53 +1399,18 @@ impl AppState {
                 activation_bps,
                 market,
             } => {
-                let token_id = canonical_clob_token_id(&token_id).into_owned();
                 if trail_bps == 0 || !plan_sell_shares.is_finite() || plan_sell_shares <= 0.0 {
                     // Misconfiguration — main should not send; ignore.
                 } else {
-                    let tid = token_id.clone();
-                    let entry_key = pending_trail_map_key_for_asset(&self.pending_trail_arms, tid.as_str())
-                        .unwrap_or_else(|| tid.clone());
-                    match self.pending_trail_arms.entry(entry_key) {
-                        Entry::Occupied(mut e) => {
-                            let p = e.get_mut();
-                            let add_plan = plan_sell_shares;
-                            let add_entry = entry_price;
-                            if add_plan > 1e-9 && add_entry.is_finite() && add_entry > 0.0 {
-                                let old_plan = p.plan_sell_shares;
-                                let old_entry = p.entry_price;
-                                let new_plan = old_plan + add_plan;
-                                if new_plan > 1e-9 {
-                                    p.plan_sell_shares = new_plan;
-                                    if old_plan > 1e-9
-                                        && old_entry.is_finite()
-                                        && old_entry > 0.0
-                                    {
-                                        p.entry_price =
-                                            (old_plan * old_entry + add_plan * add_entry) / new_plan;
-                                    } else {
-                                        p.entry_price = add_entry;
-                                    }
-                                }
-                            }
-                        }
-                        Entry::Vacant(e) => {
-                            e.insert(PendingTrailArm {
-                                market,
-                                outcome,
-                                entry_price,
-                                plan_sell_shares,
-                                token_id,
-                                trail_bps,
-                                activation_bps,
-                            });
-                        }
-                    }
-                    self.status_line = format!(
-                        "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
-                        outcome.as_str()
+                    self.merge_pending_trailing_buy_arm(
+                        outcome,
+                        entry_price,
+                        plan_sell_shares,
+                        token_id,
+                        trail_bps,
+                        activation_bps,
+                        market,
                     );
-                    self.try_promote_pending_trail_any(tid.as_str());
                 }
             }
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
@@ -1427,6 +1487,8 @@ impl AppState {
                 self.cached_pair_label = format!("{}/USD", p.asset.label);
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.cached_countdown_secs = None;
+                self.buy_trail_bps = 0;
+                self.buy_trail_activation_bps = 0;
             }
             AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
