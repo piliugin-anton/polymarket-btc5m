@@ -1319,6 +1319,7 @@ async fn main() -> Result<()> {
                     debug!(error = %e, market = %condition_id, "fetch /data/trades failed; avg entry unknown");
                     vec![]
                 });
+                let api_key = cli.l2_api_key().await;
                 let (position_up, position_down, fills_bootstrap) = hydrate_positions_from_trades(
                     &trades,
                     &up_id,
@@ -1329,6 +1330,8 @@ async fn main() -> Result<()> {
                     escrow_down,
                     data_api_up,
                     data_api_down,
+                    &oo_raw,
+                    api_key.as_deref(),
                 );
                 // Bootstrap fills + trade IDs from `GET /data/trades` so UI shows history after
                 // restart; [`UserTradeSync::seed_seen_trades_from_rest`] dedupes user-channel replay.

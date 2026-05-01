@@ -22,8 +22,8 @@ use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
 use crate::trailing_stop::{Activation, Side as TrailSide, TickOutcome, TrailSpec, TrailingStop};
 use crate::trading::{
-    canonical_clob_token_id, clob_asset_ids_match, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade,
-    OrderType, Side,
+    canonical_clob_token_id, clob_asset_ids_match, norm_clob_owner, norm_order_id_key,
+    parse_clob_side_str, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade, OrderType, Side,
 };
 use tracing::debug;
 
@@ -1530,6 +1530,40 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
     }
 }
 
+/// `GET /data/orders` snapshot for REST hydration: prefer **your** resting order's `side` and
+/// `asset_id` over trade-row noise (same idea as user-channel [`try_parse_user_channel_trade`]).
+#[derive(Debug, Clone, Default)]
+pub struct HydrateOrderSnap {
+    /// [`norm_order_id_key`] for each open order id.
+    pub known_order_keys: HashSet<String>,
+    pub side_by_norm_id:  HashMap<String, Side>,
+    pub asset_by_norm_id: HashMap<String, String>,
+}
+
+impl HydrateOrderSnap {
+    pub fn from_open_orders(rows: &[ClobOpenOrder]) -> Self {
+        let mut known_order_keys = HashSet::new();
+        let mut side_by_norm_id = HashMap::new();
+        let mut asset_by_norm_id = HashMap::new();
+        for o in rows {
+            let k = norm_order_id_key(&o.id);
+            if k.is_empty() {
+                continue;
+            }
+            known_order_keys.insert(k.clone());
+            if let Some(s) = parse_clob_side_str(&o.side) {
+                side_by_norm_id.insert(k.clone(), s);
+            }
+            asset_by_norm_id.insert(k, o.asset_id.clone());
+        }
+        Self {
+            known_order_keys,
+            side_by_norm_id,
+            asset_by_norm_id,
+        }
+    }
+}
+
 /// Effective outcome-token id for one [`ClobMakerOrder`] leg (falls back to trade-level [`ClobTrade::asset_id`]).
 fn eff_maker_leg_asset<'a>(t: &'a ClobTrade, mo: &'a ClobMakerOrder) -> &'a str {
     mo.asset_id
@@ -1540,14 +1574,16 @@ fn eff_maker_leg_asset<'a>(t: &'a ClobTrade, mo: &'a ClobMakerOrder) -> &'a str 
 }
 
 /// Picks the authenticated user's maker leg when `GET /data/trades` includes **multiple**
-/// `maker_orders` (same aggregate match). The first leg matching only top-level `asset_id` can be
-/// another participant on the **other** outcome token; we narrow by the UI market's UP/DOWN ids
-/// and, when still ambiguous, prefer the **unique** leg whose token differs from top-level
+/// `maker_orders` (same aggregate match). Prefer a leg whose [`ClobMakerOrder::order_id`] is still in
+/// [`HydrateOrderSnap::known_order_keys`] (from `GET /data/orders`), then a unique [`ClobMakerOrder::owner`]
+/// matching the authenticated L2 `apiKey`, then the **unique** leg whose token differs from top-level
 /// `asset_id` (observed when the row's `asset_id` is one outcome but the user's fill is on the sibling).
 fn maker_leg_for_trade_row<'a>(
     t: &'a ClobTrade,
     up_token_id: &str,
     down_token_id: &str,
+    order_snap: &HydrateOrderSnap,
+    clob_api_key: Option<&str>,
 ) -> Option<&'a ClobMakerOrder> {
     let is_maker = matches!(
         t.trader_side
@@ -1580,6 +1616,37 @@ fn maker_leg_for_trade_row<'a>(
             return t.maker_orders.first();
         }
         return None;
+    }
+
+    let ledger_hits: Vec<&ClobMakerOrder> = candidates
+        .iter()
+        .copied()
+        .filter(|mo| {
+            let nk = norm_order_id_key(&mo.order_id);
+            !nk.is_empty() && order_snap.known_order_keys.contains(&nk)
+        })
+        .collect();
+    if ledger_hits.len() == 1 {
+        return Some(ledger_hits[0]);
+    }
+
+    if let Some(key) = clob_api_key.map(str::trim).filter(|s| !s.is_empty()) {
+        let want = norm_clob_owner(key);
+        let owner_hits: Vec<&ClobMakerOrder> = candidates
+            .iter()
+            .copied()
+            .filter(|mo| {
+                mo.owner
+                    .as_deref()
+                    .map(norm_clob_owner)
+                    .as_ref()
+                    .map(|w| w == &want)
+                    .unwrap_or(false)
+            })
+            .collect();
+        if owner_hits.len() == 1 {
+            return Some(owner_hits[0]);
+        }
     }
 
     if candidates.len() == 1 {
@@ -1670,8 +1737,10 @@ fn rest_maker_side_sanitize_taker_echo(taker_side: Side, resolved: Side) -> Side
 
 /// Side, shares, and price **for the authenticated user** on this `GET /data/trades` row.
 ///
-/// When you are **MAKER**, your fill is [`ClobMakerOrder::matched_amount`] on the leg for this
-/// [`ClobTrade::asset_id`], not top-level `size`. When you are **TAKER**, prefer `takingAmount` /
+/// When you are **MAKER**, share count is [`ClobMakerOrder::matched_amount`] on the **resolved** maker
+/// leg only. **Side** and outcome **token** prefer [`HydrateOrderSnap`] from `GET /data/orders` when
+/// the leg's `order_id` matches an open order (same as user-channel ledger). Otherwise use the leg +
+/// [`rest_maker_side_sanitize_taker_echo`]. When you are **TAKER**, prefer `takingAmount` /
 /// `makingAmount` (same as [`PostOrderResponse`]) for share count; `size` alone can disagree.
 /// ([L2 getTrades](https://docs.polymarket.com/developers/CLOB/clients/methods-l2)).
 /// When `Some`, use that string (leg token) for [`Outcome`] mapping instead of top-level [`ClobTrade::asset_id`].
@@ -1679,8 +1748,10 @@ fn rest_trade_user_fill(
     t: &ClobTrade,
     up_token_id: &str,
     down_token_id: &str,
+    order_snap: &HydrateOrderSnap,
+    clob_api_key: Option<&str>,
 ) -> Option<(Side, f64, f64, Option<String>)> {
-    let taker_side = parse_clob_side(&t.side)?;
+    let taker_side_row = parse_clob_side(&t.side)?;
     let Ok(price_top) = t.price.parse::<f64>() else {
         return None;
     };
@@ -1692,27 +1763,41 @@ fn rest_trade_user_fill(
     let is_maker = matches!(role.as_deref(), Some("MAKER") | Some("M"));
 
     if !is_maker {
+        let nk = t
+            .taker_order_id
+            .as_deref()
+            .map(norm_order_id_key)
+            .filter(|k| !k.is_empty());
+        let mut taker_side = taker_side_row;
+        if let Some(ref k) = nk {
+            if let Some(&s) = order_snap.side_by_norm_id.get(k) {
+                taker_side = s;
+            }
+        }
+        let fill_asset = nk.and_then(|k| order_snap.asset_by_norm_id.get(&k).cloned());
         let qty = taker_trade_fill_shares(t, taker_side)?;
-        return Some((taker_side, qty, price_top, None));
+        return Some((taker_side, qty, price_top, fill_asset));
     }
 
-    if let Some(leg) = maker_leg_for_trade_row(t, up_token_id, down_token_id) {
+    if let Some(leg) = maker_leg_for_trade_row(t, up_token_id, down_token_id, order_snap, clob_api_key) {
+        let nk_leg = norm_order_id_key(&leg.order_id);
         let side_from_leg = leg
             .side
             .as_deref()
             .and_then(parse_clob_side)
-            .unwrap_or_else(|| match taker_side {
+            .unwrap_or_else(|| match taker_side_row {
                 Side::Buy => Side::Sell,
                 Side::Sell => Side::Buy,
             });
         let eff_a = eff_maker_leg_asset(t, leg);
-        let side = if clob_asset_ids_match(eff_a, t.asset_id.as_str()) {
-            rest_maker_side_sanitize_taker_echo(taker_side, side_from_leg)
+        let side = if let Some(&s) = order_snap.side_by_norm_id.get(&nk_leg) {
+            s
+        } else if clob_asset_ids_match(eff_a, t.asset_id.as_str()) {
+            rest_maker_side_sanitize_taker_echo(taker_side_row, side_from_leg)
         } else {
             side_from_leg
         };
-        let amt = leg.matched_amount.trim();
-        let qty = amt.parse::<f64>().ok()?;
+        let qty = leg.matched_amount.trim().parse::<f64>().ok()?;
         if !qty.is_finite() || qty <= 0.0 {
             return None;
         }
@@ -1720,8 +1805,12 @@ fn rest_trade_user_fill(
             Some(p) if p.is_finite() && p > 0.0 => p,
             _ => price_top,
         };
-        let eff = eff_maker_leg_asset(t, leg).to_string();
-        return Some((side, qty, px, Some(eff)));
+        let fill_asset = order_snap
+            .asset_by_norm_id
+            .get(&nk_leg)
+            .cloned()
+            .or_else(|| Some(eff_maker_leg_asset(t, leg).to_string()));
+        return Some((side, qty, px, fill_asset));
     }
 
     // Legacy / sparse payloads: no maker leg — fall back to inverted taker + top `size` (best effort).
@@ -1729,7 +1818,7 @@ fn rest_trade_user_fill(
     if !qty.is_finite() || qty <= 0.0 {
         return None;
     }
-    let side = match taker_side {
+    let side = match taker_side_row {
         Side::Buy => Side::Sell,
         Side::Sell => Side::Buy,
     };
@@ -1981,7 +2070,10 @@ pub fn hydrate_positions_from_trades(
     escrow_sell_down: f64,
     data_api_up: Option<(f64, f64)>,
     data_api_down: Option<(f64, f64)>,
+    open_orders: &[ClobOpenOrder],
+    clob_api_key: Option<&str>,
 ) -> (Position, Position, Vec<Fill>) {
+    let order_snap = HydrateOrderSnap::from_open_orders(open_orders);
     let mut indexed: Vec<(DateTime<Utc>, &str, &ClobTrade)> = trades
         .iter()
         .filter(|t| {
@@ -1998,7 +2090,9 @@ pub fn hydrate_positions_from_trades(
     let mut fills_chrono: Vec<Fill> = Vec::new();
 
     for (_, _, t) in indexed {
-        let Some((side, qty, price, fill_asset)) = rest_trade_user_fill(t, up_token_id, down_token_id) else {
+        let Some((side, qty, price, fill_asset)) =
+            rest_trade_user_fill(t, up_token_id, down_token_id, &order_snap, clob_api_key)
+        else {
             debug!(id = %t.id, side = %t.side, "skip trade: bad side/qty/price for REST row");
             continue;
         };
@@ -2236,13 +2330,14 @@ mod tests {
                 asset_id: Some(up.to_string()),
                 side: Some("BUY".into()),
                 price: None,
+                owner: None,
             }],
             trader_side: Some("MAKER".into()),
             making_amount: None,
             taking_amount: None,
         };
         let (pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert!(fills.iter().all(|f| f.side == Side::Buy && (f.qty - 10.0).abs() < 1e-6), "fills={:?}", fills);
     }
@@ -2266,13 +2361,14 @@ mod tests {
                 asset_id: Some(up.to_string()),
                 side: Some("SELL".into()),
                 price: Some("0.55".into()),
+                owner: None,
             }],
             trader_side: Some("MAKER".into()),
             making_amount: None,
             taking_amount: None,
         };
         let (_pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].side, Side::Buy, "fills={:?}", fills);
     }
@@ -2299,6 +2395,7 @@ mod tests {
                     asset_id: Some(up.to_string()),
                     side: Some("SELL".into()),
                     price: Some("0.55".into()),
+                    owner: None,
                 },
                 ClobMakerOrder {
                     order_id: "0xuser_dn".into(),
@@ -2306,6 +2403,7 @@ mod tests {
                     asset_id: Some(down.to_string()),
                     side: Some("BUY".into()),
                     price: Some("0.45".into()),
+                    owner: None,
                 },
             ],
             trader_side: Some("MAKER".into()),
@@ -2313,7 +2411,7 @@ mod tests {
             taking_amount: None,
         };
         let (pu, pd, fills) =
-            hydrate_positions_from_trades(&[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert_eq!(fills.len(), 1, "fills={:?}", fills);
         let f = &fills[0];
         assert_eq!(f.outcome, Outcome::Down, "fills={:?}", fills);
@@ -2321,6 +2419,150 @@ mod tests {
         assert!((f.qty - 5.0).abs() < 1e-9);
         assert!((pd.shares - 5.0).abs() < 1e-9, "pd={:?}", pd);
         assert!(pu.shares.abs() < 1e-9, "pu={:?}", pu);
+    }
+
+    /// `GET /data/orders` row for your maker leg: **side** and **asset** beat bad trade JSON.
+    #[test]
+    fn hydrate_maker_prefers_open_order_side_and_asset_for_multi_leg() {
+        let up = "111";
+        let down = "222";
+        let t = ClobTrade {
+            id: "m2".into(),
+            asset_id: up.to_string(),
+            side: "BUY".into(),
+            size: "100".into(),
+            price: "0.55".into(),
+            match_time: "0".into(),
+            status: Some("MINED".into()),
+            taker_order_id: Some("0xtaker".into()),
+            maker_orders: vec![
+                ClobMakerOrder {
+                    order_id: "0xother_up".into(),
+                    matched_amount: "5".into(),
+                    asset_id: Some(up.to_string()),
+                    side: Some("SELL".into()),
+                    price: Some("0.55".into()),
+                    owner: None,
+                },
+                ClobMakerOrder {
+                    order_id: "0xuser_dn".into(),
+                    matched_amount: "5".into(),
+                    asset_id: Some(down.to_string()),
+                    side: Some("BUY".into()),
+                    price: Some("0.45".into()),
+                    owner: None,
+                },
+            ],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let open = vec![ClobOpenOrder {
+            id: "0xuser_dn".into(),
+            asset_id: down.to_string(),
+            side: "SELL".into(),
+            price: "0.45".into(),
+            original_size: "10".into(),
+            size_matched: "5".into(),
+        }];
+        let (_pu, _pd, fills) = hydrate_positions_from_trades(
+            &[t],
+            up,
+            down,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &open,
+            None,
+        );
+        assert_eq!(fills.len(), 1, "fills={:?}", fills);
+        let f = &fills[0];
+        assert_eq!(f.outcome, Outcome::Down, "fills={:?}", fills);
+        assert_eq!(f.side, Side::Sell, "fills={:?}", fills);
+        assert!((f.qty - 5.0).abs() < 1e-9);
+    }
+
+    /// When no open-order match, `maker_orders[].owner` == L2 `apiKey` picks your leg (same as user WS).
+    #[test]
+    fn hydrate_maker_owner_field_disambiguates_legs() {
+        let api = "my-l2-api-key-uuid";
+        let up = "111";
+        let down = "222";
+        let t = ClobTrade {
+            id: "own1".into(),
+            asset_id: up.to_string(),
+            side: "BUY".into(),
+            size: "10".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            status: Some("MINED".into()),
+            taker_order_id: Some("0xt".into()),
+            maker_orders: vec![
+                ClobMakerOrder {
+                    order_id: "0xa".into(),
+                    matched_amount: "3".into(),
+                    asset_id: Some(up.to_string()),
+                    side: Some("SELL".into()),
+                    price: None,
+                    owner: Some("not-me".into()),
+                },
+                ClobMakerOrder {
+                    order_id: "0xb".into(),
+                    matched_amount: "7".into(),
+                    asset_id: Some(down.to_string()),
+                    side: Some("BUY".into()),
+                    price: None,
+                    owner: Some(api.into()),
+                },
+            ],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let (_pu, pd, fills) = hydrate_positions_from_trades(
+            &[t], up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], Some(api),
+        );
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].outcome, Outcome::Down);
+        assert_eq!(fills[0].side, Side::Buy);
+        assert!((fills[0].qty - 7.0).abs() < 1e-9);
+        assert!((pd.shares - 7.0).abs() < 1e-9);
+    }
+
+    /// Maker fill qty comes from the user's maker leg (`matched_amount`), not top-level `size`
+    /// (which can reflect the other side or the full match).
+    #[test]
+    fn hydrate_maker_qty_from_leg_matched_amount_ignores_top_size() {
+        let up = "111";
+        let t = ClobTrade {
+            id: "sz1".into(),
+            asset_id: up.to_string(),
+            side: "SELL".into(),
+            size: "5".into(),
+            price: "0.5".into(),
+            match_time: "0".into(),
+            status: Some("MINED".into()),
+            taker_order_id: Some("0xt".into()),
+            maker_orders: vec![ClobMakerOrder {
+                order_id: "o1".into(),
+                matched_amount: "50".into(),
+                asset_id: Some(up.to_string()),
+                side: Some("BUY".into()),
+                price: None,
+                owner: None,
+            }],
+            trader_side: Some("MAKER".into()),
+            making_amount: None,
+            taking_amount: None,
+        };
+        let (pu, _, fills) =
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
+        assert_eq!(fills.len(), 1);
+        assert!((fills[0].qty - 50.0).abs() < 1e-9, "fills={:?}", fills);
+        assert!((pu.shares - 50.0).abs() < 1e-9, "pu={:?}", pu);
     }
 
     #[test]
@@ -2341,13 +2583,14 @@ mod tests {
                 asset_id: Some(up.to_string()),
                 side: Some("SELL".into()),
                 price: Some("0.48".into()),
+                owner: None,
             }],
             trader_side: Some("MAKER".into()),
             making_amount: None,
             taking_amount: None,
         };
         let (_, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         let f = &fills[0];
         assert!((f.qty - 4.0).abs() < 1e-9);
         assert!((f.price - 0.48).abs() < 1e-9);
@@ -2372,7 +2615,7 @@ mod tests {
             taking_amount: Some("10".into()),
         };
         let (pu, _, fills) =
-            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&[t], up, "222", 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert!((pu.avg_entry - 0.54).abs() < 1e-6, "avg_entry={}", pu.avg_entry);
         assert!(fills.iter().all(|f| (f.qty - 10.0).abs() < 1e-6 && (f.price - 0.54).abs() < 1e-6), "fills={:?}", fills);
@@ -2416,7 +2659,7 @@ mod tests {
             trade("b", up, "BUY", "10", "0.6", "2000"),
         ];
         let (pu, pd, fills) =
-            hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, down, 20.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 20.0).abs() < 1e-6);
         // VWAP of USDC cost/share incl. crypto taker fees on each BUY.
         let c1 = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
@@ -2436,7 +2679,7 @@ mod tests {
             trade_with_status("bad", up, "BUY", "99", "0.5", "2000", Some("FAILED")),
         ];
         let (pu, _, fills) =
-            hydrate_positions_from_trades(&trades, up, down, 0.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, down, 0.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].clob_trade_id, Some("ok".into()));
@@ -2518,7 +2761,7 @@ mod tests {
             trade("b", up, "SELL", "4", "0.7", "2000"),
         ];
         let (pu, _, fills) =
-            hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, "222", 6.0, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 6.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         let expect_avg = buy_cost / 10.0;
@@ -2536,7 +2779,7 @@ mod tests {
         let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
         let spendable = 4.0;
         let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, "222", spendable, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 10.0).abs() < 1e-6);
         let buy_cost = 10.0f64.mul_add(0.5, polymarket_crypto_taker_fee_usdc(10.0, 0.5));
         assert!((pu.avg_entry - buy_cost / 10.0).abs() < 1e-6);
@@ -2549,7 +2792,7 @@ mod tests {
         let trades = vec![trade("a", up, "BUY", "10", "0.5", "1000")];
         let chain = 10.09;
         let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", chain, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, "222", chain, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 10.09).abs() < 1e-6);
     }
 
@@ -2558,7 +2801,7 @@ mod tests {
         let up = "111";
         let trades: Vec<ClobTrade> = vec![];
         let (pu, pd, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, None, None);
+            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, None, None, &[], None);
         assert!((pu.shares - 3.5).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
     }
@@ -2570,7 +2813,7 @@ mod tests {
         let trades: Vec<ClobTrade> = vec![];
         let data = Some((3.5, 0.62));
         let (pu, _, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, data, None);
+            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, data, None, &[], None);
         assert!((pu.shares - 3.5).abs() < 1e-6);
         assert!((pu.avg_entry - 0.62).abs() < 1e-9);
     }
@@ -2583,7 +2826,7 @@ mod tests {
         let chain = 20.0_f64;
         let data = Some((20.0, 0.58));
         let (pu, _, _) = hydrate_positions_from_trades(
-            &trades, up, "222", chain, 0.0, 0.0, 0.0, data, None,
+            &trades, up, "222", chain, 0.0, 0.0, 0.0, data, None, &[], None,
         );
         assert!((pu.shares - 20.0).abs() < 1e-6);
         assert!((pu.avg_entry - 0.58).abs() < 1e-9);
@@ -2606,7 +2849,7 @@ mod tests {
         assert!((escrow_u - 12.0).abs() < 1e-9);
         assert!(escrow_d.abs() < 1e-9);
         let (pu, pd, _) =
-            hydrate_positions_from_trades(&trades, up, "222", 0.0, 0.0, escrow_u, escrow_d, None, None);
+            hydrate_positions_from_trades(&trades, up, "222", 0.0, 0.0, escrow_u, escrow_d, None, None, &[], None);
         assert!((pu.shares - 12.0).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
     }
@@ -2627,6 +2870,8 @@ mod tests {
             0.0,
             None,
             None,
+            &[],
+            None,
         );
         assert!((pu.shares - 5.0).abs() < 1e-6);
     }
@@ -2643,6 +2888,8 @@ mod tests {
             0.0,
             0.0,
             Some((8.0, 0.44)),
+            None,
+            &[],
             None,
         );
         assert!((pu.shares - 8.0).abs() < 1e-6);

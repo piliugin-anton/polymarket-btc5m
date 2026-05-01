@@ -335,6 +335,9 @@ pub struct ClobMakerOrder {
     /// Match price for this leg (string decimal); falls back to trade-level `price` if absent.
     #[serde(default)]
     pub price: Option<String>,
+    /// L2 `owner` — your `apiKey` on **your** maker leg (disambiguates multi-leg matches in REST).
+    #[serde(default, rename = "owner", alias = "orderOwner")]
+    pub owner: Option<String>,
 }
 
 /// Polymarket `clob-client-v2` `GET /data/trades` — one row per user fill (L2 auth).
@@ -503,8 +506,13 @@ pub fn norm_order_id_key(s: &str) -> String {
     s.trim().trim_start_matches("0x").to_ascii_lowercase()
 }
 
-fn norm_user_channel_owner(s: &str) -> String {
+/// Normalize L2 `maker_orders[].owner` for comparison with [`ApiCreds::api_key`].
+pub fn norm_clob_owner(s: &str) -> String {
     s.trim().to_ascii_lowercase()
+}
+
+fn norm_user_channel_owner(s: &str) -> String {
+    norm_clob_owner(s)
 }
 
 /// Compare Polymarket order ids from `orderID` / `taker_order_id` / `maker_orders.order_id`.
@@ -1278,6 +1286,12 @@ impl TradingClient {
 
     pub fn fill_wait_registry(&self) -> Arc<FillWaitRegistry> {
         self.fill_waits.clone()
+    }
+
+    /// L2 `apiKey` — matches REST `maker_orders[].owner` and user-channel maker legs.
+    pub async fn l2_api_key(&self) -> Option<String> {
+        let state = self.state.read().await;
+        state.creds.as_ref().map(|c| c.api_key.clone())
     }
 
     /// Await the first user-channel **`trade`** that references `order_id` (taker or maker leg).
