@@ -350,8 +350,8 @@ pub struct ClobTrade {
     #[serde(alias = "matchTime")]
     pub match_time: String,
     /// On-chain settlement status: `MATCHED` | `MINED` | `CONFIRMED` | `RETRYING` | `FAILED`.
-    /// Absent on older payloads — treated as a valid fill.
-    #[serde(default)]
+    /// Replay uses only **`MINED`** / **`CONFIRMED`** rows ([`ClobTrade::is_valid_fill`]).
+    #[serde(default, alias = "tradeStatus", alias = "trade_status")]
     pub status: Option<String>,
     /// When the authenticated user was **taker**, this matches `orderID` from `postOrder`.
     #[serde(default, rename = "taker_order_id", alias = "takerOrderId")]
@@ -372,14 +372,26 @@ pub struct ClobTrade {
     pub taking_amount: Option<String>,
 }
 
+/// Whether a Polymarket trade row should affect positions / fill replay (REST and user-channel WS).
+///
+/// Only **`MINED`** and **`CONFIRMED`** count — on-chain observed / probabilistically final per
+/// [Polymarket user-channel docs](https://docs.polymarket.com/market-data/websocket/user-channel).
+/// `MATCHED`, `RETRYING`, `FAILED`, missing/blank status, and any other value are excluded.
+pub(crate) fn clob_trade_status_counts_as_fill(status: Option<&str>) -> bool {
+    let Some(s) = status.and_then(|s| {
+        let t = s.trim();
+        (!t.is_empty()).then_some(t)
+    }) else {
+        return false;
+    };
+    let u = s.to_ascii_uppercase();
+    matches!(u.as_str(), "MINED" | "CONFIRMED")
+}
+
 impl ClobTrade {
-    /// Returns `true` for trades useful in replay (`MATCHED` through `CONFIRMED`).
-    /// Absent status (older payloads) is treated as valid to preserve historical data.
+    /// Returns `true` for trades useful in replay — status **`MINED`** or **`CONFIRMED`** only.
     pub fn is_valid_fill(&self) -> bool {
-        matches!(
-            self.status.as_deref().map(|s| s.to_ascii_uppercase()).as_deref(),
-            None | Some("MATCHED") | Some("CONFIRMED") | Some("MINED")
-        )
+        clob_trade_status_counts_as_fill(self.status.as_deref())
     }
 }
 
@@ -548,9 +560,9 @@ pub struct UserChannelTradeFill {
 /// for your leg). When the open-order ledger no longer contains your `order_id` (fill already
 /// removed the row) but several maker legs remain, we pick the unique row whose `owner` matches.
 ///
-/// Accepts trade statuses **`MATCHED`**, **`MINED`**, and **`CONFIRMED`** (same `id` dedupes later
-/// status transitions in the user WS path). Returns `None` for `FAILED` / unknown status, missing
-/// `trader_side`, or **maker** with multiple legs and no disambiguation.
+/// Accepts trade statuses **`MINED`** and **`CONFIRMED`** only ([`clob_trade_status_counts_as_fill`]).
+/// Same `id` dedupes later WS deliveries. Returns `None` for `MATCHED` / `FAILED` / `RETRYING` /
+/// unknown / missing status, missing `trader_side`, or **maker** with multiple legs and no disambiguation.
 pub fn try_parse_user_channel_trade(
     v: &serde_json::Value,
     known_user_order_keys: &HashSet<String>,
@@ -564,12 +576,7 @@ pub fn try_parse_user_channel_trade(
         return None;
     }
     let status = v.get("status").and_then(|s| s.as_str());
-    let status_ok = status.is_some_and(|s| {
-        s.eq_ignore_ascii_case("MATCHED")
-            || s.eq_ignore_ascii_case("MINED")
-            || s.eq_ignore_ascii_case("CONFIRMED")
-    });
-    if !status_ok {
+    if !clob_trade_status_counts_as_fill(status) {
         return None;
     }
     let clob_trade_id = v
@@ -925,13 +932,40 @@ mod user_channel_trade_parse_tests {
     }
 
     #[test]
-    fn matched_status_parses_when_ledger_matches() {
+    fn mined_status_parses_when_ledger_matches() {
         let mut v = trade_two_makers();
-        v.as_object_mut().unwrap().insert("status".into(), json!("MATCHED"));
+        v.as_object_mut().unwrap().insert("status".into(), json!("MINED"));
         let mut ks = HashSet::new();
         ks.insert(norm_order_id_key("0xmine"));
         let f = try_parse_user_channel_trade(&v, &ks, None).unwrap();
         assert_eq!(f.order_leg_id, "0xmine");
+    }
+
+    #[test]
+    fn matched_status_is_ignored() {
+        let mut v = trade_two_makers();
+        v.as_object_mut().unwrap().insert("status".into(), json!("MATCHED"));
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmine"));
+        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+    }
+
+    #[test]
+    fn failed_status_is_ignored() {
+        let mut v = trade_two_makers();
+        v.as_object_mut().unwrap().insert("status".into(), json!("FAILED"));
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmine"));
+        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
+    }
+
+    #[test]
+    fn retrying_status_is_ignored() {
+        let mut v = trade_two_makers();
+        v.as_object_mut().unwrap().insert("status".into(), json!("RETRYING"));
+        let mut ks = HashSet::new();
+        ks.insert(norm_order_id_key("0xmine"));
+        assert!(try_parse_user_channel_trade(&v, &ks, None).is_none());
     }
 
     #[test]

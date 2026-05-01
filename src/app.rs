@@ -1786,6 +1786,18 @@ fn merge_chain_balance(
         (s.is_finite() && s > 1e-12 && a.is_finite() && a > 0.0).then_some(a)
     });
 
+    // Data API `size` / `avgPrice` agrees with our resolved `shares` (5% slack for REST vs wallet).
+    let data_basis_for_shares = |s: f64| -> Option<f64> {
+        if data_shares <= 1e-12 {
+            return None;
+        }
+        let da = data_avg?;
+        if (s - data_shares).abs() > f64::max(1e-6, 0.05 * s.max(data_shares)) {
+            return None;
+        }
+        Some(da)
+    };
+
     if !replay_ok && !bal_ok && !escrow_ok && data_shares < 1e-12 {
         return Position::default();
     }
@@ -1804,7 +1816,7 @@ fn merge_chain_balance(
         0.0
     };
 
-    let avg_entry = if replay_ok {
+    let mut avg_entry = if replay_ok {
         let tol = f64::max(
             0.02,
             0.02 * f64::max(replay.shares.abs(), inventory_fallback.max(data_shares)),
@@ -1818,13 +1830,32 @@ fn merge_chain_balance(
             );
         }
         replay.avg_entry
-    } else if data_shares > 1e-12
-        && (shares - data_shares).abs() <= f64::max(1e-6, 0.02 * shares.max(data_shares))
-    {
-        data_avg.unwrap_or(0.0)
+    } else if let Some(a) = data_basis_for_shares(shares) {
+        a
     } else {
         0.0
     };
+
+    // `/data/trades` missing or empty: wallet shows shares but CLOB VWAP is 0 → uPnL would read
+    // as pure mark-to-zero-cost. Use Data API when its `size` matches inventory.
+    if shares > 1e-9 && (!avg_entry.is_finite() || avg_entry <= 1e-12) {
+        if let Some(a) = data_basis_for_shares(shares) {
+            avg_entry = a;
+        }
+    }
+
+    // Replay covers fewer shares than wallet (skipped rows, role filter, etc.): carrying
+    // `replay.avg_entry` across the extra size understates cost and inflates uPnL after restart.
+    if replay_ok && replay.avg_entry > 1e-12 {
+        let gap = shares - replay.shares;
+        let gap_significant =
+            gap > f64::max(0.02, 0.005 * f64::max(shares, replay.shares.max(1.0)));
+        if gap_significant {
+            if let Some(a) = data_basis_for_shares(shares) {
+                avg_entry = a;
+            }
+        }
+    }
 
     Position { shares, avg_entry }
 }
@@ -2040,6 +2071,18 @@ mod tests {
         price: &str,
         match_time: &str,
     ) -> ClobTrade {
+        trade_with_status(id, asset_id, side, size, price, match_time, Some("MINED"))
+    }
+
+    fn trade_with_status(
+        id: &str,
+        asset_id: &str,
+        side: &str,
+        size: &str,
+        price: &str,
+        match_time: &str,
+        status: Option<&str>,
+    ) -> ClobTrade {
         ClobTrade {
             id: id.to_string(),
             asset_id: asset_id.to_string(),
@@ -2047,7 +2090,7 @@ mod tests {
             size: size.to_string(),
             price: price.to_string(),
             match_time: match_time.to_string(),
-            status: None,
+            status: status.map(|s| s.to_string()),
             taker_order_id: None,
             maker_orders: vec![],
             // `hydrate_positions_from_trades` only replays fills with a known role (matches CLOB user rows).
@@ -2068,7 +2111,7 @@ mod tests {
             size: "9999".into(),
             price: "0.5".into(),
             match_time: "0".into(),
-            status: None,
+            status: Some("MINED".into()),
             taker_order_id: Some("0xt".into()),
             maker_orders: vec![ClobMakerOrder {
                 order_id: "o1".into(),
@@ -2097,7 +2140,7 @@ mod tests {
             size: "100".into(),
             price: "0.50".into(),
             match_time: "0".into(),
-            status: None,
+            status: Some("MINED".into()),
             taker_order_id: None,
             maker_orders: vec![ClobMakerOrder {
                 order_id: "o1".into(),
@@ -2128,7 +2171,7 @@ mod tests {
             size: "2.5".into(),
             price: "0.5".into(),
             match_time: "0".into(),
-            status: None,
+            status: Some("MINED".into()),
             taker_order_id: None,
             maker_orders: vec![],
             trader_side: Some("TAKER".into()),
@@ -2189,6 +2232,21 @@ mod tests {
         assert!((pu.avg_entry - expect_avg).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
         assert_eq!(fills.len(), 2);
+    }
+
+    #[test]
+    fn hydrate_skips_failed_status_trades() {
+        let up = "111";
+        let down = "222";
+        let trades = vec![
+            trade_with_status("ok", up, "BUY", "10", "0.5", "1000", Some("CONFIRMED")),
+            trade_with_status("bad", up, "BUY", "99", "0.5", "2000", Some("FAILED")),
+        ];
+        let (pu, _, fills) =
+            hydrate_positions_from_trades(&trades, up, down, 0.0, 0.0, 0.0, 0.0, None, None);
+        assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
+        assert_eq!(fills.len(), 1);
+        assert_eq!(fills[0].clob_trade_id, Some("ok".into()));
     }
 
     #[test]
@@ -2310,6 +2368,32 @@ mod tests {
             hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, None, None);
         assert!((pu.shares - 3.5).abs() < 1e-6);
         assert!(pd.shares.abs() < 1e-9);
+    }
+
+    /// After restart, `/data/trades` may be empty while Data API still has `avgPrice` — uPnL needs it.
+    #[test]
+    fn hydrate_balance_only_uses_data_api_avg_when_sizes_align() {
+        let up = "111";
+        let trades: Vec<ClobTrade> = vec![];
+        let data = Some((3.5, 0.62));
+        let (pu, _, _) =
+            hydrate_positions_from_trades(&trades, up, "222", 3.5, 0.0, 0.0, 0.0, data, None);
+        assert!((pu.shares - 3.5).abs() < 1e-6);
+        assert!((pu.avg_entry - 0.62).abs() < 1e-9);
+    }
+
+    /// Trade replay under-counts vs wallet: prefer Data API VWAP for the full size so uPnL is not inflated.
+    #[test]
+    fn hydrate_partial_replay_prefers_data_api_when_inventory_gap_large() {
+        let up = "111";
+        let trades = vec![trade("a", up, "BUY", "5", "0.40", "1000")];
+        let chain = 20.0_f64;
+        let data = Some((20.0, 0.58));
+        let (pu, _, _) = hydrate_positions_from_trades(
+            &trades, up, "222", chain, 0.0, 0.0, 0.0, data, None,
+        );
+        assert!((pu.shares - 20.0).abs() < 1e-6);
+        assert!((pu.avg_entry - 0.58).abs() < 1e-9);
     }
 
     /// No trade history to replay and spendable balance is 0 while entire position is in a resting SELL.
