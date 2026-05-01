@@ -1209,11 +1209,9 @@ impl AppState {
         };
     }
 
+    /// Call only when [`Self::detection_enabled`] — avoids building [`DetectionCmd`] (e.g. full book clone).
     #[inline]
     fn detection_dispatch(&mut self, cmd: DetectionCmd) {
-        if !self.detection_enabled {
-            return;
-        }
         match &mut self.detection_engine {
             Some(DetectionEngine::Inline(rt)) => {
                 rt.apply(cmd);
@@ -1296,10 +1294,12 @@ impl AppState {
                         }
                     }
                 }
-                self.detection_dispatch(DetectionCmd::SpotAndBeat {
-                    spot: p.price,
-                    price_to_beat: self.price_to_beat(),
-                });
+                if self.detection_enabled {
+                    self.detection_dispatch(DetectionCmd::SpotAndBeat {
+                        spot: p.price,
+                        price_to_beat: self.price_to_beat(),
+                    });
+                }
             }
             AppEvent::Book(mut b) => {
                 b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
@@ -1335,11 +1335,13 @@ impl AppState {
                     self.apply_trailing_book_tick(id_for_trail.as_str(), bid);
                 }
                 self.recompute_sentiment();
-                if let Some(outcome) = detection_outcome {
-                    self.detection_dispatch(DetectionCmd::Book {
-                        is_up: matches!(outcome, Outcome::Up),
-                        book: (*snap).clone(),
-                    });
+                if self.detection_enabled {
+                    if let Some(outcome) = detection_outcome {
+                        self.detection_dispatch(DetectionCmd::Book {
+                            is_up: matches!(outcome, Outcome::Up),
+                            book: (*snap).clone(),
+                        });
+                    }
                 }
             }
             AppEvent::MarketRoll {
@@ -1379,11 +1381,13 @@ impl AppState {
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.detection_signal = None;
                 self.cached_countdown_secs = None;
-                self.detection_dispatch(DetectionCmd::MarketRolled {
-                    market: m_snap,
-                    asset_label,
-                    timeframe_label,
-                });
+                if self.detection_enabled {
+                    self.detection_dispatch(DetectionCmd::MarketRolled {
+                        market: m_snap,
+                        asset_label,
+                        timeframe_label,
+                    });
+                }
             }
             AppEvent::PriceToBeatRefresh {
                 slug,
@@ -1394,7 +1398,11 @@ impl AppState {
                         if let Some(ptb) = price_to_beat {
                             m.price_to_beat = Some(ptb);
                             self.latched_price_to_beat = None;
-                            self.detection_dispatch(DetectionCmd::SetPriceToBeat(self.price_to_beat()));
+                            if self.detection_enabled {
+                                self.detection_dispatch(DetectionCmd::SetPriceToBeat(
+                                    self.price_to_beat(),
+                                ));
+                            }
                         }
                     }
                 }
@@ -1750,7 +1758,9 @@ impl AppState {
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
-                self.detection_dispatch(DetectionCmd::Clear);
+                if self.detection_enabled {
+                    self.detection_dispatch(DetectionCmd::Clear);
+                }
             }
             AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
@@ -1835,7 +1845,9 @@ impl AppState {
                 }
             }
             AppEvent::DetectionUpdate { signal } => {
-                self.detection_signal = signal;
+                if self.detection_enabled {
+                    self.detection_signal = signal;
+                }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
