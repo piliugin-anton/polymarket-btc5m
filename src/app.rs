@@ -584,6 +584,41 @@ impl AppState {
         self.try_promote_pending_trail_any(tid.as_str());
     }
 
+    /// After `GET /data/trades` / [`AppEvent::PositionsLoaded`], register the same pending trail a
+    /// live BUY would get, so restarts keep protection when `buy_trail_bps` is set on the last roll.
+    ///
+    /// Clears any existing trail/pending for each active leg first so repeated REST loads do not
+    /// stack duplicate `plan_sell_shares`.
+    fn rehydrate_trailing_from_positions_after_rest(&mut self) {
+        if self.buy_trail_bps == 0 {
+            return;
+        }
+        let Some(m) = self.market.clone() else {
+            return;
+        };
+        for (outcome, token_raw) in [
+            (Outcome::Up, m.up_token_id.as_str()),
+            (Outcome::Down, m.down_token_id.as_str()),
+        ] {
+            let sh = self.position(outcome).shares;
+            let ae = self.position(outcome).avg_entry;
+            if sh <= 1e-9 || !ae.is_finite() || ae <= 0.0 || ae >= 0.99 {
+                continue;
+            }
+            let tid = canonical_clob_token_id(token_raw).into_owned();
+            self.clear_trailing_on_sell_token(tid.as_str());
+            self.merge_pending_trailing_buy_arm(
+                outcome,
+                ae,
+                sh,
+                tid,
+                self.buy_trail_bps,
+                self.buy_trail_activation_bps,
+                m.clone(),
+            );
+        }
+    }
+
     /// True if `token_id` already has a queued trailing exit or an in-flight FAK SELL.
     fn trailing_sell_queued_or_in_flight(&self, token_id: &str) -> bool {
         debug_assert_eq!(
@@ -1213,8 +1248,8 @@ impl AppState {
                 }
                 if let Some(m) = self.market.clone() {
                     self.sync_trailing_inventory_with_positions();
-                    self.try_promote_pending_trail_token(m.up_token_id.as_str());
-                    self.try_promote_pending_trail_token(m.down_token_id.as_str());
+                    self.rehydrate_trailing_from_positions_after_rest();
+                    self.try_promote_pending_trail_any(m.up_token_id.as_str());
                 }
             }
             AppEvent::OpenOrdersLoaded { orders } => {
@@ -3158,5 +3193,35 @@ mod tests {
         .await;
         assert!(!s.trailing.contains_key("UPL"));
         assert!(!s.pending_trail_arms.contains_key("UPL"));
+    }
+
+    /// With `buy_trail_bps` set (as after [`AppEvent::MarketRoll`]), REST hydration restores a
+    /// pending trail for non-flat long inventory.
+    #[tokio::test]
+    async fn positions_loaded_rehydrates_pending_trail_when_trail_bps_set() {
+        let mut s = test_state();
+        let m = test_market("RH1", "RH2", "0xrehyd");
+        s.market = Some(m.clone());
+        s.buy_trail_bps = 150;
+        // Keep pending: require bid >= entry × 2 before arm (bid 0.60 < 0.55 × 2).
+        s.buy_trail_activation_bps = 10_000;
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "RH1".into(),
+            bids:     vec![BookLevel { price: 0.60, size: 100.0 }],
+            asks:     vec![BookLevel { price: 0.62, size: 100.0 }],
+        }));
+        s.apply(AppEvent::PositionsLoaded {
+            position_up:   Position { shares: 10.0, avg_entry: 0.55 },
+            position_down: Position::default(),
+            fills_bootstrap: vec![],
+            refresh_status_line: false,
+        })
+        .await;
+        assert!(
+            s.pending_trail_arms.contains_key("RH1"),
+            "expected pending trail for UP leg; pending={:?}",
+            s.pending_trail_arms.keys().collect::<Vec<_>>()
+        );
+        assert!(!s.trailing.contains_key("RH1"));
     }
 }

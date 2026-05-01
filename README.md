@@ -209,6 +209,7 @@ src/
 ## Known limitations
 
 - **Trailing + resting limits.** If a limit buy that first went `live` later fills with you as **taker** on the user-channel trade, the app may not register that fill for trailing (maker-leg path only). Prefer a market buy or an immediately matched limit if you rely on the trail.
+- **Trailing after restart.** With `MARKET_BUY_TRAIL_BPS > 0` (stored at market roll), trade replay re-registers a trail from **long size + VWAP `avg_entry`**; the in-trail peak ratchet starts over from the new session’s book (no remembered pre-crash peak).
 - **No full web-app parity.** Edge cases like partial fills or unusual order states may not match what the website shows.
 - **No on-chain allowance setup.** Assumes spender approvals are already set. If not, run a one-time approval script (see [NautilusTrader docs](https://nautilustrader.io/docs/latest/integrations/polymarket/) for reference).
 - **Relayer required for redemption.** The `x` key only works with `POLYMARKET_RELAYER_API_KEY` and `POLYMARKET_SIG_TYPE=2`. Plain EOA users need the web Portfolio page.
