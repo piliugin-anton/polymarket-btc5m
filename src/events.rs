@@ -90,6 +90,7 @@ pub fn handle_key(state: &mut AppState, k: KeyEvent) -> Action {
     match state.input_mode {
         InputMode::Normal => normal_mode(state, k),
         InputMode::EditSize => edit_size_mode(state, k),
+        InputMode::EditPrice => edit_price_mode(state, k),
         InputMode::LimitModal {
             outcome,
             side,
@@ -158,7 +159,7 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
 
         // Open limit modal — default BUY UP; change outcome/side inside modal (←/→, ↑/↓, w/s/a/d).
         KeyCode::Char('l') => {
-            state.limit_price_input.clear();
+            state.limit_price_input = state.price_input.clone();
             state.limit_size_input = state.size_input.clone();
             state.input_mode = InputMode::LimitModal {
                 outcome: Outcome::Up,
@@ -172,6 +173,34 @@ fn normal_mode(state: &mut AppState, k: KeyEvent) -> Action {
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&'e') => {
             state.input_mode = InputMode::EditSize;
             Action::None
+        }
+
+        // Edit persistent price
+        KeyCode::Char('p') => {
+            state.input_mode = InputMode::EditPrice;
+            Action::None
+        }
+
+        // Quick limit GTD: buy UP or DOWN with default size and price
+        KeyCode::Char('[') => {
+            let price = state.current_price();
+            let size_usdc = size;
+            Action::PlaceLimit {
+                outcome: Outcome::Up,
+                side: Side::Buy,
+                price,
+                size_usdc,
+            }
+        }
+        KeyCode::Char(']') => {
+            let price = state.current_price();
+            let size_usdc = size;
+            Action::PlaceLimit {
+                outcome: Outcome::Down,
+                side: Side::Buy,
+                price,
+                size_usdc,
+            }
         }
 
         // Manual force-roll (useful if gamma polling hasn't picked up the next market yet)
@@ -313,6 +342,27 @@ fn edit_size_mode(state: &mut AppState, k: KeyEvent) -> Action {
         KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
             if state.size_input.len() < 10 {
                 state.size_input.push(c);
+            }
+        }
+        _ => {}
+    }
+    Action::None
+}
+
+fn edit_price_mode(state: &mut AppState, k: KeyEvent) -> Action {
+    match k.code {
+        KeyCode::Enter | KeyCode::Char('\r') | KeyCode::Char('\n') | KeyCode::Esc => {
+            if state.price_input.parse::<f64>().is_err() {
+                state.price_input = "0.50".to_string();
+            }
+            state.input_mode = InputMode::Normal;
+        }
+        KeyCode::Backspace => {
+            state.price_input.pop();
+        }
+        KeyCode::Char(c) if c.is_ascii_digit() || c == '.' => {
+            if state.price_input.len() < 10 {
+                state.price_input.push(c);
             }
         }
         _ => {}

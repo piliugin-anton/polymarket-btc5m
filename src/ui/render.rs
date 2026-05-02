@@ -624,9 +624,28 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         ),
     };
 
+    let price_span = match s.input_mode {
+        InputMode::EditPrice => Span::styled(
+            format!("[{}_]", s.price_input),
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+        _ => Span::styled(
+            format!("[{}]", s.price_input),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ),
+    };
+
     let keys = Line::from(vec![
         Span::styled("size ", Style::default().fg(Color::DarkGray)),
         size_span,
+        Span::raw(" "),
+        Span::styled("px ", Style::default().fg(Color::DarkGray)),
+        price_span,
         Span::raw(" "),
         Span::raw("[w]"),
         Span::styled(" buy UP", Style::default().fg(Color::Green)),
@@ -644,6 +663,10 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         sep(),
         key("l", "limit"),
         sep(),
+        key("[", "buy UP lmt"),
+        sep(),
+        key("]", "buy DN lmt"),
+        sep(),
         key("c", "cancel all"),
         sep(),
         key("x", "redeem all"),
@@ -651,6 +674,8 @@ fn draw_help(f: &mut Frame, area: Rect, s: &AppState) {
         key("f", "SOL USDC dep"),
         sep(),
         key("e", "resize"),
+        sep(),
+        key("p", "reprice"),
         sep(),
         key("Esc", "timeframe"),
         sep(),

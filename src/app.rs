@@ -345,6 +345,7 @@ pub struct Fill {
 pub enum InputMode {
     Normal,
     EditSize,
+    EditPrice,
     LimitModal {
         outcome: Outcome,
         side: Side,
@@ -473,6 +474,7 @@ pub struct AppState {
 
     pub default_size_usdc: f64,
     pub size_input: String, // buffer while editing size
+    pub price_input: String, // buffer while editing default price
     pub limit_price_input: String,
     pub limit_size_input: String,
 
@@ -548,6 +550,7 @@ impl AppState {
             latched_price_to_beat: None,
             default_size_usdc,
             size_input: format!("{default_size_usdc:.2}"),
+            price_input: "0.10".to_string(),
             limit_price_input: String::new(),
             limit_size_input: String::new(),
             input_mode: InputMode::Normal,
@@ -901,6 +904,14 @@ impl AppState {
 
     pub fn current_size(&self) -> f64 {
         self.size_input.parse().unwrap_or(self.default_size_usdc)
+    }
+
+    pub fn current_price(&self) -> f64 {
+        self.price_input
+            .parse::<f64>()
+            .ok()
+            .filter(|p| (0.01..=0.99).contains(p))
+            .unwrap_or(0.50)
     }
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
