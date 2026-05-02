@@ -28,14 +28,72 @@ Everything happens in the terminal. No browser required once you have your walle
 
 ## Quick start
 
-### Prerequisites
+### Option A — pre-built binary (no Rust required)
+
+1. **Download** the binary for your platform from the [Releases page](../../releases/latest):
+
+   | Platform | File |
+   |---|---|
+   | Linux x86-64 | `polymarket-crypto-linux-x86_64` |
+   | macOS Apple Silicon | `polymarket-crypto-macos-arm64` |
+   | macOS Intel | `polymarket-crypto-macos-x86_64` |
+   | Windows x86-64 | `polymarket-crypto-windows-x86_64.exe` |
+
+   Also download **`.env.example`** from the same release (or copy it from the repository root).
+
+2. **Create your `.env`** from the example:
+
+   **Linux / macOS**
+   ```sh
+   cp .env.example .env
+   ```
+   **Windows (cmd)**
+   ```cmd
+   copy .env.example .env
+   ```
+   **Windows (PowerShell)**
+   ```powershell
+   Copy-Item .env.example .env
+   ```
+
+3. **Edit `.env`** — fill in at minimum `POLYMARKET_PK`, `POLYMARKET_FUNDER`, and `POLYGON_RPC_URL` (see [Configure `.env`](#configure-env) below).
+
+4. **Run**:
+
+   **Linux**
+   ```sh
+   chmod +x polymarket-crypto-linux-x86_64
+   ./polymarket-crypto-linux-x86_64
+   ```
+
+   **macOS**
+   ```sh
+   chmod +x polymarket-crypto-macos-arm64   # or -x86_64 for Intel
+   # Remove the quarantine flag set by the browser download
+   xattr -dr com.apple.quarantine ./polymarket-crypto-macos-arm64
+   ./polymarket-crypto-macos-arm64
+   ```
+   If macOS still blocks launch, open **System Settings → Privacy & Security** and click **Open Anyway** next to the blocked binary.
+
+   **Windows**
+   ```powershell
+   # Run from the same directory as your .env file
+   .\polymarket-crypto-windows-x86_64.exe
+   ```
+   If Windows Defender SmartScreen blocks the binary, click **More info → Run anyway**.
+
+---
+
+### Option B — build from source
+
+#### Prerequisites
 
 - **Rust 1.80+** — install via [rustup](https://rustup.rs)
 - A **funded Polymarket wallet**. The typical setup is an EOA (private key) that controls a Gnosis Safe holding your USDC. Both addresses go in `.env`.
 - The Safe must have approved the CTF Exchange and NegRisk Exchange as spenders. If you've ever placed a trade through the Polymarket web UI, this is already done.
 - A **Polygon RPC endpoint** (Alchemy, drpc, or the free `polygon-rpc.com`) for on-chain balance reads.
 
-### Install
+#### Build
 
 ```sh
 git clone <this-repo>
@@ -69,7 +127,7 @@ Optional but useful:
 
 See [`.env.example`](.env.example) for the full list and descriptions.
 
-### Run
+#### Run (after build from source)
 
 ```sh
 ./target/release/polymarket-crypto
@@ -145,7 +203,10 @@ All traffic — REST, WebSockets, Chainlink feed — tunnels through the proxy. 
 If the status line shows auth errors, run the diagnostic command (skip the TUI entirely):
 
 ```sh
+# source build
 ./target/release/polymarket-crypto debug-auth
+# pre-built binary (adjust name/extension for your platform)
+./polymarket-crypto-linux-x86_64 debug-auth
 ```
 
 It prints every intermediate signing value (typeHash, domainSeparator, digest, signature) and the exact HTTP status + body from Polymarket's auth endpoints.
