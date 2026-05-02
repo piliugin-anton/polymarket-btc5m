@@ -35,11 +35,10 @@ Everything happens in the terminal. No browser required once you have your walle
    | Platform | File |
    |---|---|
    | Linux x86-64 | `polymarket-crypto-linux-x86_64` |
-   | macOS Apple Silicon | `polymarket-crypto-macos-arm64` |
-   | macOS Intel | `polymarket-crypto-macos-x86_64` |
+   | macOS Apple Silicon (M1/M2/M3) | `polymarket-crypto-macos-aarch64` |
    | Windows x86-64 | `polymarket-crypto-windows-x86_64.exe` |
 
-   Also download **`.env.example`** from the same release (or copy it from the repository root).
+   Also grab **`.env.example`** from the repository root — it is not bundled in the release. Download it from the repo's file list on GitHub.
 
 2. **Create your `.env`** from the example:
 
@@ -66,12 +65,12 @@ Everything happens in the terminal. No browser required once you have your walle
    ./polymarket-crypto-linux-x86_64
    ```
 
-   **macOS**
+   **macOS** (Apple Silicon only — M1/M2/M3)
    ```sh
-   chmod +x polymarket-crypto-macos-arm64   # or -x86_64 for Intel
+   chmod +x polymarket-crypto-macos-aarch64
    # Remove the quarantine flag set by the browser download
-   xattr -dr com.apple.quarantine ./polymarket-crypto-macos-arm64
-   ./polymarket-crypto-macos-arm64
+   xattr -dr com.apple.quarantine ./polymarket-crypto-macos-aarch64
+   ./polymarket-crypto-macos-aarch64
    ```
    If macOS still blocks launch, open **System Settings → Privacy & Security** and click **Open Anyway** next to the blocked binary.
 
@@ -205,8 +204,10 @@ If the status line shows auth errors, run the diagnostic command (skip the TUI e
 ```sh
 # source build
 ./target/release/polymarket-crypto debug-auth
-# pre-built binary (adjust name/extension for your platform)
-./polymarket-crypto-linux-x86_64 debug-auth
+# pre-built binary — use the name for your platform:
+./polymarket-crypto-linux-x86_64 debug-auth        # Linux
+./polymarket-crypto-macos-aarch64 debug-auth        # macOS
+.\polymarket-crypto-windows-x86_64.exe debug-auth  # Windows
 ```
 
 It prints every intermediate signing value (typeHash, domainSeparator, digest, signature) and the exact HTTP status + body from Polymarket's auth endpoints.
