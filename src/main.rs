@@ -56,7 +56,7 @@ use fees::take_profit_limit_price_crypto_after_fees;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{HashSet, VecDeque},
     io::stdout,
     mem,
     sync::{
@@ -1723,14 +1723,24 @@ fn spawn_price_feed(tx: mpsc::Sender<AppEvent>, rtds_sym_rx: watch::Receiver<Str
 fn clob_forwarder(tx: mpsc::Sender<AppEvent>) -> mpsc::Sender<feeds::clob_ws::BookSnapshot> {
     let (btx, mut brx) = mpsc::channel::<feeds::clob_ws::BookSnapshot>(64);
     tokio::spawn(async move {
+        // Capacity persists across bursts — no realloc after the first few iterations.
+        // Linear scan beats HashMap for n ≤ 4 (UP + DOWN + trailing tails): no hash
+        // computation, no key clone, no heap metadata.
+        let mut latest: Vec<feeds::clob_ws::BookSnapshot> = Vec::with_capacity(4);
         while let Some(b) = brx.recv().await {
             // Collapse bursts so UP/DOWN snapshots both get a chance on the queue.
-            let mut latest: HashMap<String, feeds::clob_ws::BookSnapshot> = HashMap::new();
-            latest.insert(b.asset_id.clone(), b);
+            latest.clear();
+            let mut upsert = |snap: feeds::clob_ws::BookSnapshot| {
+                match latest.iter_mut().find(|s| s.asset_id == snap.asset_id) {
+                    Some(slot) => *slot = snap,
+                    None => latest.push(snap),
+                }
+            };
+            upsert(b);
             while let Ok(more) = brx.try_recv() {
-                latest.insert(more.asset_id.clone(), more);
+                upsert(more);
             }
-            for snap in latest.into_values() {
+            for snap in latest.drain(..) {
                 let _ = tx.try_send(AppEvent::Book(snap));
             }
         }

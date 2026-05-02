@@ -1189,8 +1189,11 @@ impl AppState {
                 }
             }
             AppEvent::Book(mut b) => {
-                b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
-                let id_for_trail = b.asset_id.clone();
+                // clob_ws already emits canonical (all-decimal) IDs; skip the bignum
+                // round-trip when the fast ASCII check confirms this.
+                if !b.asset_id.bytes().all(|c| c.is_ascii_digit()) {
+                    b.asset_id = canonical_clob_token_id(&b.asset_id).into_owned();
+                }
                 let snap = Arc::new(b);
                 if let Some(m) = &self.market {
                     if clob_asset_ids_match(snap.asset_id.as_str(), m.up_token_id.as_str()) {
@@ -1204,19 +1207,16 @@ impl AppState {
                 // state changes made by try_promote_pending_trail_any / apply_trailing_book_tick.
                 if self
                     .cached_book_watch_tokens
-                    .binary_search(&id_for_trail)
+                    .binary_search(&snap.asset_id)
                     .is_ok()
                 {
                     self.watched_books
-                        .insert(id_for_trail.clone(), Arc::clone(&snap));
-                    let tokens = &self.cached_book_watch_tokens;
-                    self.watched_books
-                        .retain(|k, _| tokens.binary_search(k).is_ok());
+                        .insert(snap.asset_id.clone(), Arc::clone(&snap));
                 }
 
-                self.try_promote_pending_trail_any(id_for_trail.as_str());
-                if let Some(bid) = self.best_bid_for_token(id_for_trail.as_str()) {
-                    self.apply_trailing_book_tick(id_for_trail.as_str(), bid);
+                self.try_promote_pending_trail_any(snap.asset_id.as_str());
+                if let Some(bid) = self.best_bid_for_token(snap.asset_id.as_str()) {
+                    self.apply_trailing_book_tick(snap.asset_id.as_str(), bid);
                 }
                 self.recompute_sentiment();
             }
@@ -1700,6 +1700,11 @@ impl AppState {
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
         self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
+        // Prune watched_books once per apply() after the watch list is authoritative,
+        // not on every book tick inside the Book handler.
+        let tokens = &self.cached_book_watch_tokens;
+        self.watched_books
+            .retain(|k, _| tokens.binary_search(k).is_ok());
     }
 }
 

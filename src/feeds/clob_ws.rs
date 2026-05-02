@@ -562,10 +562,10 @@ async fn emit_snapshot(
         size: s,
     }));
 
-    // Swap the filled Vecs into the snapshot; the empty replacements allocate on
-    // the next extend() call via ExactSizeIterator, sizing to exactly the level count.
-    let snap_bids = std::mem::replace(out_bids, Vec::new());
-    let snap_asks = std::mem::replace(out_asks, Vec::new());
+    // Swap the filled Vecs into the snapshot; pre-size the replacements so the
+    // next extend() call doesn't need to allocate.
+    let snap_bids = std::mem::replace(out_bids, Vec::with_capacity(bids.levels.len()));
+    let snap_asks = std::mem::replace(out_asks, Vec::with_capacity(asks.levels.len()));
     let _ = tx
         .send(BookSnapshot {
             asset_id: asset_id.to_owned(),
