@@ -6,8 +6,9 @@
 //! [`NegRiskCtfCollateralAdapter`](https://docs.polymarket.com/resources/contracts) expose the same
 //! `redeemPositions(address,bytes32,bytes32,uint256[])` entrypoint (first args unused). They pull CTF
 //! ERC1155, call CTF internally with **USDC.e** as `collateralToken`, then wrap proceeds to **pUSD**
-//! (PMCT) for `msg.sender`. Calling **CTF** or the **legacy NegRisk adapter** directly from the Safe
-//! does not match those position IDs / unwrap paths and typically fails on-chain.
+//! (PMCT) for `msg.sender`. Use the **current** collateral adapter addresses from
+//! [Contracts / Collateral](https://docs.polymarket.com/resources/contracts); the relayer rejects
+//! calls to deprecated adapter deployments.
 //!
 //! Flow matches [`@polymarket/builder-relayer-client`](https://github.com/Polymarket/builder-relayer-client)
 //! (`buildSafeTransactionRequest`): EIP-712 `SafeTx` hash → sign → `POST /submit`.
@@ -23,23 +24,28 @@ use anyhow::{bail, Context, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
-use tracing::{error, info, warn};
+use tracing::{error, warn};
 
 use crate::config::{Config, SignatureType};
 use crate::data_api::DataPosition;
 
 const RELAYER_HOST: &str = "https://relayer-v2.polymarket.com";
-/// CtfCollateralAdapter — standard markets redeem entrypoint. [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
-const CTF_COLLATERAL_ADAPTER: Address = address!("0xADa100874d00e3331D00F2007a9c336a65009718");
-/// NegRiskCtfCollateralAdapter — neg-risk redeem entrypoint. [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
+/// CtfCollateralAdapter (current Polygon deployment — relayer rejects legacy `0x…09718`).
+/// [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
+const CTF_COLLATERAL_ADAPTER: Address =
+    address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
+/// NegRiskCtfCollateralAdapter (current Polygon deployment).
 const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
-    address!("0xAdA200001000ef00D07553cEE7006808F895c6F1");
+    address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
 /// Gnosis Safe Factory. [Contracts / Wallet factory](https://docs.polymarket.com/resources/contracts#wallet-factory-contracts)
 const SAFE_FACTORY: Address = address!("0xaacFeEa03eb1561C4e67d661e40682Bd20E3541b");
 const SAFE_INIT_CODE_HASH: B256 =
     b256!("0x2bce2127ff07fb632d16c8347c4ebf501f4841168bed00d9e6ef715ddb6fcecf");
 /// Gnosis `MultiSend` — not listed on Contracts; matches `@polymarket/builder-relayer-client` `getContractConfig(137)`.
 const SAFE_MULTISEND: Address = address!("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e7761");
+/// Max adapter calls per Safe `execTransaction`. One huge MultiSend often hits relayer gas/sim limits (`STATE_FAILED`);
+/// smaller batches stay under the limit while **each** batch still uses MultiSend when it contains 2+ redeems.
+const REDEEM_MULTISEND_CHUNK: usize = 8;
 
 sol! {
     /// Same selector/ABI as CTF `redeemPositions`; adapter ignores `collateralToken`, `parentCollectionId`, and `indexSets`.
@@ -77,6 +83,23 @@ struct SubmitResponse {
     #[allow(dead_code)]
     transaction_hash: String,
     state: String,
+}
+
+#[derive(Deserialize)]
+struct RelayerTxRecord {
+    #[serde(rename = "errorMsg", default)]
+    error_msg: Option<String>,
+}
+
+async fn relayer_transaction_error_msg(http: &Client, transaction_id: &str) -> Option<String> {
+    let url = format!("{RELAYER_HOST}/transaction?id={transaction_id}");
+    let resp = http.get(&url).send().await.ok()?;
+    if !resp.status().is_success() {
+        return None;
+    }
+    let txt = resp.text().await.ok()?;
+    let rows: Vec<RelayerTxRecord> = serde_json::from_str(&txt).ok()?;
+    rows.into_iter().next().and_then(|r| r.error_msg)
 }
 
 /// Polymarket CREATE2 Safe for browser-wallet users (`derive_safe_wallet` in `polymarket_client_sdk_v2`).
@@ -117,6 +140,26 @@ fn encode_safe_multisend_calldata_from_packed(packed: Vec<u8>) -> Result<Vec<u8>
         transactions: packed.into(),
     }
     .abi_encode())
+}
+
+/// One Safe tx: single adapter call, or `MultiSend` when `ops.len() > 1`.
+fn build_redeem_safe_tx_from_ops(
+    mut ops: Vec<(String, Address, Vec<u8>)>,
+) -> Result<(Address, Vec<u8>, u8)> {
+    if ops.is_empty() {
+        bail!("redeem: empty ops");
+    }
+    if ops.len() == 1 {
+        let (_, t, d) = ops.pop().expect("len==1");
+        Ok((t, d, 0u8))
+    } else {
+        let mut packed = Vec::new();
+        for (_, t, d) in &ops {
+            packed.extend(gnosis_multisend_pack_inner_call(*t, U256::ZERO, d));
+        }
+        let data = encode_safe_multisend_calldata_from_packed(packed)?;
+        Ok((SAFE_MULTISEND, data, 1u8))
+    }
 }
 
 /// Pack ECDSA signature for Polymarket Safe relayer (see `builder-relayer-client` `splitAndPackSig`).
@@ -234,12 +277,6 @@ async fn relayer_submit(
     relayer_key_addr: Address,
     body: serde_json::Value,
 ) -> Result<SubmitResponse> {
-    info!(
-        proxy_wallet = %body.get("proxyWallet").and_then(|v| v.as_str()).unwrap_or("?"),
-        to = %body.get("to").and_then(|v| v.as_str()).unwrap_or("?"),
-        nonce = %body.get("nonce").and_then(|v| v.as_str()).unwrap_or("?"),
-        "relayer POST /submit: sending transaction"
-    );
     let resp = http
         .post(format!("{RELAYER_HOST}/submit"))
         .header("RELAYER_API_KEY", relayer_key)
@@ -255,27 +292,21 @@ async fn relayer_submit(
     let txt = resp.text().await.unwrap_or_default();
     let body_trim = txt.trim();
     if !status.is_success() {
+        let snippet: String = body_trim.chars().take(512).collect();
         error!(
             status = %status,
-            response_body = %body_trim,
+            response_snippet = %snippet,
             "relayer POST /submit: HTTP error"
         );
         bail!("relayer /submit failed: {status} — {}", body_trim);
     }
     match serde_json::from_str::<SubmitResponse>(body_trim) {
-        Ok(out) => {
-            info!(
-                transaction_id = %out.transaction_id,
-                state = %out.state,
-                response_body = %body_trim,
-                "relayer POST /submit: success"
-            );
-            Ok(out)
-        }
+        Ok(out) => Ok(out),
         Err(e) => {
+            let snippet: String = body_trim.chars().take(512).collect();
             error!(
                 error = %e,
-                response_body = %body_trim,
+                response_snippet = %snippet,
                 "relayer POST /submit: JSON decode error (HTTP 2xx)"
             );
             Err(e).with_context(|| format!("decode /submit: {body_trim}"))
@@ -302,9 +333,9 @@ pub(crate) fn parse_token_id_u256(s: &str) -> Result<U256> {
     U256::from_str_radix(t, 10).context("asset id decimal")
 }
 
-/// Redeem all redeemable positions returned by Data API in **one** relayer submission when possible:
-/// multiple adapter `redeemPositions` calls are packed with Gnosis `MultiSend` + Safe `DelegateCall`, matching
-/// [`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts).
+/// Redeem all redeemable positions from Data API through the relayer. Builds **MultiSend** batches
+/// ([`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts));
+/// when there are many markets, splits into multiple Safe txs (`REDEEM_MULTISEND_CHUNK`) so each stays within relayer limits.
 pub async fn redeem_resolved_positions(
     cfg: &Config,
     http: &Client,
@@ -374,74 +405,105 @@ pub async fn redeem_resolved_positions(
         bail!("CTF redeem: nothing to redeem (all rows skipped or no redeemable markets)");
     }
 
-    let (relay_to, calldata, safe_operation) = if ops.len() == 1 {
-        let (_, t, d) = ops.pop().expect("len==1");
-        (t, d, 0u8)
-    } else {
-        let mut packed = Vec::new();
-        for (_, t, d) in &ops {
-            packed.extend(gnosis_multisend_pack_inner_call(*t, U256::ZERO, d));
-        }
-        let data = encode_safe_multisend_calldata_from_packed(packed)?;
-        (SAFE_MULTISEND, data, 1u8)
-    };
-
-    let nonce = relayer_get_nonce(http, cfg.signer_address).await?;
-    let digest = safe_typed_data_digest(
-        crate::config::POLYGON_CHAIN_ID,
-        cfg.funder,
-        relay_to,
-        &calldata,
-        safe_operation,
-        &nonce,
-    )?;
-    // Polymarket `buildSafeTransactionRequest` signs the EIP-712 struct hash with
-    // `signMessage(hash)` (viem/ethers) → EIP-191 `personal_sign` over the 32-byte digest,
-    // **not** raw ECDSA on the digest. See `builder-relayer-client` `createSafeSignature`.
-    let sig = signer
-        .sign_message(digest.as_slice())
-        .await
-        .context("sign SafeTx digest (EIP-191 over EIP-712 hash, relayer-compatible)")?;
-    let sig_bytes: [u8; 65] = sig.as_bytes();
-    let packed = pack_safe_rel_signature(sig_bytes)?;
-
-    let req = json!({
-        "from": format!("{:#x}", cfg.signer_address),
-        "to": format!("{relay_to:#x}"),
-        "proxyWallet": format!("{:#x}", cfg.funder),
-        "data": format!(
-            "0x{}",
-            calldata.iter().map(|b| format!("{b:02x}")).collect::<String>()
-        ),
-        "nonce": nonce,
-        "signature": packed,
-        "signatureParams": {
-            "gasPrice": "0",
-            "operation": format!("{safe_operation}"),
-            "safeTxnGas": "0",
-            "baseGas": "0",
-            "gasToken": "0x0000000000000000000000000000000000000000",
-            "refundReceiver": "0x0000000000000000000000000000000000000000"
-        },
-        "type": "SAFE",
-        "metadata": "polymarket-crypto redeem-all"
-    });
-
-    let out = relayer_submit(http, rel_key, rel_addr, req).await?;
-    let markets = ops.len();
+    let market_count = ops.len();
     let ids = ops
         .iter()
         .map(|(s, _, _)| s.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+
+    let chunks: Vec<Vec<(String, Address, Vec<u8>)>> = ops
+        .chunks(REDEEM_MULTISEND_CHUNK)
+        .map(|c| c.to_vec())
+        .collect();
+    let num_chunks = chunks.len();
+    let mut summaries = Vec::new();
+
+    for (i, chunk_ops) in chunks.into_iter().enumerate() {
+        let chunk_idx = i + 1;
+        let chunk_len = chunk_ops.len();
+        let (relay_to, calldata, safe_operation) = build_redeem_safe_tx_from_ops(chunk_ops)?;
+        let nonce = relayer_get_nonce(http, cfg.signer_address).await?;
+        let digest = safe_typed_data_digest(
+            crate::config::POLYGON_CHAIN_ID,
+            cfg.funder,
+            relay_to,
+            &calldata,
+            safe_operation,
+            &nonce,
+        )?;
+        // Polymarket `buildSafeTransactionRequest` signs the EIP-712 struct hash with
+        // `signMessage(hash)` (viem/ethers) → EIP-191 `personal_sign` over the 32-byte digest.
+        let sig = signer
+            .sign_message(digest.as_slice())
+            .await
+            .context("sign SafeTx digest (EIP-191 over EIP-712 hash, relayer-compatible)")?;
+        let sig_bytes: [u8; 65] = sig.as_bytes();
+        let packed_sig = pack_safe_rel_signature(sig_bytes)?;
+
+        let metadata = format!("polymarket-crypto redeem {}/{}", chunk_idx, num_chunks);
+        let req = json!({
+            "from": format!("{:#x}", cfg.signer_address),
+            "to": format!("{relay_to:#x}"),
+            "proxyWallet": format!("{:#x}", cfg.funder),
+            "data": format!(
+                "0x{}",
+                calldata.iter().map(|b| format!("{b:02x}")).collect::<String>()
+            ),
+            "nonce": nonce,
+            "signature": packed_sig,
+            "signatureParams": {
+                "gasPrice": "0",
+                "operation": format!("{safe_operation}"),
+                "safeTxnGas": "0",
+                "baseGas": "0",
+                "gasToken": "0x0000000000000000000000000000000000000000",
+                "refundReceiver": "0x0000000000000000000000000000000000000000"
+            },
+            "type": "SAFE",
+            "metadata": metadata,
+        });
+
+        let out = relayer_submit(http, rel_key, rel_addr, req).await?;
+        if out.state.eq_ignore_ascii_case("STATE_FAILED") {
+            let detail = relayer_transaction_error_msg(http, &out.transaction_id).await;
+            bail!(
+                "relayer MultiSend batch {}/{} failed ({} redeems in tx): state={} transactionID={}{}",
+                chunk_idx,
+                num_chunks,
+                chunk_len,
+                out.state,
+                out.transaction_id,
+                detail
+                    .map(|d| format!(" — {d}"))
+                    .unwrap_or_default()
+            );
+        }
+
+        summaries.push(format!(
+            "[{}/{}] {} ({}){}",
+            chunk_idx,
+            num_chunks,
+            out.transaction_id,
+            out.state,
+            if safe_operation == 1 {
+                " MultiSend"
+            } else {
+                ""
+            }
+        ));
+    }
+
     Ok(format!(
-        "{markets} market(s){} → relayer {} ({}) [{ids}]",
-        if safe_operation == 1 {
-            " (MultiSend batch)"
+        "{} market(s) in {} relayer submission(s){} → {} [{}]",
+        market_count,
+        num_chunks,
+        if num_chunks > 1 {
+            " (MultiSend batched)"
         } else {
             ""
         },
-        out.transaction_id,
-        out.state
+        summaries.join("; "),
+        ids
     ))
 }
