@@ -372,7 +372,14 @@ pub async fn redeem_resolved_positions(
         bail!("Safe not deployed on-chain yet — use polymarket.com once before redeeming");
     }
 
-    let mut redeemable: Vec<&DataPosition> = positions.iter().filter(|p| p.redeemable).collect();
+    let mut redeemable: Vec<&DataPosition> = positions
+        .iter()
+        .filter(|p| {
+            p.redeemable
+                && p.current_value.is_finite()
+                && p.current_value > 0.0
+        })
+        .collect();
     redeemable.sort_by(|a, b| a.condition_id.cmp(&b.condition_id));
     if redeemable.is_empty() {
         bail!("no redeemable positions from Data API");
