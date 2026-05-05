@@ -26,6 +26,8 @@ This terminal app lets you:
 
 Everything happens in the terminal. No browser required once you have your wallet configured.
 
+![Terminal trading interface: spot price, UP/DOWN order book, balances, positions, and key bindings](screenshot.png)
+
 ## Quick start
 
 ### Option A — pre-built binary (no Rust required)
