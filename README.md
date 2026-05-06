@@ -24,6 +24,8 @@ This terminal app lets you:
 - **Redeem** resolved winnings via the Polymarket relayer (Safe wallets)
 - Fetch a **Solana USDC deposit address** via Polymarket Bridge (key `f`)
 
+There is also an optional **Node.js script** [`scripts/transfer-erc20.mjs`](scripts/transfer-erc20.mjs) to send ERC-20 tokens from your EOA or (with the relayer) from your Polymarket **deposit wallet** — see [Scripts — ERC-20 transfer](#scripts--erc-20-transfer).
+
 Everything happens in the terminal. No browser required once you have your wallet configured.
 
 ![Terminal trading interface: spot price, UP/DOWN order book, balances, positions, and key bindings](screenshot.png)
@@ -275,6 +277,9 @@ Network I/O never runs on the render path. Trading actions (place order, cancel,
 ## Project layout
 
 ```
+scripts/
+├── package.json                 # Node deps for transfer-erc20.mjs (viem, dotenv)
+└── transfer-erc20.mjs           # ERC-20 transfer helper (EOA or deposit wallet via relayer)
 src/
 ├── main.rs                      # event loop, action dispatch, wizard
 ├── app.rs                       # AppState, positions, fills, event reducer
@@ -298,6 +303,43 @@ src/
 │   └── market_discovery_gamma.rs # Gamma poll + market roll
 └── ui/render.rs                 # ratatui layout
 ```
+
+## Scripts — ERC-20 transfer
+
+[`scripts/transfer-erc20.mjs`](scripts/transfer-erc20.mjs) transfers an ERC-20 balance **from the wallet derived from `POLYMARKET_PK`** to any recipient. It loads `.env` from the current working directory (run from the repo root where `.env` lives).
+
+**Prerequisites:** Node.js 18+ and a one-time install:
+
+```sh
+cd scripts && npm install
+```
+
+**Required environment variables:** `POLYMARKET_PK`, `POLYGON_RPC_URL`.
+
+**Usage**
+
+| Mode | Command summary |
+|---|---|
+| **EOA** (default) | Sends from the plain address derived from `POLYMARKET_PK`. You need POL on Polygon for gas. |
+| **Deposit wallet** | Pass `--from-deposit` to send from your deterministic Polymarket deposit wallet via a relayer **`WALLET`** batch (same EIP-712 pattern as deposit-wallet approvals in-app). Also requires **`POLYMARKET_RELAYER_API_KEY`** and **`POLYMARKET_RELAYER_API_KEY_ADDRESS`**. Optional **`RELAYER_URL`** (defaults to production `https://relayer-v2.polymarket.com`). |
+
+Examples:
+
+```sh
+# From repo root — transfer from EOA (omit --amount to send full token balance)
+cd scripts && node transfer-erc20.mjs --token 0xYourToken --to 0xRecipient --amount 10 --decimals 6
+
+# From deposit wallet (SIG_TYPE=3 style funding address)
+cd scripts && node transfer-erc20.mjs --from-deposit --token 0xYourToken --to 0xRecipient --amount 10
+```
+
+Self-check for the CREATE2 deposit-wallet address (matches [`src/deposit_wallet.rs`](src/deposit_wallet.rs)):
+
+```sh
+cd scripts && node transfer-erc20.mjs --verify-derive
+```
+
+Full flags and behavior are documented in the script header.
 
 ## Known limitations
 
