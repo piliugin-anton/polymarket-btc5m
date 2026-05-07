@@ -91,6 +91,42 @@ pub async fn submit_relayer_json(
     serde_json::from_str(&txt).with_context(|| format!("decode /submit JSON: {}", txt.trim()))
 }
 
+/// After a `WALLET` batch completes on-chain, Polymarket may still return HTTP 400
+/// `wallet busy: active action exists` until the relayer clears its internal lock. Retry with backoff.
+pub async fn submit_relayer_json_retry_on_wallet_busy(
+    http: &Client,
+    relayer_base_url: &str,
+    relayer_api_key: &str,
+    relayer_api_key_address: Address,
+    body: &serde_json::Value,
+) -> Result<RelayerSubmitResponse> {
+    const MAX_ATTEMPTS: u32 = 18;
+    for attempt in 0..MAX_ATTEMPTS {
+        match submit_relayer_json(
+            http,
+            relayer_base_url,
+            relayer_api_key,
+            relayer_api_key_address,
+            body,
+        )
+        .await
+        {
+            Ok(r) => return Ok(r),
+            Err(e) => {
+                let s = format!("{e:#}").to_lowercase();
+                let transient = s.contains("wallet busy") || s.contains("active action");
+                if transient && attempt + 1 < MAX_ATTEMPTS {
+                    let ms = 400u64.saturating_add(u64::from(attempt).saturating_mul(150));
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+    bail!("relayer POST /submit: exhausted retries (wallet busy)")
+}
+
 #[derive(serde::Serialize)]
 struct WalletCreateBody {
     #[serde(rename = "type")]

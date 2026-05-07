@@ -1,4 +1,8 @@
-//! CTF redemption via Polymarket Relayer (gasless Safe `execTransaction`).
+//! CTF redemption via Polymarket Relayer.
+//!
+//! * **`POLYMARKET_SIG_TYPE=2` (Gnosis Safe)** — gasless Safe `execTransaction` (`type`: `SAFE`).
+//! * **`POLYMARKET_SIG_TYPE=3` ([deposit wallet](https://docs.polymarket.com/trading/deposit-wallet-migration))**
+//!   — relayer `WALLET` batch with EIP-712 `DepositWallet` / `Batch` (same wire format as approvals).
 //!
 //! After [CLOB V2 / pUSD](https://docs.polymarket.com/v2-migration), resolved shares live under
 //! [`ctf-exchange-v2`](https://github.com/Polymarket/ctf-exchange-v2) **collateral adapters**:
@@ -28,6 +32,14 @@ use tracing::{error, warn};
 
 use crate::config::{Config, SignatureType};
 use crate::data_api::DataPosition;
+use crate::deposit_wallet::DEPOSIT_WALLET_FACTORY_POLYGON;
+use crate::deposit_wallet_approvals::{
+    deposit_wallet_batch_typed_data, hex0x, relayer_base_url,
+    submit_collateral_adapter_allowances_for_adapters,
+};
+use crate::polymarket_relayer::{
+    normalize_relayer_base, relayer_wallet_nonce, submit_relayer_json_retry_on_wallet_busy,
+};
 
 const RELAYER_HOST: &str = "https://relayer-v2.polymarket.com";
 /// CtfCollateralAdapter (current Polygon deployment — relayer rejects legacy `0x…09718`).
@@ -48,7 +60,9 @@ const SAFE_MULTISEND: Address = address!("0xA238CBeb142c10Ef7Ad8442C6D1f9E89e07e
 const REDEEM_MULTISEND_CHUNK: usize = 8;
 
 sol! {
-    /// Same selector/ABI as CTF `redeemPositions`; adapter ignores `collateralToken`, `parentCollectionId`, and `indexSets`.
+    /// Same selector/ABI as CTF `redeemPositions`. Adapter still routes internally with USDC.e / pUSD;
+    /// `collateralToken` / `parentCollectionId` are unused on-chain. Use binary index sets `[1, 2]` per
+    /// [Redeem Tokens](https://docs.polymarket.com/trading/ctf/redeem).
     contract CtfCollateralAdapter {
         function redeemPositions(
             address collateralToken,
@@ -65,6 +79,14 @@ sol! {
     }
 }
 
+sol! {
+    interface IERC1155Ops {
+        function isApprovedForAll(address account, address operator) external view returns (bool);
+    }
+}
+
+/// Gnosis Conditional Tokens `ERC1155` — operator checks for collateral adapters.
+const CTF_ERC1155: Address = address!("0x4D97DCd97eC945f40cF65f87097ACe5EA0476045");
 #[derive(Deserialize)]
 struct NonceResponse {
     nonce: String,
@@ -91,8 +113,13 @@ struct RelayerTxRecord {
     error_msg: Option<String>,
 }
 
-async fn relayer_transaction_error_msg(http: &Client, transaction_id: &str) -> Option<String> {
-    let url = format!("{RELAYER_HOST}/transaction?id={transaction_id}");
+async fn relayer_transaction_error_msg(
+    http: &Client,
+    relayer_base: &str,
+    transaction_id: &str,
+) -> Option<String> {
+    let base = normalize_relayer_base(relayer_base);
+    let url = format!("{base}/transaction?id={transaction_id}");
     let resp = http.get(&url).send().await.ok()?;
     if !resp.status().is_success() {
         return None;
@@ -115,7 +142,7 @@ fn encode_v2_adapter_redeem(condition_id: B256) -> Vec<u8> {
         collateralToken: Address::ZERO,
         parentCollectionId: B256::ZERO,
         conditionId: condition_id,
-        indexSets: vec![],
+        indexSets: vec![U256::from(1u64), U256::from(2u64)],
     }
     .abi_encode()
 }
@@ -271,6 +298,107 @@ async fn relayer_deployed(http: &Client, proxy_wallet: Address) -> Result<bool> 
     Ok(d.deployed)
 }
 
+/// `eth_getCode` — true if `address` has contract bytecode (EOA / empty returns false).
+/// Used for **deposit wallets**: relayer `GET /deployed` is Safe/proxy-oriented and stays false for deposit wallets.
+async fn polygon_address_has_contract_code(
+    http: &Client,
+    rpc_url: &str,
+    address: Address,
+) -> Result<bool> {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1u64,
+        "method": "eth_getCode",
+        "params": [format!("{address:#x}"), "latest"],
+    });
+    let resp = http
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("Polygon RPC POST {}", rpc_url.trim_end_matches('/')))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("Polygon RPC HTTP {status} — {}", txt.trim());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).with_context(|| format!("decode eth_getCode: {}", txt.trim()))?;
+    if let Some(err) = v.get("error") {
+        bail!("eth_getCode error: {err}");
+    }
+    let code = v
+        .get("result")
+        .and_then(|r| r.as_str())
+        .unwrap_or("0x");
+    Ok(code.len() > 2 && code != "0x")
+}
+
+/// JSON-RPC `eth_call` — returns `result` hex string (no `0x` prefix required in return).
+async fn polygon_eth_call(
+    http: &Client,
+    rpc_url: &str,
+    to: Address,
+    calldata: &[u8],
+) -> Result<String> {
+    let data_hex = format!("0x{}", hex::encode(calldata));
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1u64,
+        "method": "eth_call",
+        "params": [{
+            "to": format!("{to:#x}"),
+            "data": data_hex,
+        }, "latest"]
+    });
+    let resp = http
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .with_context(|| format!("Polygon eth_call POST {}", rpc_url.trim_end_matches('/')))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        bail!("Polygon RPC HTTP {status} — {}", txt.trim());
+    }
+    let v: serde_json::Value =
+        serde_json::from_str(&txt).with_context(|| format!("decode eth_call: {}", txt.trim()))?;
+    if let Some(err) = v.get("error") {
+        bail!("eth_call error: {err}");
+    }
+    v.get("result")
+        .and_then(|r| r.as_str())
+        .map(String::from)
+        .context("eth_call missing result")
+}
+
+fn decode_abi_bool_result(result_hex: &str) -> Result<bool> {
+    let h = result_hex.strip_prefix("0x").unwrap_or(result_hex);
+    if h.len() < 64 {
+        bail!("eth_call bool: short result {h}");
+    }
+    let b = hex::decode(h).context("eth_call result hex")?;
+    let w = b
+        .get(b.len().saturating_sub(32)..)
+        .ok_or_else(|| anyhow::anyhow!("eth_call bool: slice"))?;
+    Ok(!w.iter().all(|x| *x == 0))
+}
+
+async fn ctf_is_approved_for_all(
+    http: &Client,
+    rpc_url: &str,
+    owner: Address,
+    operator: Address,
+) -> Result<bool> {
+    let call = IERC1155Ops::isApprovedForAllCall {
+        account: owner,
+        operator,
+    };
+    let raw = polygon_eth_call(http, rpc_url, CTF_ERC1155, &call.abi_encode()).await?;
+    decode_abi_bool_result(&raw)
+}
+
 async fn relayer_submit(
     http: &Client,
     relayer_key: &str,
@@ -333,45 +461,8 @@ pub(crate) fn parse_token_id_u256(s: &str) -> Result<U256> {
     U256::from_str_radix(t, 10).context("asset id decimal")
 }
 
-/// Redeem all redeemable positions from Data API through the relayer. Builds **MultiSend** batches
-/// ([`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts));
-/// when there are many markets, splits into multiple Safe txs (`REDEEM_MULTISEND_CHUNK`) so each stays within relayer limits.
-pub async fn redeem_resolved_positions(
-    cfg: &Config,
-    http: &Client,
-    positions: &[DataPosition],
-) -> Result<String> {
-    if cfg.sig_type != SignatureType::PolyGnosisSafe {
-        bail!(
-            "CTF redeem via relayer supports POLYMARKET_SIG_TYPE=2 (Gnosis Safe) only. \
-             For EOA/proxy wallets use polymarket.com Portfolio or the official CLI."
-        );
-    }
-    let rel_key = cfg
-        .relayer_api_key
-        .as_deref()
-        .filter(|s| !s.is_empty())
-        .context(
-            "set POLYMARKET_RELAYER_API_KEY (+ POLYMARKET_RELAYER_API_KEY_ADDRESS) — create at \
-             polymarket.com → Settings → API (Relayer)",
-        )?;
-    let rel_addr = cfg
-        .relayer_api_key_address
-        .context("POLYMARKET_RELAYER_API_KEY_ADDRESS")?;
-
-    let signer: PrivateKeySigner = cfg.private_key.parse().context("parse POLYMARKET_PK")?;
-    let derived_safe = derive_polymarket_safe(cfg.signer_address);
-    if derived_safe != cfg.funder {
-        bail!(
-            "POLYMARKET_FUNDER ({:#x}) != derived Safe ({:#x}) for this EOA — check env",
-            cfg.funder,
-            derived_safe
-        );
-    }
-    if !relayer_deployed(http, cfg.funder).await? {
-        bail!("Safe not deployed on-chain yet — use polymarket.com once before redeeming");
-    }
-
+/// Build adapter calldata for each unique redeemable condition (Data API).
+fn collect_redeem_ops(positions: &[DataPosition]) -> Result<Vec<(String, Address, Vec<u8>)>> {
     let mut redeemable: Vec<&DataPosition> = positions
         .iter()
         .filter(|p| {
@@ -411,6 +502,28 @@ pub async fn redeem_resolved_positions(
     if ops.is_empty() {
         bail!("CTF redeem: nothing to redeem (all rows skipped or no redeemable markets)");
     }
+    Ok(ops)
+}
+
+async fn redeem_via_safe(
+    cfg: &Config,
+    http: &Client,
+    ops: Vec<(String, Address, Vec<u8>)>,
+    rel_key: &str,
+    rel_addr: Address,
+) -> Result<String> {
+    let signer: PrivateKeySigner = cfg.private_key.parse().context("parse POLYMARKET_PK")?;
+    let derived_safe = derive_polymarket_safe(cfg.signer_address);
+    if derived_safe != cfg.funder {
+        bail!(
+            "POLYMARKET_FUNDER ({:#x}) != derived Safe ({:#x}) for this EOA — check env",
+            cfg.funder,
+            derived_safe
+        );
+    }
+    if !relayer_deployed(http, cfg.funder).await? {
+        bail!("Safe not deployed on-chain yet — use polymarket.com once before redeeming");
+    }
 
     let market_count = ops.len();
     let ids = ops
@@ -439,8 +552,6 @@ pub async fn redeem_resolved_positions(
             safe_operation,
             &nonce,
         )?;
-        // Polymarket `buildSafeTransactionRequest` signs the EIP-712 struct hash with
-        // `signMessage(hash)` (viem/ethers) → EIP-191 `personal_sign` over the 32-byte digest.
         let sig = signer
             .sign_message(digest.as_slice())
             .await
@@ -472,8 +583,12 @@ pub async fn redeem_resolved_positions(
         });
 
         let out = relayer_submit(http, rel_key, rel_addr, req).await?;
+        let fail_detail = if out.state.eq_ignore_ascii_case("STATE_FAILED") {
+            relayer_transaction_error_msg(http, RELAYER_HOST, &out.transaction_id).await
+        } else {
+            None
+        };
         if out.state.eq_ignore_ascii_case("STATE_FAILED") {
-            let detail = relayer_transaction_error_msg(http, &out.transaction_id).await;
             bail!(
                 "relayer MultiSend batch {}/{} failed ({} redeems in tx): state={} transactionID={}{}",
                 chunk_idx,
@@ -481,9 +596,7 @@ pub async fn redeem_resolved_positions(
                 chunk_len,
                 out.state,
                 out.transaction_id,
-                detail
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default()
+                fail_detail.map(|d| format!(" — {d}")).unwrap_or_default()
             );
         }
 
@@ -513,4 +626,208 @@ pub async fn redeem_resolved_positions(
         summaries.join("; "),
         ids
     ))
+}
+
+async fn redeem_via_deposit_wallet(
+    cfg: &Config,
+    http: &Client,
+    ops: Vec<(String, Address, Vec<u8>)>,
+    rel_key: &str,
+    rel_addr: Address,
+) -> Result<String> {
+    let relayer_base = relayer_base_url();
+    let signer: PrivateKeySigner = cfg.private_key.parse().context("parse POLYMARKET_PK")?;
+    let owner = cfg.signer_address;
+    let deposit_wallet = cfg.funder;
+
+    let has_code =
+        polygon_address_has_contract_code(http, cfg.polygon_rpc_url.as_str(), deposit_wallet)
+            .await?;
+    if !has_code {
+        bail!(
+            "Deposit wallet has no contract code on Polygon — deploy with relayer WALLET-CREATE first \
+             (verify POLYGON_RPC_URL reaches Polygon mainnet)"
+        );
+    }
+
+    let rpc_url = cfg.polygon_rpc_url.as_str();
+    let mut uniq_adapters: Vec<Address> = ops
+        .iter()
+        .map(|(_, ad, _)| *ad)
+        .collect::<std::collections::HashSet<_>>()
+        .into_iter()
+        .collect();
+    uniq_adapters.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+
+    let mut need_operator_fix: Vec<Address> = Vec::new();
+    for ad in &uniq_adapters {
+        let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, *ad)
+            .await
+            .with_context(|| format!("Polygon eth_call isApprovedForAll ({ad:#x})"))?;
+        if !ok {
+            need_operator_fix.push(*ad);
+        }
+    }
+
+    if !need_operator_fix.is_empty() {
+        submit_collateral_adapter_allowances_for_adapters(cfg, http, &need_operator_fix)
+            .await
+            .context("relayer WALLET batch (CTF collateral adapter allowances)")?;
+
+        for ad in &uniq_adapters {
+            let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, *ad)
+                .await
+                .with_context(|| format!("re-check isApprovedForAll ({ad:#x})"))?;
+            if !ok {
+                bail!(
+                    "CTF `isApprovedForAll` still false for {ad:#x} after collateral allowance batch — \
+                     check Polygon RPC matches mainnet or retry deposit-wallet approvals"
+                );
+            }
+        }
+    }
+
+    let market_count = ops.len();
+    let ids = ops
+        .iter()
+        .map(|(s, _, _)| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    let chunks: Vec<Vec<(String, Address, Vec<u8>)>> = ops
+        .chunks(REDEEM_MULTISEND_CHUNK)
+        .map(|c| c.to_vec())
+        .collect();
+    let num_chunks = chunks.len();
+    let mut summaries = Vec::new();
+
+    for (i, chunk_ops) in chunks.into_iter().enumerate() {
+        let chunk_idx = i + 1;
+        let chunk_len = chunk_ops.len();
+        let nonce = relayer_wallet_nonce(http, &relayer_base, owner).await?;
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system time")?
+            .as_secs()
+            + 240;
+
+        let calls: Vec<(Address, U256, Vec<u8>)> = chunk_ops
+            .iter()
+            .map(|(_, adapter, data)| (*adapter, U256::ZERO, data.clone()))
+            .collect();
+
+        let typed =
+            deposit_wallet_batch_typed_data(deposit_wallet, &nonce, deadline, &calls)?;
+        let digest = typed
+            .eip712_signing_hash()
+            .map_err(|e| anyhow::anyhow!("DepositWallet Batch EIP-712 hash: {e}"))?;
+        let sig = signer
+            .sign_hash(&digest)
+            .await
+            .context("sign DepositWallet Batch (relayer WALLET)")?;
+        let signature = format!("0x{}", hex::encode(sig.as_bytes()));
+
+        let calls_submit: Vec<_> = chunk_ops
+            .iter()
+            .map(|(_, target, data)| {
+                json!({
+                    "target": format!("{target:#x}"),
+                    "value": "0",
+                    "data": hex0x(data),
+                })
+            })
+            .collect();
+
+        let body = json!({
+            "type": "WALLET",
+            "from": format!("{owner:#x}"),
+            "to": format!("{:#x}", DEPOSIT_WALLET_FACTORY_POLYGON),
+            "nonce": nonce,
+            "signature": signature,
+            "depositWalletParams": {
+                "depositWallet": format!("{deposit_wallet:#x}"),
+                "deadline": deadline.to_string(),
+                "calls": calls_submit
+            }
+        });
+
+        let out =
+            submit_relayer_json_retry_on_wallet_busy(http, &relayer_base, rel_key, rel_addr, &body)
+                .await?;
+        let fail_detail = if out.state.eq_ignore_ascii_case("STATE_FAILED") {
+            relayer_transaction_error_msg(http, &relayer_base, &out.transaction_id).await
+        } else {
+            None
+        };
+        if out.state.eq_ignore_ascii_case("STATE_FAILED") {
+            bail!(
+                "relayer deposit-wallet batch {}/{} failed ({} redeems in tx): state={} transactionID={}{}",
+                chunk_idx,
+                num_chunks,
+                chunk_len,
+                out.state,
+                out.transaction_id,
+                fail_detail.map(|d| format!(" — {d}")).unwrap_or_default()
+            );
+        }
+
+        summaries.push(format!(
+            "[{}/{}] {} ({}) deposit-wallet",
+            chunk_idx, num_chunks, out.transaction_id, out.state
+        ));
+    }
+
+    Ok(format!(
+        "{} market(s) in {} relayer WALLET submission(s){} → {} [{}]",
+        market_count,
+        num_chunks,
+        if num_chunks > 1 {
+            " (batched)"
+        } else {
+            ""
+        },
+        summaries.join("; "),
+        ids
+    ))
+}
+
+/// Redeem all redeemable positions from the Data API through the relayer.
+///
+/// * **`POLYMARKET_SIG_TYPE=2`** — Safe [`execTransaction`] (`SAFE`), optionally batched with **MultiSend**
+///   ([`aggregateTransaction`](https://github.com/Polymarket/builder-relayer-client/blob/main/src/builder/safe.ts)).
+/// * **`POLYMARKET_SIG_TYPE=3`** — [deposit wallet](https://docs.polymarket.com/trading/deposit-wallet-migration)
+///   **`WALLET`** batch (EIP-712 `DepositWallet` / `Batch`).
+///
+/// Large redemption sets are chunked (`REDEEM_MULTISEND_CHUNK`) so each submission stays within relayer limits.
+pub async fn redeem_resolved_positions(
+    cfg: &Config,
+    http: &Client,
+    positions: &[DataPosition],
+) -> Result<String> {
+    let rel_key = cfg
+        .relayer_api_key
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .context(
+            "set POLYMARKET_RELAYER_API_KEY (+ POLYMARKET_RELAYER_API_KEY_ADDRESS) — create at \
+             polymarket.com → Settings → API (Relayer)",
+        )?;
+    let rel_addr = cfg
+        .relayer_api_key_address
+        .context("POLYMARKET_RELAYER_API_KEY_ADDRESS")?;
+
+    let ops = collect_redeem_ops(positions)?;
+
+    match cfg.sig_type {
+        SignatureType::PolyGnosisSafe => redeem_via_safe(cfg, http, ops, rel_key, rel_addr).await,
+        SignatureType::Poly1271 => {
+            redeem_via_deposit_wallet(cfg, http, ops, rel_key, rel_addr).await
+        }
+        _ => {
+            bail!(
+                "CTF redeem via relayer supports POLYMARKET_SIG_TYPE=2 (Gnosis Safe) or 3 (deposit wallet / POLY_1271). \
+                 For EOA/proxy wallets use polymarket.com Portfolio or the official CLI."
+            );
+        }
+    }
 }
