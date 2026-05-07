@@ -1239,6 +1239,13 @@ impl AppState {
                 buy_trail_bps,
                 buy_trail_activation_bps,
             } => {
+                // Fold open mark-to-market PnL into `realized_pnl` before we drop books /
+                // positions. Otherwise `total_pnl` (rPnL + uPnL) would collapse to rPnL alone
+                // across the roll even though economics were unchanged at the last mark.
+                let roll_upnl = self.unrealized_pnl(Outcome::Up) + self.unrealized_pnl(Outcome::Down);
+                if roll_upnl.is_finite() {
+                    self.realized_pnl += roll_upnl;
+                }
                 // Close any positions from the previous market — they'll resolve
                 // via Polymarket and show up as realized once winnings redeem.
                 // We keep realized_pnl but zero out live positions for the new market.
