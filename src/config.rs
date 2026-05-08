@@ -1,6 +1,7 @@
 //! Configuration: endpoints, env vars, chain constants.
 //!
 //! All trading-sensitive values come from environment variables. See `.env.example`.
+//! Trailing width: prefer `BUY_TRAIL_BPS`; `MARKET_BUY_TRAIL_BPS` is a legacy alias when unset.
 
 use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
@@ -73,12 +74,14 @@ pub struct Config {
     /// reaches entry).
     pub market_buy_take_profit_bps: u32,
     /// If positive after a **Buy** (FAK market or GTD limit when the POST response includes a fill),
-    /// run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak. The same
-    /// value gates the trailing FAK **sell**: floor (`best_bid × (1 − sell slippage)`) must be at
-    /// least this many **gross** bps above cost basis before `place_order` (deferred until book
-    /// improves if not). Resting limit buys arm the same trail when the fill arrives on the user
-    /// channel as a **maker** leg (`MARKET_BUY_TRAIL_BPS` + values from the last market roll).
-    pub market_buy_trail_bps: u32,
+    /// run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak. Resting
+    /// limit buys arm the same trail when the fill arrives on the user channel as a **maker** leg
+    /// (`BUY_TRAIL_BPS` at startup, copied onto each [`crate::app::AppEvent::MarketRoll`]).
+    pub buy_trail_bps: u32,
+    /// Trailing FAK **sell** floor (`best_bid × (1 − sell slippage bps)`) must be at least this many
+    /// **gross** basis points above cost basis (`avg_entry` or trail install entry) before `place_order`.
+    /// `0` = no gate (legacy). If unset entry cannot be resolved, the sell is not blocked.
+    pub trailing_exit_min_profit_bps: u32,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -142,7 +145,17 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
-        let market_buy_trail_bps = std::env::var("MARKET_BUY_TRAIL_BPS")
+        let buy_trail_bps = std::env::var("BUY_TRAIL_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                std::env::var("MARKET_BUY_TRAIL_BPS")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
+            .unwrap_or(0);
+
+        let trailing_exit_min_profit_bps = std::env::var("TRAILING_EXIT_MIN_PROFIT_BPS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
@@ -196,7 +209,8 @@ impl Config {
             market_buy_slippage_bps,
             market_sell_slippage_bps,
             market_buy_take_profit_bps,
-            market_buy_trail_bps,
+            buy_trail_bps,
+            trailing_exit_min_profit_bps,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,

@@ -254,7 +254,7 @@ async fn apply_app_event(
                     });
                 }
                 AppEvent::MergeTakeProfitRestingSells { outcome } => {
-                    if cfg.market_buy_trail_bps == 0 && cfg.market_buy_take_profit_bps > 0 {
+                    if cfg.buy_trail_bps == 0 && cfg.market_buy_take_profit_bps > 0 {
                         if let Some(market) = state.market.clone() {
                             let pos = match outcome {
                                 Outcome::Up => state.position_up.clone(),
@@ -366,20 +366,20 @@ fn try_dispatch_trailing_sell(
             newq.push_back(ex);
             continue;
         };
-        if cfg.market_buy_trail_bps > 0 {
+        if cfg.trailing_exit_min_profit_bps > 0 {
             if let Some(entry) = state.trailing_exit_entry_for_dispatch(&ex) {
                 if !trailing_exit_sell_meets_min_gross_profit_bps(
                     price,
                     entry,
-                    cfg.market_buy_trail_bps,
+                    cfg.trailing_exit_min_profit_bps,
                 ) {
                     debug!(
                         outcome = ?ex.outcome,
                         token_id = %ex.token_id,
                         sell_floor = price,
                         entry,
-                        trail_bps = cfg.market_buy_trail_bps,
-                        "trailing: FAK SELL deferred — sell floor below entry×(1+MARKET_BUY_TRAIL_BPS)",
+                        min_bps = cfg.trailing_exit_min_profit_bps,
+                        "trailing: FAK SELL deferred — sell floor below entry×(1+min profit bps)",
                     );
                     newq.push_back(ex);
                     continue;
@@ -1071,8 +1071,9 @@ async fn main() -> Result<()> {
         funder = %cfg.funder,
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
         market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
-        market_buy_trail_bps = cfg.market_buy_trail_bps,
-        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell requires floor ≥ entry×(1+TRAIL_BPS))",
+        buy_trail_bps = cfg.buy_trail_bps,
+        trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
+        "config loaded (GTD take-profit if TP_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
@@ -1216,7 +1217,7 @@ async fn main() -> Result<()> {
     let tx_for_books = tx.clone();
     let trading_for_positions = trading.clone();
     let data_api_user = cfg.funder;
-    let buy_trail_bps_supervisor = cfg.market_buy_trail_bps;
+    let buy_trail_bps_supervisor = cfg.buy_trail_bps;
     let buy_trail_activation_bps_supervisor = cfg.market_buy_take_profit_bps;
     let user_open_ledger = std::sync::Arc::new(feeds::clob_user_ws::UserOpenOrdersLedger::new());
     let user_trade_sync = std::sync::Arc::new(feeds::user_trade_sync::UserTradeSync::new());
@@ -2088,7 +2089,7 @@ fn dispatch_action(
                 buy_notional,
                 0,
                 cfg.market_buy_take_profit_bps,
-                cfg.market_buy_trail_bps,
+                cfg.buy_trail_bps,
                 false,
             );
         }
@@ -2138,7 +2139,7 @@ fn dispatch_action(
                 buy_notional,
                 exp_secs,
                 cfg.market_buy_take_profit_bps,
-                cfg.market_buy_trail_bps,
+                cfg.buy_trail_bps,
                 false,
             );
         }

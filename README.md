@@ -124,8 +124,8 @@ Optional but useful:
 | Variable | What it is |
 |---|---|
 | `POLYMARKET_PROXY` | Proxy for geo-blocked regions — see [Geo-restrictions](#geo-restricted) |
-| `MARKET_BUY_TRAIL_BPS` | Trailing stop width in bps from peak bid (`0` = off). Applies to **market and limit BUY** when set |
-| `MARKET_BUY_TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). Also used for auto take-profit **GTD sell after market BUY** when `TRAIL_BPS` is `0` |
+| `BUY_TRAIL_BPS` | Trailing stop width in bps from peak best bid (`0` = off). Applies after **market or limit** buys that arm the trail. Legacy: `MARKET_BUY_TRAIL_BPS` is used if `BUY_TRAIL_BPS` is unset |
+| `MARKET_BUY_TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). Also used for auto take-profit **GTD sell after market BUY** when `BUY_TRAIL_BPS` is `0` |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
 | `POLYMARKET_RELAYER_API_KEY` | Redeem (`x` / `X`, Safe only), **`deploy-wallet`**, and deposit-wallet **approvals** (`b` in TUI when `SIG_TYPE=3`) — same Relayer API key from Settings → API |
 
@@ -216,7 +216,7 @@ GTD orders expire one second before the active window closes. The app enforces a
 
 1. Start with a small `DEFAULT_SIZE_USDC` (e.g. `1.0` or `5.0`) until you trust the setup.
 2. Run `debug-auth` before your first trade to verify credentials are correct (see [Troubleshooting](#troubleshooting-clob-credentials)).
-3. If you enable `MARKET_BUY_TRAIL_BPS`, a trip fires a real **FAK SELL** (market or limit buy). Test with minimum size first. For **resting limit buys**, the trail is registered when the fill hits the user WebSocket as a **maker** leg; an immediate limit match in the POST response uses the same path as a market buy.
+3. If you enable `BUY_TRAIL_BPS`, a trip fires a real **FAK SELL** (market or limit buy). Test with minimum size first. For **resting limit buys**, the trail is registered when the fill hits the user WebSocket as a **maker** leg; an immediate limit match in the POST response uses the same path as a market buy.
 4. Never commit `.env` with real keys. The example ships with zero-filled keys so a copy without editing will fail loudly.
 
 ## Geo-restricted?
@@ -344,7 +344,7 @@ Full flags and behavior are documented in the script header.
 ## Known limitations
 
 - **Trailing + resting limits.** If a limit buy that first went `live` later fills with you as **taker** on the user-channel trade, the app may not register that fill for trailing (maker-leg path only). Prefer a market buy or an immediately matched limit if you rely on the trail.
-- **Trailing after restart.** With `MARKET_BUY_TRAIL_BPS > 0` (stored at market roll), trade replay re-registers a trail from **long size + VWAP `avg_entry`**; the in-trail peak ratchet starts over from the new session’s book (no remembered pre-crash peak).
+- **Trailing after restart.** With `BUY_TRAIL_BPS > 0` (stored at market roll), trade replay re-registers a trail from **long size + VWAP `avg_entry`**; the in-trail peak ratchet starts over from the new session’s book (no remembered pre-crash peak).
 - **No full web-app parity.** Edge cases like partial fills or unusual order states may not match what the website shows.
 - **No on-chain allowance setup.** Assumes spender approvals are already set. If not, run a one-time approval script (see [NautilusTrader docs](https://nautilustrader.io/docs/latest/integrations/polymarket/) for reference).
 - **Relayer required for redemption.** The `x` key only works with `POLYMARKET_RELAYER_API_KEY` and `POLYMARKET_SIG_TYPE=2`. Plain EOA users need the web Portfolio page.

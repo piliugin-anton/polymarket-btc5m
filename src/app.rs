@@ -161,7 +161,7 @@ pub enum AppEvent {
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
     /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
     StartTrading(std::sync::Arc<MarketProfile>),
-    /// After a market **Buy** (FAK) with `MARKET_BUY_TAKE_PROFIT_BPS > 0` and `MARKET_BUY_TRAIL_BPS == 0`:
+    /// After a market **Buy** (FAK) with `MARKET_BUY_TAKE_PROFIT_BPS > 0` and `BUY_TRAIL_BPS == 0`:
     /// consolidate take-profit vs open SELL legs and current position (handled in `main::apply_app_event`).
     RunTakeProfitAfterMarketBuy {
         market: crate::gamma::ActiveMarket,
@@ -175,7 +175,7 @@ pub enum AppEvent {
     MergeTakeProfitRestingSells {
         outcome: Outcome,
     },
-    /// After a market **Buy** (FAK) when `MARKET_BUY_TRAIL_BPS` is set: register until CLOB **mid**
+    /// After a **Buy** (FAK or GTD with fill in POST) when `BUY_TRAIL_BPS` is set: register until CLOB **mid**
     /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
     RequestTrailingArm {
         outcome: Outcome,
