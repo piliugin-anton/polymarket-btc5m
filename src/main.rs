@@ -42,8 +42,8 @@ mod ui;
 use anyhow::{Context, Result};
 use app::{
     clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
-    resolve_market_order, resolve_trailing_sell, AppEvent, AppState, Outcome, TrailingExit,
-    MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
+    resolve_market_order, resolve_trailing_sell, trailing_exit_sell_meets_min_gross_profit_bps,
+    AppEvent, AppState, Outcome, TrailingExit, MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
 };
 use config::Config;
 use crossterm::{
@@ -366,6 +366,26 @@ fn try_dispatch_trailing_sell(
             newq.push_back(ex);
             continue;
         };
+        if cfg.market_buy_trail_bps > 0 {
+            if let Some(entry) = state.trailing_exit_entry_for_dispatch(&ex) {
+                if !trailing_exit_sell_meets_min_gross_profit_bps(
+                    price,
+                    entry,
+                    cfg.market_buy_trail_bps,
+                ) {
+                    debug!(
+                        outcome = ?ex.outcome,
+                        token_id = %ex.token_id,
+                        sell_floor = price,
+                        entry,
+                        trail_bps = cfg.market_buy_trail_bps,
+                        "trailing: FAK SELL deferred — sell floor below entry×(1+MARKET_BUY_TRAIL_BPS)",
+                    );
+                    newq.push_back(ex);
+                    continue;
+                }
+            }
+        }
         state.trailing_sell_in_flight.insert(ex.token_id.clone());
         started += 1;
         let exit = ex;
@@ -1052,7 +1072,7 @@ async fn main() -> Result<()> {
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
         market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
         market_buy_trail_bps = cfg.market_buy_trail_bps,
-        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position)",
+        "config loaded (GTD take-profit if TP_BPS>0 and TRAIL=0; trailing if TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell requires floor ≥ entry×(1+TRAIL_BPS))",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────

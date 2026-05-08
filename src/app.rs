@@ -791,6 +791,52 @@ impl AppState {
         sess.tracked_shares.max(0.0)
     }
 
+    /// Cost basis for status / trailing exit checks (same rules as `apply_trailing_book_tick`).
+    pub fn trailing_session_entry_px(&self, token_id: &str) -> Option<f64> {
+        let map_key = trailing_map_key_for_asset(&self.trailing, token_id)?;
+        let sess = self.trailing.get(&map_key)?;
+        let entry_px = if self
+            .market
+            .as_ref()
+            .is_some_and(|m| m.condition_id == sess.market.condition_id)
+        {
+            let pos = self.position(sess.outcome);
+            if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                pos.avg_entry
+            } else {
+                sess.stop.entry_price()
+            }
+        } else if let Some(oc) = self.outcome_for_active_token(map_key.as_str()) {
+            let pos = self.position(oc);
+            if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                pos.avg_entry
+            } else {
+                sess.stop.entry_price()
+            }
+        } else {
+            sess.stop.entry_price()
+        };
+        (entry_px.is_finite() && entry_px > 0.0).then_some(entry_px)
+    }
+
+    /// Entry for a queued trailing FAK sell: armed session if present, else live position on the exit market.
+    pub fn trailing_exit_entry_for_dispatch(&self, ex: &TrailingExit) -> Option<f64> {
+        if let Some(px) = self.trailing_session_entry_px(ex.token_id.as_str()) {
+            return Some(px);
+        }
+        if self
+            .market
+            .as_ref()
+            .is_some_and(|m| m.condition_id == ex.market.condition_id)
+        {
+            let pos = self.position(ex.outcome);
+            if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                return Some(pos.avg_entry);
+            }
+        }
+        None
+    }
+
     /// Drop trailing / pending-arm rows when REST replay shows no position on that leg (manual sell
     /// or fills missed on the user channel).
     fn sync_trailing_inventory_with_positions(&mut self) {
@@ -1082,27 +1128,9 @@ impl AppState {
         };
         let (token_id, market, outcome, plan, entry_px, live) = {
             let sess = self.trailing.get(&map_key).expect("trailing session");
-            let entry_px = if self
-                .market
-                .as_ref()
-                .is_some_and(|m| m.condition_id == sess.market.condition_id)
-            {
-                let pos = self.position(sess.outcome);
-                if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                    pos.avg_entry
-                } else {
-                    sess.stop.entry_price()
-                }
-            } else if let Some(oc) = self.outcome_for_active_token(&map_key) {
-                let pos = self.position(oc);
-                if pos.shares > 1e-9 && pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                    pos.avg_entry
-                } else {
-                    sess.stop.entry_price()
-                }
-            } else {
-                sess.stop.entry_price()
-            };
+            let entry_px = self
+                .trailing_session_entry_px(sess.token_id.as_str())
+                .unwrap_or_else(|| sess.stop.entry_price());
             let live = self.trail_live_shares(sess);
             (
                 sess.token_id.clone(),
@@ -2480,6 +2508,24 @@ pub fn resolve_market_order(
     }
 }
 
+/// Gross minimum edge vs `entry_px` for a trailing FAK sell floor (after sell slippage).
+/// `min_profit_bps == 0` disables the check. Invalid prices return `true` so dispatch is not stuck.
+#[inline]
+pub fn trailing_exit_sell_meets_min_gross_profit_bps(
+    sell_floor_px: f64,
+    entry_px: f64,
+    min_profit_bps: u32,
+) -> bool {
+    if min_profit_bps == 0 {
+        return true;
+    }
+    if !sell_floor_px.is_finite() || !entry_px.is_finite() || entry_px <= 0.0 {
+        return true;
+    }
+    let threshold = entry_px * (1.0 + min_profit_bps as f64 / 10_000.0);
+    sell_floor_px + 1e-12 >= threshold
+}
+
 /// FAK SELL pricing for a trailing exit on an arbitrary `token_id` (UI or watched book).
 pub fn resolve_trailing_sell(
     state: &AppState,
@@ -3670,5 +3716,28 @@ mod tests {
             s.pending_trail_arms.keys().collect::<Vec<_>>()
         );
         assert!(!s.trailing.contains_key("RH1"));
+    }
+
+    #[test]
+    fn trailing_exit_min_profit_bps_disabled_always_ok() {
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(0.40, 0.50, 0));
+    }
+
+    #[test]
+    fn trailing_exit_min_profit_bps_gross_edge_vs_entry() {
+        let entry = 0.50;
+        let bps = 100; // 1%
+        let threshold = entry * 1.01;
+        assert!(
+            !trailing_exit_sell_meets_min_gross_profit_bps(threshold - 1e-6, entry, bps),
+            "just below 1% gross should fail"
+        );
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(threshold, entry, bps));
+    }
+
+    #[test]
+    fn trailing_exit_min_profit_bps_skips_when_prices_invalid() {
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(f64::NAN, 0.5, 50));
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(0.6, 0.0, 50));
     }
 }
