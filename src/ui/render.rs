@@ -20,6 +20,7 @@ use crate::app::{
     AppState, DepositModalPhase, InputMode, LimitField, Outcome, SentimentDir, UiPhase,
 };
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
+use crate::market_activity::format_compact_notional;
 use crate::market_profile::Timeframe;
 
 const SPACES: &str = "                                "; // 32 spaces — wider than any balance panel
@@ -307,6 +308,14 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         Span::raw("  "),
     ];
     line1_parts.extend(sentiment_spans);
+    let act = format_compact_notional(s.cached_market_activity_notional);
+    line1_parts.push(Span::raw("  "));
+    line1_parts.push(Span::styled("Activity:", Style::default().fg(Color::DarkGray)));
+    line1_parts.push(Span::raw(" "));
+    line1_parts.push(Span::styled(
+        act,
+        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+    ));
     let line1 = Line::from(line1_parts);
     // Line 2: price to beat + countdown + market (+ background trailing sessions)
     let bg_trail = s.background_trail_count();

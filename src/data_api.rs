@@ -136,6 +136,49 @@ pub async fn fetch_positions_for_market(
     Ok(batch)
 }
 
+/// One row from public [`GET /trades`](https://docs.polymarket.com/api-reference/core/get-trades-for-a-user-or-markets) (no auth).
+#[derive(Debug, Clone, Deserialize)]
+pub struct DataApiPublicTrade {
+    #[serde(default)]
+    pub asset: String,
+    #[serde(default)]
+    pub price: f64,
+    #[serde(default)]
+    pub size: f64,
+    #[serde(default)]
+    pub timestamp: i64,
+}
+
+/// `GET /trades?market=<conditionId>&limit=…` — public trade tape for activity bootstrap.
+pub async fn fetch_public_trades_for_market(
+    http: &reqwest::Client,
+    market_condition_id: &str,
+    limit: u32,
+) -> Result<Vec<DataApiPublicTrade>> {
+    let mut u = reqwest::Url::parse(&format!("{DATA_API_HOST}/trades"))
+        .context("parse Data API /trades URL")?;
+    u.query_pairs_mut()
+        .append_pair("market", market_condition_id)
+        .append_pair("limit", &limit.to_string());
+    let resp = http
+        .get(u.as_str())
+        .send()
+        .await
+        .with_context(|| format!("GET {}", u.as_str()))?;
+    let status = resp.status();
+    let txt = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        anyhow::bail!(
+            "data-api GET /trades failed: {} — {}",
+            status,
+            txt.trim()
+        );
+    }
+    let batch: Vec<DataApiPublicTrade> = serde_json::from_str(&txt)
+        .with_context(|| format!("decode /trades: {}", txt.trim()))?;
+    Ok(batch)
+}
+
 /// Map Data API rows to UP/DOWN `(shares, avg_price)` using the same token-id rules as CLOB.
 pub fn positions_size_avg_for_tokens(
     rows: &[DataPosition],

@@ -29,6 +29,7 @@ mod feeds;
 mod fees;
 mod gamma;
 mod gamma_series;
+mod market_activity;
 mod market_profile;
 mod redeem;
 mod take_profit;
@@ -45,6 +46,7 @@ use app::{
     resolve_market_order, resolve_trailing_sell, trailing_exit_sell_meets_min_gross_profit_bps,
     AppEvent, AppState, Outcome, TrailingExit, MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
 };
+use chrono::Utc;
 use config::Config;
 use crossterm::{
     event::{
@@ -57,6 +59,7 @@ use crossterm::{
 };
 use events::Action;
 use feeds::clob_user_ws::{UserWsBundle, UserWsMarket};
+use feeds::clob_ws::ClobTradePrint;
 use fees::take_profit_limit_price_crypto_after_fees;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
@@ -1054,7 +1057,10 @@ async fn run_take_profit_consolidate_after_buy(
 }
 
 use tracing::{debug, error, info, warn};
-use trading::{clob_asset_ids_match, ClobOpenOrder, OrderArgs, OrderType, Side, TradingClient};
+use trading::{
+    canonical_clob_token_id, clob_asset_ids_match, ClobOpenOrder, OrderArgs, OrderType, Side,
+    TradingClient,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -1123,6 +1129,16 @@ async fn main() -> Result<()> {
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
+
+    let (trade_print_tx, mut trade_print_rx) = mpsc::channel::<ClobTradePrint>(4096);
+    {
+        let txp = tx.clone();
+        tokio::spawn(async move {
+            while let Some(p) = trade_print_rx.recv().await {
+                let _ = txp.try_send(AppEvent::ClobPublicTrade(p));
+            }
+        });
+    }
 
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
@@ -1261,10 +1277,13 @@ async fn main() -> Result<()> {
     let user_open_ledger_for_supervisor = user_open_ledger.clone();
     let user_trade_sync_for_supervisor = user_trade_sync.clone();
     let mut book_token_rx_supervisor = book_token_rx;
+    let trade_print_tx_supervisor = trade_print_tx.clone();
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
         let mut holders_poll: Option<tokio::task::JoinHandle<()>> = None;
+
+        let trade_sock = trade_print_tx_supervisor;
 
         // User WS: one long-lived connection; `UserWsBundle` adds extra condition IDs for
         // background trailing fills (main updates the watch after each `apply`).
@@ -1299,6 +1318,7 @@ async fn main() -> Result<()> {
                 *book_handle = Some(feeds::clob_ws::spawn(
                     ids.to_vec(),
                     clob_forwarder(tx_for_books.clone()),
+                    trade_sock.clone(),
                 ));
                 last_book_spawn = ids.to_vec();
             };
@@ -1429,6 +1449,59 @@ async fn main() -> Result<()> {
                 let _ = txp
                     .send(AppEvent::OpenOrdersLoaded { orders: ui_orders })
                     .await;
+
+                let now_ms = Utc::now().timestamp_millis();
+                let window = crate::market_activity::ACTIVITY_WINDOW_MS;
+                if let Ok(http_pub) = net::reqwest_client() {
+                    match crate::data_api::fetch_public_trades_for_market(
+                        &http_pub,
+                        &condition_id,
+                        500,
+                    )
+                    .await
+                    {
+                        Ok(api_rows) => {
+                            let prints: Vec<ClobTradePrint> = api_rows
+                                .into_iter()
+                                .filter(|r| {
+                                    clob_asset_ids_match(&r.asset, &up_id)
+                                        || clob_asset_ids_match(&r.asset, &down_id)
+                                })
+                                .filter_map(|r| {
+                                    let ts = crate::market_activity::normalize_exchange_ts_ms(
+                                        r.timestamp,
+                                    );
+                                    if now_ms.saturating_sub(ts) > window {
+                                        return None;
+                                    }
+                                    let n = r.price * r.size;
+                                    if !n.is_finite() || n <= 0.0 {
+                                        return None;
+                                    }
+                                    Some(ClobTradePrint {
+                                        asset_id: canonical_clob_token_id(&r.asset)
+                                            .into_owned(),
+                                        price: r.price,
+                                        size: r.size,
+                                        ts_ms: ts,
+                                    })
+                                })
+                                .collect();
+                            if !prints.is_empty() {
+                                let _ = txp
+                                    .send(AppEvent::ActivityTradesSeed(prints))
+                                    .await;
+                            }
+                        }
+                        Err(e) => {
+                            debug!(
+                                error = %e,
+                                market = %condition_id,
+                                "data-api GET /trades (activity bootstrap) failed"
+                            );
+                        }
+                    }
+                }
             });
 
             // Periodic open-orders + full positions replay (5s) — disabled: parallel L2/REST

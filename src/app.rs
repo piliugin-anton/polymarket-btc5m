@@ -3,7 +3,7 @@
 //! Three async sources push into a single `AppEvent` channel:
 //!   1. crossterm key events
 //!   2. Chainlink price ticks
-//!   3. CLOB book snapshots
+//!   3. CLOB book snapshots + public trade prints (`last_trade_price`)
 //!   4. CLOB conditional balances (positions) after each market roll
 //!   5. Periodic ticks for market rolling
 //!
@@ -19,6 +19,7 @@ use crate::feeds::{chainlink::PriceTick, clob_ws::BookSnapshot};
 use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
+use crate::market_activity::RollingTradedNotional;
 use crate::market_profile::MarketProfile;
 use crate::take_profit::{clob_order_has_open_size, clob_order_remaining_size};
 use crate::trading::{
@@ -85,6 +86,10 @@ pub enum AppEvent {
     Tick, // 1-Hz clock
     Price(PriceTick),
     Book(BookSnapshot),
+    /// Public CLOB market WS `last_trade_price` — one event per match (not coalesced).
+    ClobPublicTrade(crate::feeds::clob_ws::ClobTradePrint),
+    /// Seed rolling activity from Data API `GET /trades` after a market roll.
+    ActivityTradesSeed(Vec<crate::feeds::clob_ws::ClobTradePrint>),
     /// New active market + buy-side trail settings (from env at roll; used for maker WSS fills).
     MarketRoll {
         market: ActiveMarket,
@@ -494,6 +499,8 @@ pub struct AppState {
 
     /// Pre-computed from CLOB mid + top-holder sums; updated on Book and TopHoldersSentiment events.
     pub cached_sentiment: SentimentDir,
+    /// Rolling 60s traded notional (`price * size`) from public prints + optional REST seed.
+    pub cached_market_activity_notional: f64,
     /// Updated once per second in the Tick handler; avoids `Utc::now()` in the draw path.
     pub cached_countdown_secs: Option<i64>,
     /// `”{asset}/USD”` label, set once on StartTrading.
@@ -522,6 +529,8 @@ pub struct AppState {
     pub buy_trail_activation_bps: u32,
     /// Maker BUY fill on user WS (resting limit) should run fixed take-profit in `main` after `apply`.
     pub pending_ws_take_profit: Option<(Outcome, f64)>,
+
+    traded_activity: RollingTradedNotional,
 }
 
 impl AppState {
@@ -565,6 +574,7 @@ impl AppState {
             top_holders_up_sum: None,
             top_holders_down_sum: None,
             cached_sentiment: SentimentDir::Unknown,
+            cached_market_activity_notional: 0.0,
             cached_countdown_secs: None,
             cached_pair_label: "\u{2014}/USD".to_string(), // "—/USD"
             user_trade_sync,
@@ -577,6 +587,7 @@ impl AppState {
             buy_trail_bps: 0,
             buy_trail_activation_bps: 0,
             pending_ws_take_profit: None,
+            traded_activity: RollingTradedNotional::new(),
         }
     }
 
@@ -1209,6 +1220,28 @@ impl AppState {
         };
     }
 
+    fn refresh_market_activity_cache(&mut self) {
+        let now = Utc::now().timestamp_millis();
+        self.traded_activity.prune_against_wall_clock(now);
+        let t = self.traded_activity.total();
+        self.cached_market_activity_notional = if t.is_finite() { t } else { 0.0 };
+    }
+
+    fn token_watched_for_activity(&self, token: &str) -> bool {
+        if self
+            .cached_book_watch_tokens
+            .iter()
+            .any(|t| clob_asset_ids_match(t, token))
+        {
+            return true;
+        }
+        if let Some(m) = &self.market {
+            return clob_asset_ids_match(token, m.up_token_id.as_str())
+                || clob_asset_ids_match(token, m.down_token_id.as_str());
+        }
+        false
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
         match ev {
@@ -1224,6 +1257,7 @@ impl AppState {
                     .market
                     .as_ref()
                     .map(|m| (m.closes_at - Utc::now()).num_seconds().max(0));
+                self.refresh_market_activity_cache();
             }
             AppEvent::Price(p) => {
                 self.spot_price = Some(p.price);
@@ -1271,6 +1305,23 @@ impl AppState {
                 }
                 self.recompute_sentiment();
             }
+            AppEvent::ClobPublicTrade(p) => {
+                if self.token_watched_for_activity(p.asset_id.as_str()) {
+                    let n = p.price * p.size;
+                    self.traded_activity.record_trade(p.ts_ms, n);
+                    self.refresh_market_activity_cache();
+                }
+            }
+            AppEvent::ActivityTradesSeed(prints) => {
+                for p in prints {
+                    if !self.token_watched_for_activity(p.asset_id.as_str()) {
+                        continue;
+                    }
+                    let n = p.price * p.size;
+                    self.traded_activity.record_trade(p.ts_ms, n);
+                }
+                self.refresh_market_activity_cache();
+            }
             AppEvent::MarketRoll {
                 market,
                 buy_trail_bps,
@@ -1309,6 +1360,8 @@ impl AppState {
                 self.watched_books.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.cached_countdown_secs = None;
+                self.traded_activity.clear();
+                self.refresh_market_activity_cache();
             }
             AppEvent::PriceToBeatRefresh {
                 slug,

@@ -29,6 +29,8 @@
 //! slice, skipping the 256-bit bignum parse + `to_string` round-trip in
 //! `canonical_clob_token_id` entirely.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
@@ -66,6 +68,15 @@ pub struct BookSnapshot {
     pub asset_id: String,
     pub bids: Vec<BookLevel>, // sorted high → low
     pub asks: Vec<BookLevel>, // sorted low  → high
+}
+
+/// One `last_trade_price` execution from the public CLOB market WebSocket.
+#[derive(Debug, Clone)]
+pub struct ClobTradePrint {
+    pub asset_id: String,
+    pub price: f64,
+    pub size: f64,
+    pub ts_ms: i64,
 }
 
 // ── Zero-alloc serde visitors ─────────────────────────────────────────────────
@@ -113,6 +124,29 @@ fn deser_is_buy<'de, D: serde::Deserializer<'de>>(de: D) -> Result<bool, D::Erro
     de.deserialize_str(Vis)
 }
 
+fn deser_ts_ms<'de, D: serde::Deserializer<'de>>(de: D) -> Result<i64, D::Error> {
+    struct Vis;
+    impl<'de> serde::de::Visitor<'de> for Vis {
+        type Value = i64;
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("unix millis as number or decimal string")
+        }
+        #[inline]
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<i64, E> {
+            s.parse().map_err(E::custom)
+        }
+        #[inline]
+        fn visit_u64<E: serde::de::Error>(self, n: u64) -> Result<i64, E> {
+            Ok(n as i64)
+        }
+        #[inline]
+        fn visit_i64<E: serde::de::Error>(self, n: i64) -> Result<i64, E> {
+            Ok(n)
+        }
+    }
+    de.deserialize_any(Vis)
+}
+
 // ── Wire types ────────────────────────────────────────────────────────────────
 
 /// `#[serde(borrow)]` on the internally-tagged enum is incompatible with `#[serde(other)]`
@@ -135,6 +169,16 @@ enum RawEvent {
         asset_id: String,
         #[serde(default)]
         changes: Vec<RawChange>,
+    },
+    #[serde(rename = "last_trade_price")]
+    LastTradePrice {
+        asset_id: String,
+        #[serde(deserialize_with = "deser_f64_str")]
+        price: f64,
+        #[serde(deserialize_with = "deser_f64_str")]
+        size: f64,
+        #[serde(deserialize_with = "deser_ts_ms")]
+        timestamp: i64,
     },
     #[serde(other)]
     Other,
@@ -325,15 +369,22 @@ fn ensure_canonical(s: &str) -> std::borrow::Cow<'_, str> {
     canonical_clob_token_id(s)
 }
 
+#[inline]
+fn watched_contains(watched: &HashSet<String>, asset_id: &str) -> bool {
+    let c = ensure_canonical(asset_id);
+    watched.contains(c.as_ref())
+}
+
 // ── Spawn / run ───────────────────────────────────────────────────────────────
 
 pub fn spawn(
     token_ids: Vec<String>,
-    tx: mpsc::Sender<BookSnapshot>,
+    book_tx: mpsc::Sender<BookSnapshot>,
+    trade_tx: mpsc::Sender<ClobTradePrint>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_once(&token_ids, &tx).await {
+            if let Err(e) = run_once(&token_ids, &book_tx, &trade_tx).await {
                 warn!(error = %e, "CLOB WS disconnected — reconnecting in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -341,7 +392,11 @@ pub fn spawn(
     })
 }
 
-async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Result<()> {
+async fn run_once(
+    token_ids: &[String],
+    book_tx: &mpsc::Sender<BookSnapshot>,
+    trade_tx: &mpsc::Sender<ClobTradePrint>,
+) -> Result<()> {
     let (mut ws, _) = crate::net::ws_connect(CLOB_WS_URL)
         .await
         .context("connect to Polymarket CLOB WS")?;
@@ -382,6 +437,11 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
             break;
         }
     }
+
+    let watched: HashSet<String> = token_ids
+        .iter()
+        .map(|id| canonical_clob_token_id(id).into_owned())
+        .collect();
 
     // Output buffers reused across snapshots (swapped out into each BookSnapshot).
     let mut out_bids: Vec<BookLevel> = Vec::with_capacity(64);
@@ -443,7 +503,10 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                     match sonic_rs::from_str::<Vec<RawEvent>>(t) {
                         Ok(events) => {
                             for ev in events {
-                                if let Some(i) = apply_event(&mut db, ev) {
+                                if let Some(p) = extract_trade_print(&watched, &ev) {
+                                    let _ = trade_tx.try_send(p);
+                                }
+                                if let Some(i) = apply_book_event(&mut db, ev) {
                                     touched.set(i);
                                 }
                             }
@@ -472,7 +535,10 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                 } else {
                     match sonic_rs::from_str::<RawEvent>(t) {
                         Ok(ev) => {
-                            if let Some(i) = apply_event(&mut db, ev) {
+                            if let Some(p) = extract_trade_print(&watched, &ev) {
+                                let _ = trade_tx.try_send(p);
+                            }
+                            if let Some(i) = apply_book_event(&mut db, ev) {
                                 touched.set(i);
                             }
                         }
@@ -492,7 +558,7 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
                             &book.asks,
                             &mut out_bids,
                             &mut out_asks,
-                            tx,
+                            book_tx,
                         )
                         .await;
                     }
@@ -502,10 +568,32 @@ async fn run_once(token_ids: &[String], tx: &mpsc::Sender<BookSnapshot>) -> Resu
     }
 }
 
+fn extract_trade_print(watched: &HashSet<String>, ev: &RawEvent) -> Option<ClobTradePrint> {
+    let RawEvent::LastTradePrice {
+        asset_id,
+        price,
+        size,
+        timestamp,
+    } = ev
+    else {
+        return None;
+    };
+    if !watched_contains(watched, asset_id) {
+        return None;
+    }
+    let aid = canonical_clob_token_id(asset_id).into_owned();
+    Some(ClobTradePrint {
+        asset_id: aid,
+        price: *price,
+        size: *size,
+        ts_ms: *timestamp,
+    })
+}
+
 // ── Event application ─────────────────────────────────────────────────────────
 
 #[inline]
-fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
+fn apply_book_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
     match ev {
         RawEvent::Book {
             asset_id,
@@ -535,7 +623,7 @@ fn apply_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
             }
             Some(i)
         }
-        RawEvent::Other => None,
+        RawEvent::LastTradePrice { .. } | RawEvent::Other => None,
     }
 }
 
@@ -547,7 +635,7 @@ async fn emit_snapshot(
     asks: &BookSide,
     out_bids: &mut Vec<BookLevel>,
     out_asks: &mut Vec<BookLevel>,
-    tx: &mpsc::Sender<BookSnapshot>,
+    book_tx: &mpsc::Sender<BookSnapshot>,
 ) {
     out_bids.clear();
     out_asks.clear();
@@ -566,7 +654,7 @@ async fn emit_snapshot(
     // next extend() call doesn't need to allocate.
     let snap_bids = std::mem::replace(out_bids, Vec::with_capacity(bids.levels.len()));
     let snap_asks = std::mem::replace(out_asks, Vec::with_capacity(asks.levels.len()));
-    let _ = tx
+    let _ = book_tx
         .send(BookSnapshot {
             asset_id: asset_id.to_owned(),
             bids: snap_bids,
