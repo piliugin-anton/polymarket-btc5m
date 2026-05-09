@@ -42,7 +42,7 @@ pub fn draw(f: &mut Frame, s: &AppState) {
     }
     let area = f.area();
     let chunks = Layout::vertical([
-        Constraint::Length(4),                    // header
+        Constraint::Length(4),                 // header
         Constraint::Min(8), // main — book + positions (less vertical space than before)
         Constraint::Length(8), // open orders
         Constraint::Length(8), // fills
@@ -310,11 +310,16 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     line1_parts.extend(sentiment_spans);
     let act = format_compact_notional(s.cached_market_activity_notional);
     line1_parts.push(Span::raw("  "));
-    line1_parts.push(Span::styled("Activity:", Style::default().fg(Color::DarkGray)));
+    line1_parts.push(Span::styled(
+        "Activity:",
+        Style::default().fg(Color::DarkGray),
+    ));
     line1_parts.push(Span::raw(" "));
     line1_parts.push(Span::styled(
         act,
-        Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
     ));
     let line1 = Line::from(line1_parts);
     // Line 2: price to beat + countdown + market (+ background trailing sessions)

@@ -56,7 +56,11 @@ pub async fn relayer_wallet_nonce(
     let status = resp.status();
     let txt = resp.text().await.unwrap_or_default();
     if !status.is_success() {
-        bail!("relayer GET /nonce (WALLET): HTTP {} — {}", status, txt.trim());
+        bail!(
+            "relayer GET /nonce (WALLET): HTTP {} — {}",
+            status,
+            txt.trim()
+        );
     }
     let n: NonceResponse =
         serde_json::from_str(&txt).with_context(|| format!("decode /nonce: {}", txt.trim()))?;
@@ -152,7 +156,8 @@ pub async fn submit_wallet_create(
     relayer_api_key: &str,
     relayer_api_key_address: Address,
 ) -> Result<RelayerSubmitResponse> {
-    let body = serde_json::to_value(wallet_create_body(owner, factory)).context("encode WALLET-CREATE")?;
+    let body =
+        serde_json::to_value(wallet_create_body(owner, factory)).context("encode WALLET-CREATE")?;
     submit_relayer_json(
         http,
         relayer_base_url,
@@ -199,7 +204,11 @@ pub async fn wait_relayer_transaction(
             match txn.state.as_str() {
                 "STATE_MINED" | "STATE_CONFIRMED" => return Ok(txn),
                 "STATE_FAILED" | "STATE_INVALID" => {
-                    bail!("relayer transaction {} failed (state={})", transaction_id, txn.state);
+                    bail!(
+                        "relayer transaction {} failed (state={})",
+                        transaction_id,
+                        txn.state
+                    );
                 }
                 _ => {}
             }

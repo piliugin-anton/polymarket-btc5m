@@ -27,8 +27,7 @@ const CTF: Address = address!("0x4D97DCd97eC945f40cF65f87097ACe5EA0476045");
 const CTF_EXCHANGE_V2: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const NEG_RISK_CTF_EXCHANGE_V2: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
 /// Same deployments as [`crate::redeem`] — relayer redeem routes through these adapters.
-const CTF_COLLATERAL_ADAPTER: Address =
-    address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
+const CTF_COLLATERAL_ADAPTER: Address = address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
 const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
     address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
 
@@ -167,9 +166,7 @@ pub(crate) async fn submit_deposit_wallet_calls(
     calls: Vec<(Address, U256, Vec<u8>)>,
 ) -> Result<String> {
     if cfg.sig_type != SignatureType::Poly1271 {
-        bail!(
-            "deposit-wallet relayer batches require POLYMARKET_SIG_TYPE=3 (POLY_1271)"
-        );
+        bail!("deposit-wallet relayer batches require POLYMARKET_SIG_TYPE=3 (POLY_1271)");
     }
     if calls.is_empty() {
         bail!("deposit-wallet batch: empty calls");
@@ -232,10 +229,7 @@ pub(crate) async fn submit_deposit_wallet_calls(
     let submitted = submit_relayer_json(http, &relayer_url, rel_key, rel_addr, &body).await?;
     let txid = submitted.transaction_id.clone();
     let final_row = wait_relayer_transaction(http, &relayer_url, &txid, 120, 2_000).await?;
-    let mut out = format!(
-        "deposit-wallet batch mined (state={})",
-        final_row.state
-    );
+    let mut out = format!("deposit-wallet batch mined (state={})", final_row.state);
     if let Some(h) = &final_row.transaction_hash {
         out.push_str(&format!(" tx={h}"));
     }

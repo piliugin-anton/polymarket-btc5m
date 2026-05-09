@@ -31,9 +31,8 @@ fn init_code_hash_erc1967(implementation: Address, args: &[u8]) -> B256 {
     let mut prefix10 = [0u8; 10];
     prefix10.copy_from_slice(&combined.to_be_bytes::<32>()[22..]);
 
-    let mut buf = Vec::with_capacity(
-        10 + 20 + 2 + ERC1967_CONST2.len() + ERC1967_CONST1.len() + args.len(),
-    );
+    let mut buf =
+        Vec::with_capacity(10 + 20 + 2 + ERC1967_CONST2.len() + ERC1967_CONST1.len() + args.len());
     buf.extend_from_slice(&prefix10);
     buf.extend_from_slice(implementation.as_slice());
     buf.extend_from_slice(&[0x60, 0x09]);

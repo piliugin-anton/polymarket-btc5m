@@ -13,7 +13,8 @@ use crate::polymarket_relayer::{submit_wallet_create, wait_relayer_transaction};
 /// Load env for deploy only (does not require `POLYMARKET_FUNDER` / full trading config).
 pub fn load_deploy_env() -> Result<DeployWalletEnv> {
     let _ = dotenvy::dotenv();
-    let poly_pk = std::env::var("POLYMARKET_PK").context("POLYMARKET_PK (owner EOA private key)")?;
+    let poly_pk =
+        std::env::var("POLYMARKET_PK").context("POLYMARKET_PK (owner EOA private key)")?;
 
     let relayer_url = std::env::var("RELAYER_URL")
         .ok()
@@ -30,8 +31,8 @@ pub fn load_deploy_env() -> Result<DeployWalletEnv> {
         .ok()
         .filter(|s| !s.trim().is_empty())
         .context("POLYMARKET_RELAYER_API_KEY_ADDRESS (paired with the relayer API key)")?;
-    let relayer_api_key_address =
-        Address::from_str(relayer_api_key_address.trim()).context("POLYMARKET_RELAYER_API_KEY_ADDRESS")?;
+    let relayer_api_key_address = Address::from_str(relayer_api_key_address.trim())
+        .context("POLYMARKET_RELAYER_API_KEY_ADDRESS")?;
 
     Ok(DeployWalletEnv {
         poly_pk,
@@ -56,7 +57,10 @@ pub async fn run() -> Result<()> {
 
     println!("\n━━━ Deposit wallet (WALLET-CREATE) ━━━\n");
     println!("owner (EOA)         : {owner:#x}");
-    println!("factory             : {:#x}", DEPOSIT_WALLET_FACTORY_POLYGON);
+    println!(
+        "factory             : {:#x}",
+        DEPOSIT_WALLET_FACTORY_POLYGON
+    );
     println!("predicted (CREATE2) : {predicted:#x}");
     println!("relayer             : {}", env.relayer_url.trim());
     println!();
@@ -80,15 +84,10 @@ pub async fn run() -> Result<()> {
     }
     println!("\nWaiting for relayer (STATE_MINED / STATE_CONFIRMED)…\n");
 
-    let final_row = wait_relayer_transaction(
-        &http,
-        &env.relayer_url,
-        &submit.transaction_id,
-        100,
-        2_000,
-    )
-    .await
-    .context("wait relayer")?;
+    let final_row =
+        wait_relayer_transaction(&http, &env.relayer_url, &submit.transaction_id, 100, 2_000)
+            .await
+            .context("wait relayer")?;
 
     println!("final state: {}", final_row.state);
     if let Some(h) = &final_row.transaction_hash {

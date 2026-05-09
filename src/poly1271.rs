@@ -4,7 +4,7 @@
 
 use std::string::String;
 
-use alloy_primitives::{keccak256, Address, B256, PrimitiveSignature, U256};
+use alloy_primitives::{keccak256, Address, PrimitiveSignature, B256, U256};
 use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{eip712_domain, sol, Eip712Domain, SolStruct};
@@ -45,9 +45,7 @@ fn order_type_hash() -> B256 {
 }
 
 fn domain_type_hash() -> B256 {
-    keccak256(
-        b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)",
-    )
+    keccak256(b"EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)")
 }
 
 fn ctf_exchange_name_hash() -> B256 {

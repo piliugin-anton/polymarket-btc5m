@@ -1025,7 +1025,8 @@ impl AppState {
             return;
         }
         let had_trailing = trailing_map_key_for_asset(&self.trailing, token_id).is_some();
-        let had_pending = pending_trail_map_key_for_asset(&self.pending_trail_arms, token_id).is_some();
+        let had_pending =
+            pending_trail_map_key_for_asset(&self.pending_trail_arms, token_id).is_some();
         let pos_shares = self.position(outcome).shares;
         let pos_avg = self.position(outcome).avg_entry;
         if !had_trailing && !had_pending && pos_shares <= 1e-9 {
@@ -1036,11 +1037,7 @@ impl AppState {
         };
         let tid = canonical_clob_token_id(token_id).into_owned();
         self.remove_trailing_and_pending_arm_for_token(tid.as_str());
-        if pos_shares <= 1e-9
-            || !pos_avg.is_finite()
-            || pos_avg <= 0.0
-            || pos_avg >= 0.99
-        {
+        if pos_shares <= 1e-9 || !pos_avg.is_finite() || pos_avg <= 0.0 || pos_avg >= 0.99 {
             return;
         }
         self.merge_pending_trailing_buy_arm(
@@ -1052,6 +1049,57 @@ impl AppState {
             self.buy_trail_activation_bps,
             market,
         );
+    }
+
+    /// A trailing FAK SELL can partially fill. Re-arm the unsold planned shares while the exit task
+    /// is still in flight; ordinary/user SELLs still clear trailing as before.
+    fn rearm_trailing_after_partial_sell(&mut self, token_id: &str, sold_qty: f64) -> bool {
+        let Some(map_key) = trailing_map_key_for_asset(&self.trailing, token_id) else {
+            return false;
+        };
+        let Some(sess) = self.trailing.remove(&map_key) else {
+            return false;
+        };
+        self.book_watch_tokens_dirty = true;
+
+        let live_shares = self.trail_live_shares(&sess);
+        let remaining_plan = (sess.plan_sell_shares - sold_qty).max(0.0).min(live_shares);
+        if live_shares <= 1e-9 || remaining_plan <= 1e-9 || sess.trail_bps == 0 {
+            return false;
+        }
+
+        let entry = if self
+            .market
+            .as_ref()
+            .is_some_and(|m| m.condition_id == sess.market.condition_id)
+        {
+            let pos = self.position(sess.outcome);
+            if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                pos.avg_entry
+            } else {
+                sess.stop.entry_price()
+            }
+        } else if let Some(oc) = self.outcome_for_active_token(&sess.token_id) {
+            let pos = self.position(oc);
+            if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                pos.avg_entry
+            } else {
+                sess.stop.entry_price()
+            }
+        } else {
+            sess.stop.entry_price()
+        };
+
+        self.install_trailing_session(
+            sess.market,
+            sess.outcome,
+            entry,
+            remaining_plan,
+            sess.token_id,
+            sess.trail_bps,
+            live_shares.max(0.0),
+        );
+        true
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1624,7 +1672,11 @@ impl AppState {
                     self.bump_trailing_tracked_shares(&token_id, side, qty);
                 }
                 if side == Side::Sell {
-                    self.clear_trailing_on_sell_token(&token_id);
+                    let rearmed = self.trailing_sell_in_flight.contains(&token_id)
+                        && self.rearm_trailing_after_partial_sell(&token_id, qty);
+                    if !rearmed {
+                        self.clear_trailing_on_sell_token(&token_id);
+                    }
                 } else if !skip_bump_and_trail_promote {
                     self.try_promote_pending_trail_any(token_id.as_str());
                 }
@@ -1701,7 +1753,11 @@ impl AppState {
                         self.bump_trailing_tracked_shares(&token_id, side, qty);
                     }
                     if side == Side::Sell {
-                        self.clear_trailing_on_sell_token(&token_id);
+                        let rearmed = self.trailing_sell_in_flight.contains(&token_id)
+                            && self.rearm_trailing_after_partial_sell(&token_id, qty);
+                        if !rearmed {
+                            self.clear_trailing_on_sell_token(&token_id);
+                        }
                     } else if !skip_bump_and_trail_promote {
                         self.try_promote_pending_trail_any(token_id.as_str());
                     }
@@ -1894,7 +1950,13 @@ impl AppState {
                             format!("trailing {} re-armed after exit failure", oc.as_str());
                     }
                 } else if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
-                    self.trailing.remove(&k);
+                    let remove = match self.trailing.get(&k) {
+                        Some(sess) => self.trail_live_shares(sess) <= 1e-9,
+                        None => true,
+                    };
+                    if remove {
+                        self.trailing.remove(&k);
+                    }
                 }
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
@@ -3803,7 +3865,11 @@ mod tests {
         .await;
         let sh = s.position(Outcome::Up).shares;
         let sess = s.trailing.get("UP_ACK").expect("armed after first ack");
-        assert!((sess.plan_sell_shares - sh).abs() < 1e-6, "plan={}", sess.plan_sell_shares);
+        assert!(
+            (sess.plan_sell_shares - sh).abs() < 1e-6,
+            "plan={}",
+            sess.plan_sell_shares
+        );
         s.apply(AppEvent::OrderAck {
             side: Side::Buy,
             outcome: Outcome::Up,
@@ -3815,8 +3881,81 @@ mod tests {
         .await;
         let sh = s.position(Outcome::Up).shares;
         let sess = s.trailing.get("UP_ACK").expect("armed after second ack");
-        assert!((sess.plan_sell_shares - sh).abs() < 1e-6, "plan={}", sess.plan_sell_shares);
+        assert!(
+            (sess.plan_sell_shares - sh).abs() < 1e-6,
+            "plan={}",
+            sess.plan_sell_shares
+        );
         assert!((sh - 7.0).abs() < 1e-6);
+    }
+
+    /// A partial trailing FAK SELL must keep the unsold shares protected instead of treating any
+    /// SELL ack as a full exit.
+    #[tokio::test]
+    async fn trailing_partial_sell_ack_rearms_remaining_position() {
+        let mut s = test_state();
+        let m = test_market("UP_PART_SELL", "DOWN_PART_SELL", "0xpartsell");
+        s.market = Some(m.clone());
+        s.buy_trail_bps = 100;
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_PART_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.55,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.57,
+                size: 100.0,
+            }],
+        }));
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_PART_SELL".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        assert!(s.trailing.contains_key("UP_PART_SELL"));
+        s.trailing_sell_in_flight.insert("UP_PART_SELL".into());
+
+        s.apply(AppEvent::OrderAck {
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            qty: 6.0,
+            price: 0.54,
+            clob_order_id: Some("partial-trailing-sell".into()),
+            token_id: "UP_PART_SELL".into(),
+        })
+        .await;
+
+        assert!((s.position(Outcome::Up).shares - 4.0).abs() < 1e-6);
+        let sess = s
+            .trailing
+            .get("UP_PART_SELL")
+            .expect("remaining shares stay protected");
+        assert!(
+            (sess.plan_sell_shares - 4.0).abs() < 1e-6,
+            "plan={}",
+            sess.plan_sell_shares
+        );
+
+        s.apply(AppEvent::TrailingExitDispatchDone {
+            token_id: "UP_PART_SELL".into(),
+            success: true,
+            error: None,
+        })
+        .await;
+        assert!(
+            s.trailing.contains_key("UP_PART_SELL"),
+            "dispatch success must not clear a re-armed residual trail"
+        );
     }
 
     /// CLOB book `asset_id` may be `0x…` while the armed session key is decimal — the same logical token.
