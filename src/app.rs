@@ -1000,6 +1000,60 @@ impl AppState {
         self.book_watch_tokens_dirty = true;
     }
 
+    /// Remove armed / pending trail rows for `token_id` only (no SELL queue / watched-book purge).
+    fn remove_trailing_and_pending_arm_for_token(&mut self, token_id: &str) {
+        let tid = canonical_clob_token_id(token_id);
+        let t = tid.as_ref();
+        if let Some(k) = trailing_map_key_for_asset(&self.trailing, t) {
+            self.trailing.remove(&k);
+            self.book_watch_tokens_dirty = true;
+        }
+        if let Some(k) = pending_trail_map_key_for_asset(&self.pending_trail_arms, t) {
+            self.pending_trail_arms.remove(&k);
+            self.book_watch_tokens_dirty = true;
+        }
+    }
+
+    /// After a BUY fill on the **active** UI market, unregister any trail/pending for that token and
+    /// re-register from live `position` (total shares + `avg_entry`) so partial fills cannot leave
+    /// stale `plan_sell_shares` or a mis-merged ratchet on [`TrailingStop`].
+    fn refresh_buy_trailing_from_position(&mut self, outcome: Outcome, token_id: &str) {
+        if self.buy_trail_bps == 0 {
+            return;
+        }
+        if self.outcome_for_active_token(token_id) != Some(outcome) {
+            return;
+        }
+        let had_trailing = trailing_map_key_for_asset(&self.trailing, token_id).is_some();
+        let had_pending = pending_trail_map_key_for_asset(&self.pending_trail_arms, token_id).is_some();
+        let pos_shares = self.position(outcome).shares;
+        let pos_avg = self.position(outcome).avg_entry;
+        if !had_trailing && !had_pending && pos_shares <= 1e-9 {
+            return;
+        }
+        let Some(market) = self.market.clone() else {
+            return;
+        };
+        let tid = canonical_clob_token_id(token_id).into_owned();
+        self.remove_trailing_and_pending_arm_for_token(tid.as_str());
+        if pos_shares <= 1e-9
+            || !pos_avg.is_finite()
+            || pos_avg <= 0.0
+            || pos_avg >= 0.99
+        {
+            return;
+        }
+        self.merge_pending_trailing_buy_arm(
+            outcome,
+            pos_avg,
+            pos_shares,
+            tid,
+            self.buy_trail_bps,
+            self.buy_trail_activation_bps,
+            market,
+        );
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn install_trailing_session(
         &mut self,
@@ -1535,24 +1589,13 @@ impl AppState {
                     }
                     self.reconcile_position_shares_with_fill_deque(ui_oc);
                     if matches!(side, Side::Buy)
-                        && from_maker_leg
                         && self.buy_trail_bps > 0
                         && qty > 1e-12
                         && price.is_finite()
                         && price > 0.0
                         && price < 0.99
                     {
-                        if let Some(m) = self.market.clone() {
-                            self.merge_pending_trailing_buy_arm(
-                                ui_oc,
-                                price,
-                                qty,
-                                token_id.clone(),
-                                self.buy_trail_bps,
-                                self.buy_trail_activation_bps,
-                                m,
-                            );
-                        }
+                        self.refresh_buy_trailing_from_position(ui_oc, &token_id);
                     }
                     if matches!(side, Side::Buy)
                         && from_maker_leg
@@ -1574,10 +1617,15 @@ impl AppState {
                         .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
                         .await;
                 }
-                self.bump_trailing_tracked_shares(&token_id, side, qty);
+                let skip_bump_and_trail_promote = matches!(side, Side::Buy)
+                    && self.buy_trail_bps > 0
+                    && self.outcome_for_active_token(&token_id).is_some();
+                if !skip_bump_and_trail_promote {
+                    self.bump_trailing_tracked_shares(&token_id, side, qty);
+                }
                 if side == Side::Sell {
                     self.clear_trailing_on_sell_token(&token_id);
-                } else {
+                } else if !skip_bump_and_trail_promote {
                     self.try_promote_pending_trail_any(token_id.as_str());
                 }
                 self.status_line = format!(
@@ -1641,10 +1689,20 @@ impl AppState {
                     if let Some(oc) = filled_oc {
                         self.reconcile_position_shares_with_fill_deque(oc);
                     }
-                    self.bump_trailing_tracked_shares(&token_id, side, qty);
+                    if side == Side::Buy && self.buy_trail_bps > 0 && qty > 1e-12 {
+                        if let Some(oc) = filled_oc {
+                            self.refresh_buy_trailing_from_position(oc, &token_id);
+                        }
+                    }
+                    let skip_bump_and_trail_promote = matches!(side, Side::Buy)
+                        && self.buy_trail_bps > 0
+                        && self.outcome_for_active_token(&token_id).is_some();
+                    if !skip_bump_and_trail_promote {
+                        self.bump_trailing_tracked_shares(&token_id, side, qty);
+                    }
                     if side == Side::Sell {
                         self.clear_trailing_on_sell_token(&token_id);
-                    } else {
+                    } else if !skip_bump_and_trail_promote {
                         self.try_promote_pending_trail_any(token_id.as_str());
                     }
                 }
@@ -3702,6 +3760,63 @@ mod tests {
             "plan={}",
             sess.plan_sell_shares
         );
+    }
+
+    /// Partial BUY [`AppEvent::OrderAck`]s must refresh trailing from live position, not keep the
+    /// initial `RequestTrailingArm` size until the next maker-only WSS merge.
+    #[tokio::test]
+    async fn trailing_plan_follows_partial_buy_order_acks() {
+        let mut s = test_state();
+        let m = test_market("UP_ACK", "DOWN_ACK", "0xackpart");
+        s.market = Some(m.clone());
+        s.buy_trail_bps = 100;
+        s.buy_trail_activation_bps = 0;
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_ACK".into(),
+            bids: vec![BookLevel {
+                price: 0.55,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.57,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_ACK".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m.clone(),
+        })
+        .await;
+        s.apply(AppEvent::OrderAck {
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            qty: 3.0,
+            price: 0.50,
+            clob_order_id: None,
+            token_id: "UP_ACK".into(),
+        })
+        .await;
+        let sh = s.position(Outcome::Up).shares;
+        let sess = s.trailing.get("UP_ACK").expect("armed after first ack");
+        assert!((sess.plan_sell_shares - sh).abs() < 1e-6, "plan={}", sess.plan_sell_shares);
+        s.apply(AppEvent::OrderAck {
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            qty: 4.0,
+            price: 0.55,
+            clob_order_id: None,
+            token_id: "UP_ACK".into(),
+        })
+        .await;
+        let sh = s.position(Outcome::Up).shares;
+        let sess = s.trailing.get("UP_ACK").expect("armed after second ack");
+        assert!((sess.plan_sell_shares - sh).abs() < 1e-6, "plan={}", sess.plan_sell_shares);
+        assert!((sh - 7.0).abs() < 1e-6);
     }
 
     /// CLOB book `asset_id` may be `0x…` while the armed session key is decimal — the same logical token.
