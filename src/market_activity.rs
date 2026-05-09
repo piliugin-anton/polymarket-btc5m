@@ -3,7 +3,7 @@
 use std::collections::VecDeque;
 
 /// Match [`docs`](https://docs.polymarket.com/market-data/websocket/market-channel): one headline window.
-pub const ACTIVITY_WINDOW_MS: i64 = 60_000;
+pub const ACTIVITY_WINDOW_MS: i64 = 15_000;
 
 /// Data API may return seconds or millis; WS uses millis (13-digit typical).
 #[inline]
