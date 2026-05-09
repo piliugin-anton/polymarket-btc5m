@@ -1380,6 +1380,13 @@ impl TradingClient {
                 return Ok(v);
             }
         }
+        // Hardcoded: avoid GET /version on every `place_order` (latency). Polymarket CLOB order API v2
+        // is required for deposit-wallet / EIP-712 v2 signing in this binary anyway.
+        const HARDCODED_CLOB_ORDER_API_VERSION: u32 = 2;
+        let mut state = self.state.write().await;
+        state.cached_clob_order_version = Some(HARDCODED_CLOB_ORDER_API_VERSION);
+        Ok(HARDCODED_CLOB_ORDER_API_VERSION)
+        /*
         let url = format!("{CLOB_HOST}/version");
         let resp = self
             .http
@@ -1401,6 +1408,7 @@ impl TradingClient {
         let mut state = self.state.write().await;
         state.cached_clob_order_version = Some(version);
         Ok(version)
+        */
     }
 
     /// Prime `/version`, (if signing v1) `/fee-rate`, and **`GET /balance-allowance/update`** for each
@@ -2125,6 +2133,9 @@ impl TradingClient {
         };
 
         for post_attempt in 0..max_post_attempts {
+            // SELL prep disabled for latency: settle sleep + GET /balance-allowance before retries
+            // (previously when `!fast_first_sell_post`). Original body kept below for reference.
+            /*
             if matches!(args.side, Side::Sell) {
                 let fast_first_sell_post = post_attempt == 0
                     && (matches!(order_type, OrderType::Fak) || args.sell_skip_pre_post_settle);
@@ -2160,6 +2171,7 @@ impl TradingClient {
                     }
                 }
             }
+            */
 
             // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
             let (maker_amount, taker_amount) = amounts_for(
