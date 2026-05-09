@@ -1,4 +1,4 @@
-//! Pure helpers for market-buy take-profit **consolidation** and user-WS **merge** of duplicate
+//! Pure helpers for take-profit **consolidation** and user-WS **merge** of duplicate
 //! resting SELL legs (unit-tested). Async CLOB I/O stays in `main.rs`.
 
 use crate::app::Outcome;
@@ -24,7 +24,7 @@ pub fn clob_order_has_open_size(o: &ClobOpenOrder) -> bool {
     clob_order_remaining_size(o) > CLOB_ORDER_REMAINING_DUST
 }
 
-/// GTD take-profit sell size after a market BUY consolidate.
+/// GTD take-profit sell size after a **buy** consolidate (FAK or matched GTD).
 ///
 /// - `had_resting_sells`: sum old TP escrow (`sell_rem_pre`) + this fill (`buy_ack_qty`).
 /// - no existing TP: use total position (`position_shares`), with `buy_ack_qty` as floor for stale state.

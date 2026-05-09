@@ -27,7 +27,7 @@ pub(crate) fn clamp_prob_fee(p: f64) -> f64 {
     p.clamp(0.01, 0.99)
 }
 
-/// Limit price for a GTD take-profit **sell** after a **taker** market buy at `entry_px`.
+/// Limit price for a GTD take-profit **sell** after a **taker** buy (FAK or crossed GTD) at `entry_px`.
 ///
 /// Interprets `take_profit_bps` like the legacy formula (`entry * (1 + bps/10_000)`) but solves for a
 /// limit price `tp` such that **round-trip taker fees** still leave about that **gross** edge vs

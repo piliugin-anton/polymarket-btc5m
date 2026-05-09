@@ -2,6 +2,7 @@
 //!
 //! All trading-sensitive values come from environment variables. See `.env.example`.
 //! Trailing width: prefer `BUY_TRAIL_BPS`; `MARKET_BUY_TRAIL_BPS` is a legacy alias when unset.
+//! Take-profit / trail-activation bps: prefer `TAKE_PROFIT_BPS`; `MARKET_BUY_TAKE_PROFIT_BPS` is a legacy alias when unset.
 
 use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
@@ -67,12 +68,12 @@ pub struct Config {
     pub market_buy_slippage_bps: u32,
     /// Max fill slippage for market **sell** FAK orders (basis points; widens sell floor vs best bid).
     pub market_sell_slippage_bps: u32,
-    /// Bps margin: (1) with trailing **off** — GTD SELL after a market **Buy** at this edge
-    /// ([`crate::fees::take_profit_limit_price_crypto_after_fees`]). (2) with trailing **on** — trail
-    /// **arms** when `best_bid >= entry * (1 + bps/10_000)` with `entry` from the live position
-    /// (`avg_entry`) or the fill estimate until the position is applied (`0` = arm as soon as bid
-    /// reaches entry).
-    pub market_buy_take_profit_bps: u32,
+    /// Bps margin: (1) with trailing **off** — GTD SELL after a **Buy** (FAK market or GTD limit with
+    /// fill) at this edge ([`crate::fees::take_profit_limit_price_crypto_after_fees`]). (2) with
+    /// trailing **on** — trail **arms** when `best_bid >= entry * (1 + bps/10_000)` with `entry` from
+    /// the live position (`avg_entry`) or the fill estimate until the position is applied (`0` =
+    /// arm as soon as bid reaches entry).
+    pub take_profit_bps: u32,
     /// If positive after a **Buy** (FAK market or GTD limit when the POST response includes a fill),
     /// run a trailing stop on CLOB best bid, then FAK SELL; trail width in bps from peak. Resting
     /// limit buys arm the same trail when the fill arrives on the user channel as a **maker** leg
@@ -140,9 +141,14 @@ impl Config {
             .or(legacy_slippage_bps)
             .unwrap_or(50);
 
-        let market_buy_take_profit_bps = std::env::var("MARKET_BUY_TAKE_PROFIT_BPS")
+        let take_profit_bps = std::env::var("TAKE_PROFIT_BPS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
+            .or_else(|| {
+                std::env::var("MARKET_BUY_TAKE_PROFIT_BPS")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+            })
             .unwrap_or(0);
 
         let buy_trail_bps = std::env::var("BUY_TRAIL_BPS")
@@ -208,7 +214,7 @@ impl Config {
             default_price,
             market_buy_slippage_bps,
             market_sell_slippage_bps,
-            market_buy_take_profit_bps,
+            take_profit_bps,
             buy_trail_bps,
             trailing_exit_min_profit_bps,
             relayer_api_key,

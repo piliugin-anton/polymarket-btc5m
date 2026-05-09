@@ -19,7 +19,7 @@ This terminal app lets you:
 - See the full **UP / DOWN order book** in real time
 - Place **market orders** (FAK — Fill or Kill) and **limit orders** (GTD — expire just before window close) with single keypresses
 - Track your **open positions and unrealized PnL**
-- Use an optional **trailing stop** — tracks **best bid**, arms after a gross move (`MARKET_BUY_TAKE_PROFIT_BPS`), then FAK-sells when the trail trips; works for **market (FAK) and limit (GTD) buys** (resting fills arm via the user-channel when you are **maker** on the trade)
+- Use an optional **trailing stop** — tracks **best bid**, arms after a gross move (`TAKE_PROFIT_BPS`), then FAK-sells when the trail trips; works for **market (FAK) and limit (GTD) buys** (resting fills arm via the user-channel when you are **maker** on the trade)
 - View **sentiment** (CLOB mid-price or top holders from Data API)
 - **Redeem** resolved winnings via the Polymarket relayer (Safe wallets)
 - Fetch a **Solana USDC deposit address** via Polymarket Bridge (key `f`)
@@ -125,7 +125,7 @@ Optional but useful:
 |---|---|
 | `POLYMARKET_PROXY` | Proxy for geo-blocked regions — see [Geo-restrictions](#geo-restricted) |
 | `BUY_TRAIL_BPS` | Trailing stop width in bps from peak best bid (`0` = off). Applies after **market or limit** buys that arm the trail. Legacy: `MARKET_BUY_TRAIL_BPS` is used if `BUY_TRAIL_BPS` is unset |
-| `MARKET_BUY_TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). Also used for auto take-profit **GTD sell after market BUY** when `BUY_TRAIL_BPS` is `0` |
+| `TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). With `BUY_TRAIL_BPS` at `0`, also places an auto **GTD take-profit sell** after a **market or limit** buy fills (POST fill or maker fill on user WebSocket). Legacy: `MARKET_BUY_TAKE_PROFIT_BPS` is used if `TAKE_PROFIT_BPS` is unset |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
 | `POLYMARKET_RELAYER_API_KEY` | Redeem (`x` / `X`, Safe only), **`deploy-wallet`**, and deposit-wallet **approvals** (`b` in TUI when `SIG_TYPE=3`) — same Relayer API key from Settings → API |
 

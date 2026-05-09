@@ -225,7 +225,7 @@ async fn apply_app_event(
         }
         e => {
             match e {
-                AppEvent::RunTakeProfitAfterMarketBuy {
+                AppEvent::RunTakeProfitAfterBuy {
                     market,
                     outcome,
                     take_profit_bps,
@@ -254,14 +254,14 @@ async fn apply_app_event(
                     });
                 }
                 AppEvent::MergeTakeProfitRestingSells { outcome } => {
-                    if cfg.buy_trail_bps == 0 && cfg.market_buy_take_profit_bps > 0 {
+                    if cfg.buy_trail_bps == 0 && cfg.take_profit_bps > 0 {
                         if let Some(market) = state.market.clone() {
                             let pos = match outcome {
                                 Outcome::Up => state.position_up.clone(),
                                 Outcome::Down => state.position_down.clone(),
                             };
                             if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
-                                let tpb = cfg.market_buy_take_profit_bps;
+                                let tpb = cfg.take_profit_bps;
                                 let trading2 = Arc::clone(trading);
                                 let ledger2 = user_open_ledger.clone();
                                 let tx2 = tx.clone();
@@ -308,6 +308,42 @@ async fn apply_app_event(
                     // after Book events so we skip the call on every Price/Tick/etc. message.
                     let is_book_ev = matches!(ev, AppEvent::Book(_));
                     state.apply(ev).await;
+                    if let Some((outcome, buy_ack_qty)) = state.take_pending_ws_take_profit() {
+                        if cfg.buy_trail_bps == 0 && cfg.take_profit_bps > 0 {
+                            if let Some(market) = state.market.clone() {
+                                let pos = match outcome {
+                                    Outcome::Up => state.position_up.clone(),
+                                    Outcome::Down => state.position_down.clone(),
+                                };
+                                if pos.avg_entry.is_finite() && pos.avg_entry > 0.0 {
+                                    let tpb = cfg.take_profit_bps;
+                                    let trading2 = Arc::clone(trading);
+                                    let ledger2 = user_open_ledger.clone();
+                                    let tx2 = tx.clone();
+                                    tokio::spawn(async move {
+                                        run_take_profit_consolidate_after_buy(
+                                            trading2,
+                                            ledger2,
+                                            tx2,
+                                            market,
+                                            outcome,
+                                            tpb,
+                                            buy_ack_qty,
+                                            pos.shares,
+                                            pos.avg_entry,
+                                        )
+                                        .await;
+                                    });
+                                } else {
+                                    debug!(
+                                        outcome = ?outcome,
+                                        avg = pos.avg_entry,
+                                        "take-profit (maker WS BUY): skipped — invalid position avg entry",
+                                    );
+                                }
+                            }
+                        }
+                    }
                     if is_book_ev {
                         try_dispatch_trailing_sell(state, trading, tx, cfg);
                     }
@@ -720,13 +756,13 @@ async fn run_merge_resting_tp_sells_from_ws(
     );
 }
 
-/// After a market BUY (FAK) with fixed take-profit: optionally cancel resting SELL on the same
+/// After a **Buy** (FAK or GTD with fill) with fixed take-profit: optionally cancel resting SELL on the same
 /// outcome, then place one GTD take-profit sized to the merged position (VWAP from UI state).
 ///
 /// Open orders come from [`feeds::clob_user_ws::UserOpenOrdersLedger`] (user WS + last REST
 /// merge). Sell size uses UI `position_shares` (no `GET /balance-allowance` here); `place_order`
 /// still performs its own balance reads on retries if needed. `buy_ack_qty` matches the preceding
-/// [`AppEvent::OrderAck`] for this FAK BUY (floor when UI position lags CLOB).
+/// [`AppEvent::OrderAck`] for this buy (floor when UI position lags CLOB).
 #[allow(clippy::too_many_arguments)]
 async fn run_take_profit_consolidate_after_buy(
     trading: Arc<TradingClient>,
@@ -1070,10 +1106,10 @@ async fn main() -> Result<()> {
         signer = %cfg.signer_address,
         funder = %cfg.funder,
         proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
-        market_buy_take_profit_bps = cfg.market_buy_take_profit_bps,
+        take_profit_bps = cfg.take_profit_bps,
         buy_trail_bps = cfg.buy_trail_bps,
         trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
-        "config loaded (GTD take-profit if TP_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
+        "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
     // ── subcommand dispatch (no TUI) ─────────────────────────────────
@@ -1218,7 +1254,7 @@ async fn main() -> Result<()> {
     let trading_for_positions = trading.clone();
     let data_api_user = cfg.funder;
     let buy_trail_bps_supervisor = cfg.buy_trail_bps;
-    let buy_trail_activation_bps_supervisor = cfg.market_buy_take_profit_bps;
+    let buy_trail_activation_bps_supervisor = cfg.take_profit_bps;
     let user_open_ledger = std::sync::Arc::new(feeds::clob_user_ws::UserOpenOrdersLedger::new());
     let user_trade_sync = std::sync::Arc::new(feeds::user_trade_sync::UserTradeSync::new());
     // Supervisor moves a clone; `user_open_ledger` / `user_trade_sync` stay in `main` for TUI.
@@ -2088,7 +2124,7 @@ fn dispatch_action(
                 otype,
                 buy_notional,
                 0,
-                cfg.market_buy_take_profit_bps,
+                cfg.take_profit_bps,
                 cfg.buy_trail_bps,
                 false,
             );
@@ -2138,7 +2174,7 @@ fn dispatch_action(
                 OrderType::Gtd,
                 buy_notional,
                 exp_secs,
-                cfg.market_buy_take_profit_bps,
+                cfg.take_profit_bps,
                 cfg.buy_trail_bps,
                 false,
             );
@@ -2162,7 +2198,7 @@ fn spawn_order(
     // Trailing when > 0; `take_profit_bps` is the **gross** bps move vs entry to arm (see
     // `RequestTrailingArm` / `try_promote_pending_trail`).
     trail_bps: u32,
-    // If true: GTD limit sell placed after a market buy (take-profit); used for targeted logging.
+    // If true: GTD limit sell placed after a buy take-profit; used for targeted logging.
     is_take_profit_placement: bool,
 ) {
     tokio::spawn(async move {
@@ -2332,18 +2368,18 @@ fn spawn_order(
                     if take_profit_bps > 0
                         && trail_bps == 0
                         && matches!(side, Side::Buy)
-                        && otype == OrderType::Fak
+                        && matches!(otype, OrderType::Fak | OrderType::Gtd)
                     {
                         let Some(buy_ack_qty) = buy_ack_qty_tp else {
                             info!(
                                 take_profit_bps,
                                 outcome = ?outcome,
-                                "take-profit: skipped — no FAK fill ack (cannot align TP with position)",
+                                order_type = ?otype,
+                                "take-profit: skipped — no fill ack (cannot align TP with position)",
                             );
                             let _ = tx
                                 .send(AppEvent::StatusInfo(
-                                    "take-profit skipped: no fill ack for FAK BUY (see logs)"
-                                        .into(),
+                                    "take-profit skipped: no fill ack for BUY (see logs)".into(),
                                 ))
                                 .await;
                             return;
@@ -2352,21 +2388,24 @@ fn spawn_order(
                             info!(
                                 limit_price = price,
                                 outcome = ?outcome,
-                                "take-profit: skipped — market FAK limit price >= 0.99",
+                                order_type = ?otype,
+                                "take-profit: skipped — BUY limit price >= 0.99",
                             );
                             return;
                         }
                         info!(
                             take_profit_bps,
                             outcome = ?outcome,
+                            order_type = ?otype,
                             buy_ack_qty,
-                            "take-profit: market BUY succeeded; evaluating GTD limit sell",
+                            "take-profit: BUY filled; evaluating GTD limit sell",
                         );
                         let Some((_, _, amounts_from_api)) =
                             resp.take_profit_fill_for_market_buy(shares, price)
                         else {
                             info!(
                                 outcome = ?outcome,
+                                order_type = ?otype,
                                 success = resp.success,
                                 status = ?resp.status,
                                 "take-profit: skipped — could not estimate fill (see StatusInfo in TUI)",
@@ -2374,7 +2413,7 @@ fn spawn_order(
                             let _ = tx
                                 .send(AppEvent::StatusInfo(
                                     "take-profit skipped: no fill amounts and order not in an \
-                                     executable state (unexpected for FAK)"
+                                     executable state (unexpected for a matched buy)"
                                         .into(),
                                 ))
                                 .await;
@@ -2436,7 +2475,7 @@ fn spawn_order(
                             "take-profit: scheduling consolidate (open SELL on same outcome + merged position)",
                         );
                         let _ = tx
-                            .send(AppEvent::RunTakeProfitAfterMarketBuy {
+                            .send(AppEvent::RunTakeProfitAfterBuy {
                                 market: market_for_refresh.clone(),
                                 outcome,
                                 take_profit_bps,

@@ -162,9 +162,9 @@ pub enum AppEvent {
     SeriesListReady(std::result::Result<Vec<SeriesRow>, String>),
     /// Wizard complete — start RTDS + Gamma discovery (main spawns tasks; `apply` updates state).
     StartTrading(std::sync::Arc<MarketProfile>),
-    /// After a market **Buy** (FAK) with `MARKET_BUY_TAKE_PROFIT_BPS > 0` and `BUY_TRAIL_BPS == 0`:
+    /// After a **Buy** (FAK or GTD with fill in POST) with `TAKE_PROFIT_BPS > 0` and `BUY_TRAIL_BPS == 0`:
     /// consolidate take-profit vs open SELL legs and current position (handled in `main::apply_app_event`).
-    RunTakeProfitAfterMarketBuy {
+    RunTakeProfitAfterBuy {
         market: crate::gamma::ActiveMarket,
         outcome: Outcome,
         take_profit_bps: u32,
@@ -177,7 +177,7 @@ pub enum AppEvent {
         outcome: Outcome,
     },
     /// After a **Buy** (FAK or GTD with fill in POST) when `BUY_TRAIL_BPS` is set: register until CLOB **mid**
-    /// is at or above **gross** take-profit move from position entry (`MARKET_BUY_TAKE_PROFIT_BPS`).
+    /// is at or above **gross** take-profit move from position entry (`TAKE_PROFIT_BPS`).
     RequestTrailingArm {
         outcome: Outcome,
         /// Fill / REST estimate; used if position not yet updated.
@@ -520,6 +520,8 @@ pub struct AppState {
     /// Last [`AppEvent::MarketRoll`] — arms trailing on **maker** user-channel BUY fills (resting limits).
     pub buy_trail_bps: u32,
     pub buy_trail_activation_bps: u32,
+    /// Maker BUY fill on user WS (resting limit) should run fixed take-profit in `main` after `apply`.
+    pub pending_ws_take_profit: Option<(Outcome, f64)>,
 }
 
 impl AppState {
@@ -574,7 +576,13 @@ impl AppState {
             cached_book_watch_tokens: Vec::new(),
             buy_trail_bps: 0,
             buy_trail_activation_bps: 0,
+            pending_ws_take_profit: None,
         }
+    }
+
+    /// Clears and returns a pending fixed take-profit request from a **maker** user-channel BUY fill.
+    pub fn take_pending_ws_take_profit(&mut self) -> Option<(Outcome, f64)> {
+        self.pending_ws_take_profit.take()
     }
 
     /// Merge a pending trailing arm (same rules as [`AppEvent::RequestTrailingArm`]).
@@ -1287,6 +1295,7 @@ impl AppState {
                 self.market = Some(market);
                 self.buy_trail_bps = buy_trail_bps;
                 self.buy_trail_activation_bps = buy_trail_activation_bps;
+                self.pending_ws_take_profit = None;
                 self.book_up = None;
                 self.book_down = None;
                 self.position_up = Default::default();
@@ -1476,6 +1485,17 @@ impl AppState {
                             );
                         }
                     }
+                    if matches!(side, Side::Buy)
+                        && from_maker_leg
+                        && self.buy_trail_bps == 0
+                        && self.buy_trail_activation_bps > 0
+                        && qty > 1e-12
+                        && price.is_finite()
+                        && price > 0.0
+                        && price < 0.99
+                    {
+                        self.pending_ws_take_profit = Some((ui_oc, qty));
+                    }
                     self.user_trade_sync
                         .after_ws_user_fill_committed(&clob_trade_id, &order_leg_id, qty, price)
                         .await;
@@ -1664,8 +1684,9 @@ impl AppState {
                 self.cached_countdown_secs = None;
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
+                self.pending_ws_take_profit = None;
             }
-            AppEvent::RunTakeProfitAfterMarketBuy { .. } => {
+            AppEvent::RunTakeProfitAfterBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
             }
             AppEvent::MergeTakeProfitRestingSells { .. } => {
