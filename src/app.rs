@@ -20,6 +20,7 @@ use crate::fees::polymarket_crypto_taker_fee_usdc;
 use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_profile::MarketProfile;
+use crate::take_profit::{clob_order_has_open_size, clob_order_remaining_size};
 use crate::trading::{
     canonical_clob_token_id, clob_asset_ids_match, norm_clob_owner, norm_order_id_key,
     parse_clob_side_str, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade,
@@ -2136,12 +2137,10 @@ pub fn escrow_sell_shares_from_clob_orders(
         if side != Side::Sell {
             continue;
         }
-        let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
-        let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
-        let remaining = orig - matched;
-        if !remaining.is_finite() || remaining <= 1e-9 {
+        if !clob_order_has_open_size(o) {
             continue;
         }
+        let remaining = clob_order_remaining_size(o);
         match outcome {
             Some(Outcome::Up) => up += remaining,
             Some(Outcome::Down) => down += remaining,
@@ -2169,13 +2168,11 @@ pub fn open_orders_from_clob(
         let Some(side) = parse_clob_side(&o.side) else {
             continue;
         };
-        let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
-        let matched = o.size_matched.parse::<f64>().unwrap_or(0.0);
         let price = o.price.parse::<f64>().unwrap_or(f64::NAN);
-        let remaining = orig - matched;
-        if !remaining.is_finite() || remaining <= 1e-9 {
+        if !clob_order_has_open_size(&o) {
             continue;
         }
+        let remaining = clob_order_remaining_size(&o);
         if !price.is_finite() || price <= 0.0 {
             continue;
         }

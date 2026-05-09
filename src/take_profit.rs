@@ -4,6 +4,10 @@
 use crate::app::Outcome;
 use crate::trading::{clob_asset_ids_match, parse_clob_side_str, ClobOpenOrder, Side};
 
+/// Remaining size at or below this is treated as fully filled (REST/WS float noise; TUI shows
+/// `{:.2}` shares so sub-0.01 leftovers read as `0.00` but would otherwise stick in Open Orders).
+pub const CLOB_ORDER_REMAINING_DUST: f64 = 5e-3;
+
 /// Unfilled size (`original_size - size_matched`), clamped to `>= 0`, `0` if parse fails.
 pub fn clob_order_remaining_size(o: &ClobOpenOrder) -> f64 {
     let orig = o.original_size.parse::<f64>().unwrap_or(f64::NAN);
@@ -13,6 +17,11 @@ pub fn clob_order_remaining_size(o: &ClobOpenOrder) -> f64 {
     } else {
         0.0
     }
+}
+
+#[inline]
+pub fn clob_order_has_open_size(o: &ClobOpenOrder) -> bool {
+    clob_order_remaining_size(o) > CLOB_ORDER_REMAINING_DUST
 }
 
 /// GTD take-profit sell size after a market BUY consolidate.
@@ -127,6 +136,17 @@ mod tests {
         let mut o = sell_row("x", "111", "10", "0");
         o.original_size = "nan".into();
         assert!(clob_order_remaining_size(&o).abs() < 1e-9);
+    }
+
+    #[test]
+    fn has_open_size_respects_dust_floor() {
+        let tiny = sell_row("d", "111", "10", "9.9999");
+        assert!(
+            !clob_order_has_open_size(&tiny),
+            "sub-dust remainder should not count as open"
+        );
+        let open = sell_row("e", "111", "10", "3");
+        assert!(clob_order_has_open_size(&open));
     }
 
     #[test]

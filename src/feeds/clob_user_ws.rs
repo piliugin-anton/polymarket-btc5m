@@ -29,7 +29,9 @@ use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
 use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
-use crate::take_profit::outcomes_with_duplicate_resting_sells;
+use crate::take_profit::{
+    clob_order_has_open_size, outcomes_with_duplicate_resting_sells,
+};
 use crate::trading::{
     canonical_clob_token_id, clob_asset_ids_match, norm_order_id_key, parse_clob_side_str,
     parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, Side,
@@ -253,12 +255,7 @@ impl UserOpenOrdersLedger {
             if k2.is_empty() {
                 return false;
             }
-            let remove = {
-                let orig = row.original_size.parse::<f64>().unwrap_or(f64::NAN);
-                let matched = row.size_matched.parse::<f64>().unwrap_or(0.0);
-                orig.is_finite() && (orig - matched) <= 1e-9
-            };
-            if remove {
+            if !clob_order_has_open_size(&row) {
                 return g.by_id.remove(&k2).is_some();
             }
             g.by_id.insert(k2, row);
@@ -654,5 +651,55 @@ mod tests {
         assert!(o2.is_some());
         let rows = o2.expect("rows");
         assert!(rows.is_empty());
+    }
+
+    #[tokio::test]
+    async fn user_ws_ledger_update_below_dust_removes_row() {
+        let l = UserOpenOrdersLedger::new();
+        l.roll_market(&UserWsMarket {
+            condition_id: "0xabc1".to_string(),
+            up_token_id: "111".to_string(),
+            down_token_id: "222".to_string(),
+        })
+        .await;
+        let place: Value = serde_json::from_str(
+            r#"{
+            "event_type":"order",
+            "id":"0xdust",
+            "market":"0xabc1",
+            "type":"PLACEMENT",
+            "asset_id":"111",
+            "side":"BUY",
+            "price":"0.5",
+            "original_size":"10",
+            "size_matched":"0"
+        }"#,
+        )
+        .unwrap();
+        let almost: Value = serde_json::from_str(
+            r#"{
+            "event_type":"order",
+            "id":"0xdust",
+            "market":"0xabc1",
+            "type":"UPDATE",
+            "asset_id":"111",
+            "side":"BUY",
+            "price":"0.5",
+            "original_size":"10",
+            "size_matched":"9.999"
+        }"#,
+        )
+        .unwrap();
+        assert!(l.apply_order_values(&[place]).await.is_some());
+        let o = l
+            .apply_order_values(&[almost])
+            .await
+            .expect("second apply should refresh UI rows");
+        assert!(
+            o.is_empty(),
+            "remaining 0.001 share is dust vs TUI — treat as fully filled"
+        );
+        let snap = l.open_orders_ui_snapshot().await.expect("snap");
+        assert!(snap.is_empty());
     }
 }
