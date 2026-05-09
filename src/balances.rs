@@ -100,6 +100,38 @@ fn position_id(collateral: Address, collection_id: B256) -> U256 {
     U256::from_be_slice(h.as_slice())
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ConditionPositionIds {
+    pos1_usdc: U256,
+    pos2_usdc: U256,
+    pos1_pusd: U256,
+    pos2_pusd: U256,
+}
+
+impl ConditionPositionIds {
+    fn new(condition_id: B256) -> Self {
+        let collection_1 = collection_id(condition_id, 1);
+        let collection_2 = collection_id(condition_id, 2);
+        Self {
+            pos1_usdc: position_id(USDC_E, collection_1),
+            pos2_usdc: position_id(USDC_E, collection_2),
+            pos1_pusd: position_id(PUSD, collection_1),
+            pos2_pusd: position_id(PUSD, collection_2),
+        }
+    }
+
+    fn contains(self, token_id: U256) -> bool {
+        token_id == self.pos1_usdc
+            || token_id == self.pos2_usdc
+            || token_id == self.pos1_pusd
+            || token_id == self.pos2_pusd
+    }
+
+    fn is_outcome_one(self, token_id: U256) -> bool {
+        token_id == self.pos1_usdc || token_id == self.pos1_pusd
+    }
+}
+
 fn u256_to_usdc_f64(v: U256) -> f64 {
     v.to_string().parse::<f64>().unwrap_or(0.0) / 1_000_000.0
 }
@@ -243,30 +275,26 @@ fn claimable_standard_total_from_maps(
     balances: &HashMap<U256, U256>,
 ) -> f64 {
     let mut total = 0.0f64;
+    let mut position_ids_by_condition: HashMap<B256, ConditionPositionIds> = HashMap::new();
     for &(cid, tid, api_fb) in parsed {
         let Some((d, n0, n1)) = payouts.get(&cid).copied() else {
             total += api_fb;
             continue;
         };
-        let pos1_usdc = position_id(USDC_E, collection_id(cid, 1));
-        let pos2_usdc = position_id(USDC_E, collection_id(cid, 2));
-        let pos1_pusd = position_id(PUSD, collection_id(cid, 1));
-        let pos2_pusd = position_id(PUSD, collection_id(cid, 2));
+        let ids = *position_ids_by_condition
+            .entry(cid)
+            .or_insert_with(|| ConditionPositionIds::new(cid));
         let b = balances.get(&tid).copied().unwrap_or(U256::ZERO);
 
         if d.is_zero() {
             total += api_fb;
             continue;
         }
-        if tid != pos1_usdc && tid != pos2_usdc && tid != pos1_pusd && tid != pos2_pusd {
+        if !ids.contains(tid) {
             total += api_fb;
             continue;
         }
-        let n = if tid == pos1_usdc || tid == pos1_pusd {
-            n0
-        } else {
-            n1
-        };
+        let n = if ids.is_outcome_one(tid) { n0 } else { n1 };
         let slot_usdc = u256_to_usdc_f64(b * n / d);
         if slot_usdc > 1e-9 {
             total += slot_usdc;
@@ -275,6 +303,23 @@ fn claimable_standard_total_from_maps(
         }
     }
     total
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn condition_position_ids_match_direct_derivation() {
+        let cid = B256::repeat_byte(0x11);
+        let ids = ConditionPositionIds::new(cid);
+
+        assert_eq!(ids.pos1_usdc, position_id(USDC_E, collection_id(cid, 1)));
+        assert_eq!(ids.pos2_usdc, position_id(USDC_E, collection_id(cid, 2)));
+        assert_eq!(ids.pos1_pusd, position_id(PUSD, collection_id(cid, 1)));
+        assert_eq!(ids.pos2_pusd, position_id(PUSD, collection_id(cid, 2)));
+    }
 }
 
 async fn fetch_onchain_cash_and_claim_std(
@@ -431,6 +476,15 @@ fn sum_neg_risk_claimable_usdc(rows: &[DataPosition]) -> f64 {
         .map(|p| p.current_value)
         .filter(|v| v.is_finite())
         .sum()
+}
+
+/// Cash (USDC.e) + claimable: standard CTF via Multicall3 `aggregate3`; neg-risk from Data API; floor vs full API sum.
+pub async fn fetch_cash_panel_usdc(
+    http_rpc: &Client,
+    rpc_url: &str,
+    funder: Address,
+) -> Result<f64> {
+    collateral_cash_usdc_f64(http_rpc, rpc_url, funder).await
 }
 
 /// Cash (USDC.e) + claimable: standard CTF via Multicall3 `aggregate3`; neg-risk from Data API; floor vs full API sum.

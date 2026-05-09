@@ -1,6 +1,7 @@
 //! Gamma `GET /series` — list crypto up/down **assets** for the wizard (lightweight, `exclude_events=true`).
 
 use anyhow::{Context, Result};
+use futures_util::future::join_all;
 use serde::Deserialize;
 
 use crate::config::GAMMA_HOST;
@@ -41,38 +42,8 @@ pub fn static_fallback_rows() -> Vec<SeriesRow> {
 
 /// Fetch metadata for each known [`CRYPTO_ASSETS`] 5m series.
 pub async fn fetch_crypto_series_for_wizard(http: &reqwest::Client) -> Result<Vec<SeriesRow>> {
-    let mut out = Vec::new();
-    for a in CRYPTO_ASSETS {
-        let url = format!(
-            "{GAMMA_HOST}/series?slug={}&limit=1&exclude_events=true",
-            a.series_slug_5m
-        );
-        let resp = http
-            .get(&url)
-            .send()
-            .await
-            .with_context(|| format!("GET {url}"))?;
-        if !resp.status().is_success() {
-            out.push(fallback_row(a));
-            continue;
-        }
-        let list: Vec<RawSeries> = resp.json().await.with_context(|| format!("decode {url}"))?;
-        if let Some(s) = list.into_iter().next() {
-            out.push(SeriesRow {
-                asset: a.clone(),
-                title: if s.title.is_empty() {
-                    a.label.to_string()
-                } else {
-                    s.title
-                },
-                volume_24h: s.volume,
-                series_slug: s.slug,
-            });
-        } else {
-            out.push(fallback_row(a));
-        }
-    }
-    Ok(out)
+    let rows = join_all(CRYPTO_ASSETS.iter().map(|a| fetch_series_row(http, a))).await;
+    rows.into_iter().collect()
 }
 
 fn fallback_row(a: &CryptoAsset) -> SeriesRow {
@@ -81,5 +52,35 @@ fn fallback_row(a: &CryptoAsset) -> SeriesRow {
         title: format!("{} Up or Down", a.label),
         volume_24h: None,
         series_slug: a.series_slug_5m.to_string(),
+    }
+}
+
+async fn fetch_series_row(http: &reqwest::Client, a: &CryptoAsset) -> Result<SeriesRow> {
+    let url = format!(
+        "{GAMMA_HOST}/series?slug={}&limit=1&exclude_events=true",
+        a.series_slug_5m
+    );
+    let resp = http
+        .get(&url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?;
+    if !resp.status().is_success() {
+        return Ok(fallback_row(a));
+    }
+    let list: Vec<RawSeries> = resp.json().await.with_context(|| format!("decode {url}"))?;
+    if let Some(s) = list.into_iter().next() {
+        Ok(SeriesRow {
+            asset: a.clone(),
+            title: if s.title.is_empty() {
+                a.label.to_string()
+            } else {
+                s.title
+            },
+            volume_24h: s.volume,
+            series_slug: s.slug,
+        })
+    } else {
+        Ok(fallback_row(a))
     }
 }

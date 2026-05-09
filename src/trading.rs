@@ -1299,9 +1299,21 @@ fn balance_allowance_error_text(msg: &str) -> bool {
 /// Back-off (ms) before re-reading conditional balance + POST **SELL** on retries. Used after a
 /// failed/zero-balance read or a balance/allowance rejection — not on the first FAK attempt (fast path).
 const SELL_ORDER_PREP_SETTLE_MS: [u64; 5] = [200, 500, 1_200, 2_500, 4_500];
+const FAST_SELL_MAX_POST_ATTEMPTS: u32 = 2;
+const SKIP_SETTLE_SELL_MAX_POST_ATTEMPTS: u32 = 3;
 
 /// How long `GET /fee-rate` responses are reused per `token_id` (avoids an extra RTT on hot paths).
 const FEE_RATE_CACHE_TTL: Duration = Duration::from_secs(600);
+
+fn sell_post_attempt_limit(order_type: OrderType, sell_skip_pre_post_settle: bool) -> u32 {
+    if matches!(order_type, OrderType::Fak) {
+        FAST_SELL_MAX_POST_ATTEMPTS
+    } else if sell_skip_pre_post_settle {
+        SKIP_SETTLE_SELL_MAX_POST_ATTEMPTS
+    } else {
+        SELL_ORDER_PREP_SETTLE_MS.len() as u32
+    }
+}
 
 struct TradingState {
     creds: Option<ApiCreds>,
@@ -2063,9 +2075,53 @@ impl TradingClient {
         // (`OrderArgs::sell_skip_pre_post_settle`) skip settle sleep on the first attempt so POST
         // starts quickly; retries + clamp recover stale cache / allowance errors.
         let max_post_attempts: u32 = if matches!(args.side, Side::Sell) {
-            SELL_ORDER_PREP_SETTLE_MS.len() as u32
+            sell_post_attempt_limit(order_type, args.sell_skip_pre_post_settle)
         } else {
             1
+        };
+
+        let creds = self.ensure_creds().await?;
+        let api_version = self.fetch_clob_order_version().await?;
+        if self.config.sig_type == SignatureType::Poly1271 && api_version != 2 {
+            bail!(
+                "POLYMARKET_SIG_TYPE=3 (POLY_1271 / deposit wallet) requires CLOB order API version 2; \
+                 GET /version returned {api_version}"
+            );
+        }
+        // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
+        let fee_bps = if api_version == 1 {
+            self.fetch_fee_rate_bps(&args.token_id).await?
+        } else {
+            0u64
+        };
+        let expiration_u256 = match order_type {
+            OrderType::Gtd => {
+                if args.expiration_unix_secs == 0 {
+                    bail!("GTD order requires non-zero expiration_unix_secs");
+                }
+                U256::from(args.expiration_unix_secs)
+            }
+            _ => {
+                if args.expiration_unix_secs != 0 {
+                    bail!("expiration_unix_secs must be 0 for {:?}", order_type);
+                }
+                U256::ZERO
+            }
+        };
+        let expiration_wire = match order_type {
+            OrderType::Gtd => args.expiration_unix_secs.to_string(),
+            _ => "0".into(),
+        };
+        let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
+        let verifying_v1 = if args.neg_risk {
+            NEG_RISK_CTF_EXCHANGE_V1
+        } else {
+            CTF_EXCHANGE_V1
+        };
+        let verifying_v2 = if args.neg_risk {
+            NEG_RISK_CTF_EXCHANGE_V2
+        } else {
+            CTF_EXCHANGE_V2
         };
 
         for post_attempt in 0..max_post_attempts {
@@ -2105,40 +2161,6 @@ impl TradingClient {
                 }
             }
 
-            let creds = self.ensure_creds().await?;
-            let api_version = self.fetch_clob_order_version().await?;
-            if self.config.sig_type == SignatureType::Poly1271 && api_version != 2 {
-                bail!(
-                    "POLYMARKET_SIG_TYPE=3 (POLY_1271 / deposit wallet) requires CLOB order API version 2; \
-                     GET /version returned {api_version}"
-                );
-            }
-            // EIP-712 V1 includes `feeRateBps`; V2 does not — skip `/fee-rate` on the hot path.
-            let fee_bps = if api_version == 1 {
-                self.fetch_fee_rate_bps(&args.token_id).await?
-            } else {
-                0u64
-            };
-
-            let expiration_u256 = match order_type {
-                OrderType::Gtd => {
-                    if args.expiration_unix_secs == 0 {
-                        bail!("GTD order requires non-zero expiration_unix_secs");
-                    }
-                    U256::from(args.expiration_unix_secs)
-                }
-                _ => {
-                    if args.expiration_unix_secs != 0 {
-                        bail!("expiration_unix_secs must be 0 for {:?}", order_type);
-                    }
-                    U256::ZERO
-                }
-            };
-            let expiration_wire = match order_type {
-                OrderType::Gtd => args.expiration_unix_secs.to_string(),
-                _ => "0".into(),
-            };
-
             // 1. Compute maker/taker amounts from price+size (tick-aware — see `getOrderRawAmounts`).
             let (maker_amount, taker_amount) = amounts_for(
                 args.side,
@@ -2162,19 +2184,6 @@ impl TradingClient {
             // 2. Salt — must fit in JS `Number` (see `orderToJsonV1` / `orderToJsonV2` `parseInt`).
             let ts_ms = chrono::Utc::now().timestamp_millis();
             let salt = (rand::random::<f64>() * ts_ms as f64).round() as u64;
-
-            let token_id_u256 = U256::from_str(&args.token_id).context("token_id")?;
-
-            let verifying_v1 = if args.neg_risk {
-                NEG_RISK_CTF_EXCHANGE_V1
-            } else {
-                CTF_EXCHANGE_V1
-            };
-            let verifying_v2 = if args.neg_risk {
-                NEG_RISK_CTF_EXCHANGE_V2
-            } else {
-                CTF_EXCHANGE_V2
-            };
 
             const PUBLIC_TAKER: &str = "0x0000000000000000000000000000000000000000";
             const ZERO32: &str =
@@ -2352,7 +2361,7 @@ impl TradingClient {
                             maker_amount: order.makerAmount.to_string(),
                             taker_amount: order.takerAmount.to_string(),
                             side: args.side.as_str().to_string(),
-                            expiration: expiration_wire,
+                            expiration: expiration_wire.clone(),
                             nonce: "0".into(),
                             signature_type: self.config.sig_type as u8,
                             signature: sig_hex,
@@ -2984,6 +2993,26 @@ mod clob_error_text_tests {
     #[test]
     fn non_json_yields_none() {
         assert_eq!(extract_clob_error_text("not json"), None);
+    }
+}
+
+#[cfg(test)]
+mod sell_retry_policy_tests {
+    use super::{sell_post_attempt_limit, OrderType, SELL_ORDER_PREP_SETTLE_MS};
+
+    #[test]
+    fn fak_sell_uses_fast_retry_cap() {
+        assert_eq!(sell_post_attempt_limit(OrderType::Fak, false), 2);
+        assert_eq!(sell_post_attempt_limit(OrderType::Fak, true), 2);
+    }
+
+    #[test]
+    fn normal_sell_keeps_conservative_retry_count() {
+        assert_eq!(
+            sell_post_attempt_limit(OrderType::Gtd, false),
+            SELL_ORDER_PREP_SETTLE_MS.len() as u32
+        );
+        assert_eq!(sell_post_attempt_limit(OrderType::Gtd, true), 3);
     }
 }
 

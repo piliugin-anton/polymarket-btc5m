@@ -17,13 +17,11 @@
 mod app;
 mod balances;
 mod bridge_deposit;
-mod polymarket_relayer;
 mod config;
+mod data_api;
 mod deploy_wallet_cmd;
 mod deposit_wallet;
 mod deposit_wallet_approvals;
-mod poly1271;
-mod data_api;
 mod events;
 mod feeds;
 mod fees;
@@ -31,6 +29,8 @@ mod gamma;
 mod gamma_series;
 mod market_activity;
 mod market_profile;
+mod poly1271;
+mod polymarket_relayer;
 mod redeem;
 mod take_profit;
 
@@ -50,7 +50,7 @@ use chrono::Utc;
 use config::Config;
 use crossterm::{
     event::{
-        DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode,
+        DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode, KeyEvent,
         KeyEventKind, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
         PushKeyboardEnhancementFlags,
     },
@@ -65,6 +65,7 @@ use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     collections::{HashSet, VecDeque},
+    future::Future,
     io::stdout,
     mem,
     sync::{
@@ -116,6 +117,70 @@ const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
 /// GTD limit orders: 1 initial attempt + 3 retries on network error or CLOB soft rejection.
 const LIMIT_ORDER_MAX_ATTEMPTS: u32 = 4;
 const LIMIT_ORDER_RETRY_MS: u64 = 300;
+const MARKET_DATA_FLUSH_MS: u64 = 10;
+const MAX_EVENTS_PER_FRAME: usize = 512;
+const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(4);
+const BALANCE_CASH_POLL_SECS: u64 = 5;
+const BALANCE_CLAIMABLE_POLL_SECS: u64 = 60;
+const TP_CANCEL_MAX_CONCURRENT: usize = 4;
+
+#[derive(Debug, Clone, Copy)]
+struct EventDrainBudget {
+    max_events: usize,
+    max_elapsed: Duration,
+}
+
+impl EventDrainBudget {
+    fn new(max_events: usize, max_elapsed: Duration) -> Self {
+        Self {
+            max_events,
+            max_elapsed,
+        }
+    }
+
+    fn can_continue(self, processed: usize, started: Instant) -> bool {
+        processed < self.max_events && started.elapsed() < self.max_elapsed
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RateLimitBackoff {
+    base: Duration,
+    max: Duration,
+    current: Duration,
+}
+
+impl RateLimitBackoff {
+    fn new(base: Duration, max: Duration) -> Self {
+        Self {
+            base,
+            max,
+            current: base,
+        }
+    }
+
+    fn next_delay(self) -> Duration {
+        self.current
+    }
+
+    fn record_success(&mut self) {
+        self.current = self.base;
+    }
+
+    fn record_rate_limit(&mut self) {
+        self.current = std::cmp::min(self.current + self.current, self.max);
+    }
+}
+
+async fn bounded_join<F, T>(futures: Vec<F>, limit: usize) -> Vec<T>
+where
+    F: Future<Output = T>,
+{
+    futures_util::stream::iter(futures)
+        .buffer_unordered(limit.max(1))
+        .collect()
+        .await
+}
 
 /// Build CLOB user-channel subscription set (active UI + trailing tail markets).
 fn build_user_ws_bundle(state: &AppState) -> UserWsBundle {
@@ -692,7 +757,7 @@ async fn run_merge_resting_tp_sells_from_ws(
             async move { t.cancel_order(&id).await.map_err(|e| (id, e)) }
         })
         .collect();
-    for res in futures_util::future::join_all(cancel_futs).await {
+    for res in bounded_join(cancel_futs, TP_CANCEL_MAX_CONCURRENT).await {
         match res {
             Ok(()) => debug!("merge TP SELL: canceled resting SELL"),
             Err((order_id, e)) => {
@@ -830,7 +895,7 @@ async fn run_take_profit_consolidate_after_buy(
             async move { t.cancel_order(&id).await.map_err(|e| (id, e)) }
         })
         .collect();
-    for res in futures_util::future::join_all(cancel_futs).await {
+    for res in bounded_join(cancel_futs, TP_CANCEL_MAX_CONCURRENT).await {
         match res {
             Ok(()) => debug!("take-profit consolidate: canceled resting SELL"),
             Err((order_id, e)) => {
@@ -1099,8 +1164,12 @@ async fn main() -> Result<()> {
             println!("Subcommands:");
             println!("  debug-auth     Run the CLOB L1 auth flow and dump all intermediate");
             println!("                 values (useful for debugging 401/403 errors).");
-            println!("  deploy-wallet  Submit WALLET-CREATE; POLYMARKET_PK + POLYMARKET_RELAYER_API_KEY");
-            println!("                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default).");
+            println!(
+                "  deploy-wallet  Submit WALLET-CREATE; POLYMARKET_PK + POLYMARKET_RELAYER_API_KEY"
+            );
+            println!(
+                "                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default)."
+            );
             println!("  help           Show this help.");
             return Ok(());
         }
@@ -1130,15 +1199,8 @@ async fn main() -> Result<()> {
     // Shared event channel — generous buffer so bursts from the book WS don't drop
     let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
 
-    let (trade_print_tx, mut trade_print_rx) = mpsc::channel::<ClobTradePrint>(4096);
-    {
-        let txp = tx.clone();
-        tokio::spawn(async move {
-            while let Some(p) = trade_print_rx.recv().await {
-                let _ = txp.try_send(AppEvent::ClobPublicTrade(p));
-            }
-        });
-    }
+    let market_data = feeds::market_data_coalescer::MarketDataCoalescer::new(4096);
+    spawn_market_data_flusher(market_data.clone(), tx.clone());
 
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
@@ -1166,7 +1228,8 @@ async fn main() -> Result<()> {
     // ── spawn feeds ──────────────────────────────────────────────────
     spawn_price_feed(tx.clone(), rtds_sym_rx);
     spawn_ticker(tx.clone());
-    spawn_key_reader(tx.clone());
+    let (key_tx, mut key_rx) = mpsc::channel::<KeyEvent>(256);
+    spawn_key_reader(key_tx, tx.clone());
 
     // Shared `TradingClient` (interior `RwLock` for caches + `Mutex` for one-shot creds derive).
     let trading = Arc::new(TradingClient::new(cfg.clone())?);
@@ -1221,16 +1284,31 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                let mut interval = tokio::time::interval(Duration::from_secs(5));
+                let mut interval =
+                    tokio::time::interval(Duration::from_secs(BALANCE_CASH_POLL_SECS));
                 interval.tick().await;
+                let mut next_claimable_refresh = Instant::now();
+                let mut last_claimable = None;
                 loop {
                     interval.tick().await;
-                    match crate::balances::fetch_balance_panel_usdc(
-                        &data_http, &rpc_http, &rpc_url, funder,
-                    )
-                    .await
-                    {
+                    let refresh_claimable = Instant::now() >= next_claimable_refresh;
+                    let panel_result = if refresh_claimable || last_claimable.is_none() {
+                        crate::balances::fetch_balance_panel_usdc(
+                            &data_http, &rpc_http, &rpc_url, funder,
+                        )
+                        .await
+                    } else {
+                        crate::balances::fetch_cash_panel_usdc(&rpc_http, &rpc_url, funder)
+                            .await
+                            .map(|cash| (cash, last_claimable.unwrap_or(0.0)))
+                    };
+                    match panel_result {
                         Ok((cash, claimable)) => {
+                            if refresh_claimable || last_claimable.is_none() {
+                                last_claimable = Some(claimable);
+                                next_claimable_refresh = Instant::now()
+                                    + Duration::from_secs(BALANCE_CLAIMABLE_POLL_SECS);
+                            }
                             info!(
                                 cash_usdc = cash,
                                 claimable_usdc = claimable,
@@ -1277,13 +1355,11 @@ async fn main() -> Result<()> {
     let user_open_ledger_for_supervisor = user_open_ledger.clone();
     let user_trade_sync_for_supervisor = user_trade_sync.clone();
     let mut book_token_rx_supervisor = book_token_rx;
-    let trade_print_tx_supervisor = trade_print_tx.clone();
+    let market_data_supervisor = market_data.clone();
     tokio::spawn(async move {
         let mut book_handle: Option<tokio::task::JoinHandle<()>> = None;
         let mut orders_poll: Option<tokio::task::JoinHandle<()>> = None;
         let mut holders_poll: Option<tokio::task::JoinHandle<()>> = None;
-
-        let trade_sock = trade_print_tx_supervisor;
 
         // User WS: one long-lived connection; `UserWsBundle` adds extra condition IDs for
         // background trailing fills (main updates the watch after each `apply`).
@@ -1317,8 +1393,7 @@ async fn main() -> Result<()> {
                 }
                 *book_handle = Some(feeds::clob_ws::spawn(
                     ids.to_vec(),
-                    clob_forwarder(tx_for_books.clone()),
-                    trade_sock.clone(),
+                    market_data_supervisor.clone(),
                 ));
                 last_book_spawn = ids.to_vec();
             };
@@ -1627,9 +1702,9 @@ async fn main() -> Result<()> {
                         return;
                     }
                 };
-                // Public GET /holders — 1 Hz is typically fine; back off if you see HTTP 429.
-                let mut interval = tokio::time::interval(Duration::from_secs(1));
-                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                // Public GET /holders is a sentiment fallback; keep it lower cadence than L2 books.
+                let mut backoff =
+                    RateLimitBackoff::new(Duration::from_secs(5), Duration::from_secs(60));
                 loop {
                     match crate::data_api::fetch_top_holders_amount_sums(
                         &http,
@@ -1640,6 +1715,7 @@ async fn main() -> Result<()> {
                     .await
                     {
                         Ok((up_sum, down_sum)) => {
+                            backoff.record_success();
                             let _ = tx_holders
                                 .send(AppEvent::TopHoldersSentiment { up_sum, down_sum })
                                 .await;
@@ -1647,12 +1723,12 @@ async fn main() -> Result<()> {
                         Err(e) => {
                             let emsg = e.to_string();
                             if emsg.contains("429") || emsg.contains("Too Many") {
-                                // Rate-limited: back off 1 s before the next attempt.
+                                backoff.record_rate_limit();
                                 debug!(
                                     market = %cond_h,
-                                    "data-api GET /holders 429 rate-limit — backing off 1s"
+                                    delay_ms = backoff.next_delay().as_millis(),
+                                    "data-api GET /holders 429 rate-limit"
                                 );
-                                tokio::time::sleep(Duration::from_secs(1)).await;
                             } else {
                                 debug!(
                                     error = %e,
@@ -1662,7 +1738,7 @@ async fn main() -> Result<()> {
                             }
                         }
                     }
-                    interval.tick().await;
+                    tokio::time::sleep(backoff.next_delay()).await;
                 }
             }));
                 }
@@ -1704,27 +1780,36 @@ async fn main() -> Result<()> {
     let backend = CrosstermBackend::new(out);
     let mut term = Terminal::new(backend)?;
 
-    let mut state = AppState::new(cfg.default_size_usdc, cfg.default_price, user_trade_sync.clone());
+    let mut state = AppState::new(
+        cfg.default_size_usdc,
+        cfg.default_price,
+        user_trade_sync.clone(),
+    );
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);
 
     // ── main loop ────────────────────────────────────────────────────
-    /// Drain coalesced feed events in one frame so a burst of book updates
-    /// does not force one `draw()` per message (that made size-edit feel frozen).
-    const MAX_EVENTS_PER_FRAME: usize = 8192;
+    // Drain coalesced feed events in bounded slices so a burst of book updates
+    // cannot monopolize the TUI between draws.
+    let drain_budget = EventDrainBudget::new(MAX_EVENTS_PER_FRAME, EVENT_DRAIN_BUDGET);
 
     let result: Result<()> = loop {
         term.draw(|f| ui::draw(f, &state))?;
         let draw_finished_at = Instant::now();
 
-        let Some(mut ev) = rx.recv().await else {
+        let Some(mut ev) = (tokio::select! {
+            biased;
+            maybe_key = key_rx.recv() => maybe_key.map(AppEvent::Key),
+            maybe_ev = rx.recv() => maybe_ev,
+        }) else {
             break Ok(());
         };
 
         let mut should_quit = false;
         let mut had_key = false;
         let mut processed = 0usize;
+        let drain_started_at = Instant::now();
         loop {
             if matches!(ev, AppEvent::Key(_)) {
                 had_key = true;
@@ -1750,10 +1835,14 @@ async fn main() -> Result<()> {
                 break;
             }
             processed += 1;
-            if processed >= MAX_EVENTS_PER_FRAME {
+            if !drain_budget.can_continue(processed, drain_started_at) {
                 break;
             }
-            match rx.try_recv() {
+            match key_rx
+                .try_recv()
+                .map(AppEvent::Key)
+                .or_else(|_| rx.try_recv())
+            {
                 Ok(next) => ev = next,
                 Err(_) => break,
             }
@@ -1770,8 +1859,10 @@ async fn main() -> Result<()> {
             if Instant::now() < deadline {
                 tokio::select! {
                     biased;
-                    maybe_ev = rx.recv() => {
-                        let Some(mut ev) = maybe_ev else { break Ok(()) };
+                    maybe_key = key_rx.recv() => {
+                        let Some(mut ev) = maybe_key.map(AppEvent::Key) else { break Ok(()) };
+                        let mut processed = 0usize;
+                        let drain_started_at = Instant::now();
                         loop {
                             if apply_app_event(
                                 ev,
@@ -1793,7 +1884,54 @@ async fn main() -> Result<()> {
                                 should_quit = true;
                                 break;
                             }
-                            match rx.try_recv() {
+                            processed += 1;
+                            if !drain_budget.can_continue(processed, drain_started_at) {
+                                break;
+                            }
+                            match key_rx
+                                .try_recv()
+                                .map(AppEvent::Key)
+                                .or_else(|_| rx.try_recv())
+                            {
+                                Ok(next) => ev = next,
+                                Err(_) => break,
+                            }
+                        }
+                    }
+                    maybe_ev = rx.recv() => {
+                        let Some(mut ev) = maybe_ev else { break Ok(()) };
+                        let mut processed = 0usize;
+                        let drain_started_at = Instant::now();
+                        loop {
+                            if apply_app_event(
+                                ev,
+                                &mut state,
+                                &trading,
+                                &tx,
+                                &cfg,
+                                &user_open_ledger,
+                                &rtds_sym_tx,
+                                &market_tx,
+                                &market_profile_tx,
+                                &mut market_profile_rx_slot,
+                                &mut discovery_spawned,
+                                &user_bundle_tx,
+                                &book_token_tx,
+                            )
+                            .await
+                            {
+                                should_quit = true;
+                                break;
+                            }
+                            processed += 1;
+                            if !drain_budget.can_continue(processed, drain_started_at) {
+                                break;
+                            }
+                            match key_rx
+                                .try_recv()
+                                .map(AppEvent::Key)
+                                .or_else(|_| rx.try_recv())
+                            {
                                 Ok(next) => ev = next,
                                 Err(_) => break,
                             }
@@ -1805,7 +1943,16 @@ async fn main() -> Result<()> {
                     break Ok(());
                 }
             }
-            while let Ok(next) = rx.try_recv() {
+            let mut processed = 0usize;
+            let drain_started_at = Instant::now();
+            while drain_budget.can_continue(processed, drain_started_at) {
+                let Ok(next) = key_rx
+                    .try_recv()
+                    .map(AppEvent::Key)
+                    .or_else(|_| rx.try_recv())
+                else {
+                    break;
+                };
                 if apply_app_event(
                     next,
                     &mut state,
@@ -1826,6 +1973,7 @@ async fn main() -> Result<()> {
                     should_quit = true;
                     break;
                 }
+                processed += 1;
             }
             if should_quit {
                 break Ok(());
@@ -1865,32 +2013,94 @@ fn spawn_price_feed(tx: mpsc::Sender<AppEvent>, rtds_sym_rx: watch::Receiver<Str
     });
 }
 
-fn clob_forwarder(tx: mpsc::Sender<AppEvent>) -> mpsc::Sender<feeds::clob_ws::BookSnapshot> {
-    let (btx, mut brx) = mpsc::channel::<feeds::clob_ws::BookSnapshot>(64);
+fn spawn_market_data_flusher(
+    market_data: feeds::market_data_coalescer::MarketDataCoalescer,
+    tx: mpsc::Sender<AppEvent>,
+) {
     tokio::spawn(async move {
-        // Capacity persists across bursts — no realloc after the first few iterations.
-        // Linear scan beats HashMap for n ≤ 4 (UP + DOWN + trailing tails): no hash
-        // computation, no key clone, no heap metadata.
-        let mut latest: Vec<feeds::clob_ws::BookSnapshot> = Vec::with_capacity(4);
-        while let Some(b) = brx.recv().await {
-            // Collapse bursts so UP/DOWN snapshots both get a chance on the queue.
-            latest.clear();
-            let mut upsert = |snap: feeds::clob_ws::BookSnapshot| {
-                match latest.iter_mut().find(|s| s.asset_id == snap.asset_id) {
-                    Some(slot) => *slot = snap,
-                    None => latest.push(snap),
+        let mut interval = tokio::time::interval(Duration::from_millis(MARKET_DATA_FLUSH_MS));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            let batch = market_data.drain();
+            for snap in batch.books {
+                if tx.send(AppEvent::Book(snap)).await.is_err() {
+                    return;
                 }
-            };
-            upsert(b);
-            while let Ok(more) = brx.try_recv() {
-                upsert(more);
             }
-            for snap in latest.drain(..) {
-                let _ = tx.try_send(AppEvent::Book(snap));
+            if !batch.trades.is_empty()
+                && tx
+                    .send(AppEvent::ClobPublicTrades(batch.trades))
+                    .await
+                    .is_err()
+            {
+                return;
             }
         }
     });
-    btx
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_drain_budget_stops_at_count_limit() {
+        let budget = EventDrainBudget::new(2, Duration::from_secs(60));
+        let started = Instant::now();
+
+        assert!(budget.can_continue(0, started));
+        assert!(budget.can_continue(1, started));
+        assert!(!budget.can_continue(2, started));
+    }
+
+    #[test]
+    fn event_drain_budget_stops_after_time_budget() {
+        let budget = EventDrainBudget::new(100, Duration::from_millis(5));
+        let started = Instant::now() - Duration::from_millis(10);
+
+        assert!(!budget.can_continue(1, started));
+    }
+
+    #[test]
+    fn rate_limit_backoff_grows_and_resets() {
+        let mut backoff = RateLimitBackoff::new(Duration::from_secs(5), Duration::from_secs(60));
+
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+        backoff.record_rate_limit();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(10));
+        backoff.record_rate_limit();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(20));
+        backoff.record_success();
+        assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[tokio::test]
+    async fn bounded_join_limits_concurrent_work() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let futs: Vec<_> = (0..8)
+            .map(|_| {
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(now, Ordering::SeqCst);
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    1usize
+                }
+            })
+            .collect();
+
+        let out = bounded_join(futs, 3).await;
+
+        assert_eq!(out.len(), 8);
+        assert!(peak.load(Ordering::SeqCst) <= 3);
+    }
 }
 
 fn spawn_ticker(tx: mpsc::Sender<AppEvent>) {
@@ -1914,11 +2124,11 @@ fn tty_restore_raw_mode() {
     }
 }
 
-fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
+fn spawn_key_reader(key_tx: mpsc::Sender<KeyEvent>, tx: mpsc::Sender<AppEvent>) {
     tokio::spawn(async move {
         let mut stream = EventStream::new();
         loop {
-            if tx.is_closed() {
+            if key_tx.is_closed() && tx.is_closed() {
                 break;
             }
             match stream.next().await {
@@ -1940,7 +2150,7 @@ fn spawn_key_reader(tx: mpsc::Sender<AppEvent>) {
                                 "key reader: x/X KeyEvent (Press) — forwarding to main loop"
                             );
                         }
-                        if tx.send(AppEvent::Key(k)).await.is_err() {
+                        if key_tx.send(k).await.is_err() {
                             break;
                         }
                     }
@@ -2030,7 +2240,9 @@ fn spawn_deposit_wallet_approvals(
             }
             Err(e) => {
                 let _ = tx
-                    .send(AppEvent::OrderErrModal(format!("deposit-wallet approvals: {e:#}")))
+                    .send(AppEvent::OrderErrModal(format!(
+                        "deposit-wallet approvals: {e:#}"
+                    )))
                     .await;
             }
         }
@@ -2103,12 +2315,10 @@ fn dispatch_action(
                 tx.clone(),
                 cfg.clone(),
                 trading.clone(),
-                state.market.as_ref().map(|m| {
-                    (
-                        m.up_token_id.clone(),
-                        m.down_token_id.clone(),
-                    )
-                }),
+                state
+                    .market
+                    .as_ref()
+                    .map(|m| (m.up_token_id.clone(), m.down_token_id.clone())),
             );
         }
         Action::FetchSolanaDeposit => {

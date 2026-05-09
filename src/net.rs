@@ -65,15 +65,13 @@ pub fn proxy_env() -> Option<String> {
 
 /// Shared HTTP/2 + TCP keep-alive + idle pool settings for long-lived HTTPS clients (JSON-RPC, REST).
 ///
-/// * **HTTP/2:** `http2_prior_knowledge` — multiplexed requests per host when the server speaks `h2`.
-///   If TLS fails with “no protocol”, the origin may be HTTP/1-only — drop `http2_prior_knowledge` for that host.
+/// * **HTTP/2:** use default ALPN negotiation so HTTP/1-only origins still work.
 /// * **Pool:** `pool_idle_timeout(None)` keeps idle sockets in the pool.
 /// * **HTTP/2 PING** + **TCP keepalive** reduce stale connections.
 fn reqwest_shared_builder(timeout: std::time::Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .user_agent(concat!("polymarket-crypto/", env!("CARGO_PKG_VERSION")))
         .timeout(timeout)
-        .http2_prior_knowledge()
         .http2_keep_alive_interval(std::time::Duration::from_secs(30))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(10))
         .http2_keep_alive_while_idle(true)

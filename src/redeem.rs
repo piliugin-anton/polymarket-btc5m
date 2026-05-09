@@ -25,6 +25,7 @@ use alloy_signer::Signer;
 use alloy_signer_local::PrivateKeySigner;
 use alloy_sol_types::{sol, SolCall};
 use anyhow::{bail, Context, Result};
+use futures_util::future::join_all;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::json;
@@ -44,8 +45,7 @@ use crate::polymarket_relayer::{
 const RELAYER_HOST: &str = "https://relayer-v2.polymarket.com";
 /// CtfCollateralAdapter (current Polygon deployment — relayer rejects legacy `0x…09718`).
 /// [Contracts / Collateral](https://docs.polymarket.com/resources/contracts)
-const CTF_COLLATERAL_ADAPTER: Address =
-    address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
+const CTF_COLLATERAL_ADAPTER: Address = address!("0xAdA100Db00Ca00073811820692005400218FcE1f");
 /// NegRiskCtfCollateralAdapter (current Polygon deployment).
 const NEG_RISK_CTF_COLLATERAL_ADAPTER: Address =
     address!("0xadA2005600Dec949baf300f4C6120000bDB6eAab");
@@ -322,15 +322,12 @@ async fn polygon_address_has_contract_code(
     if !status.is_success() {
         bail!("Polygon RPC HTTP {status} — {}", txt.trim());
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&txt).with_context(|| format!("decode eth_getCode: {}", txt.trim()))?;
+    let v: serde_json::Value = serde_json::from_str(&txt)
+        .with_context(|| format!("decode eth_getCode: {}", txt.trim()))?;
     if let Some(err) = v.get("error") {
         bail!("eth_getCode error: {err}");
     }
-    let code = v
-        .get("result")
-        .and_then(|r| r.as_str())
-        .unwrap_or("0x");
+    let code = v.get("result").and_then(|r| r.as_str()).unwrap_or("0x");
     Ok(code.len() > 2 && code != "0x")
 }
 
@@ -465,11 +462,7 @@ pub(crate) fn parse_token_id_u256(s: &str) -> Result<U256> {
 fn collect_redeem_ops(positions: &[DataPosition]) -> Result<Vec<(String, Address, Vec<u8>)>> {
     let mut redeemable: Vec<&DataPosition> = positions
         .iter()
-        .filter(|p| {
-            p.redeemable
-                && p.current_value.is_finite()
-                && p.current_value > 0.0
-        })
+        .filter(|p| p.redeemable && p.current_value.is_finite() && p.current_value > 0.0)
         .collect();
     redeemable.sort_by(|a, b| a.condition_id.cmp(&b.condition_id));
     if redeemable.is_empty() {
@@ -660,12 +653,17 @@ async fn redeem_via_deposit_wallet(
     uniq_adapters.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
 
     let mut need_operator_fix: Vec<Address> = Vec::new();
-    for ad in &uniq_adapters {
-        let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, *ad)
+    for result in join_all(uniq_adapters.iter().copied().map(|ad| async move {
+        let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, ad)
             .await
             .with_context(|| format!("Polygon eth_call isApprovedForAll ({ad:#x})"))?;
+        Ok::<_, anyhow::Error>((ad, ok))
+    }))
+    .await
+    {
+        let (ad, ok) = result?;
         if !ok {
-            need_operator_fix.push(*ad);
+            need_operator_fix.push(ad);
         }
     }
 
@@ -674,10 +672,15 @@ async fn redeem_via_deposit_wallet(
             .await
             .context("relayer WALLET batch (CTF collateral adapter allowances)")?;
 
-        for ad in &uniq_adapters {
-            let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, *ad)
+        for result in join_all(uniq_adapters.iter().copied().map(|ad| async move {
+            let ok = ctf_is_approved_for_all(http, rpc_url, deposit_wallet, ad)
                 .await
                 .with_context(|| format!("re-check isApprovedForAll ({ad:#x})"))?;
+            Ok::<_, anyhow::Error>((ad, ok))
+        }))
+        .await
+        {
+            let (ad, ok) = result?;
             if !ok {
                 bail!(
                     "CTF `isApprovedForAll` still false for {ad:#x} after collateral allowance batch — \
@@ -716,8 +719,7 @@ async fn redeem_via_deposit_wallet(
             .map(|(_, adapter, data)| (*adapter, U256::ZERO, data.clone()))
             .collect();
 
-        let typed =
-            deposit_wallet_batch_typed_data(deposit_wallet, &nonce, deadline, &calls)?;
+        let typed = deposit_wallet_batch_typed_data(deposit_wallet, &nonce, deadline, &calls)?;
         let digest = typed
             .eip712_signing_hash()
             .map_err(|e| anyhow::anyhow!("DepositWallet Batch EIP-712 hash: {e}"))?;
@@ -781,11 +783,7 @@ async fn redeem_via_deposit_wallet(
         "{} market(s) in {} relayer WALLET submission(s){} → {} [{}]",
         market_count,
         num_chunks,
-        if num_chunks > 1 {
-            " (batched)"
-        } else {
-            ""
-        },
+        if num_chunks > 1 { " (batched)" } else { "" },
         summaries.join("; "),
         ids
     ))

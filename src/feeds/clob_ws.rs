@@ -34,11 +34,11 @@ use std::collections::HashSet;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
-use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 use tracing::{info, warn};
 
 use crate::config::CLOB_WS_URL;
+use crate::feeds::market_data_coalescer::MarketDataCoalescer;
 use crate::trading::canonical_clob_token_id;
 
 const PRICE_KEY_SCALE: f64 = 1_000_000.0;
@@ -379,12 +379,11 @@ fn watched_contains(watched: &HashSet<String>, asset_id: &str) -> bool {
 
 pub fn spawn(
     token_ids: Vec<String>,
-    book_tx: mpsc::Sender<BookSnapshot>,
-    trade_tx: mpsc::Sender<ClobTradePrint>,
+    market_data: MarketDataCoalescer,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         loop {
-            if let Err(e) = run_once(&token_ids, &book_tx, &trade_tx).await {
+            if let Err(e) = run_once(&token_ids, &market_data).await {
                 warn!(error = %e, "CLOB WS disconnected — reconnecting in 2s");
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
@@ -392,11 +391,7 @@ pub fn spawn(
     })
 }
 
-async fn run_once(
-    token_ids: &[String],
-    book_tx: &mpsc::Sender<BookSnapshot>,
-    trade_tx: &mpsc::Sender<ClobTradePrint>,
-) -> Result<()> {
+async fn run_once(token_ids: &[String], market_data: &MarketDataCoalescer) -> Result<()> {
     let (mut ws, _) = crate::net::ws_connect(CLOB_WS_URL)
         .await
         .context("connect to Polymarket CLOB WS")?;
@@ -504,7 +499,7 @@ async fn run_once(
                         Ok(events) => {
                             for ev in events {
                                 if let Some(p) = extract_trade_print(&watched, &ev) {
-                                    let _ = trade_tx.try_send(p);
+                                    market_data.submit_trade(p);
                                 }
                                 if let Some(i) = apply_book_event(&mut db, ev) {
                                     touched.set(i);
@@ -536,7 +531,7 @@ async fn run_once(
                     match sonic_rs::from_str::<RawEvent>(t) {
                         Ok(ev) => {
                             if let Some(p) = extract_trade_print(&watched, &ev) {
-                                let _ = trade_tx.try_send(p);
+                                market_data.submit_trade(p);
                             }
                             if let Some(i) = apply_book_event(&mut db, ev) {
                                 touched.set(i);
@@ -558,9 +553,8 @@ async fn run_once(
                             &book.asks,
                             &mut out_bids,
                             &mut out_asks,
-                            book_tx,
-                        )
-                        .await;
+                            market_data,
+                        );
                     }
                 }
             }
@@ -629,13 +623,13 @@ fn apply_book_event(db: &mut BookDb, ev: RawEvent) -> Option<usize> {
 
 // ── Snapshot emission ─────────────────────────────────────────────────────────
 
-async fn emit_snapshot(
+fn emit_snapshot(
     asset_id: &str,
     bids: &BookSide,
     asks: &BookSide,
     out_bids: &mut Vec<BookLevel>,
     out_asks: &mut Vec<BookLevel>,
-    book_tx: &mpsc::Sender<BookSnapshot>,
+    market_data: &MarketDataCoalescer,
 ) {
     out_bids.clear();
     out_asks.clear();
@@ -654,13 +648,11 @@ async fn emit_snapshot(
     // next extend() call doesn't need to allocate.
     let snap_bids = std::mem::replace(out_bids, Vec::with_capacity(bids.levels.len()));
     let snap_asks = std::mem::replace(out_asks, Vec::with_capacity(asks.levels.len()));
-    let _ = book_tx
-        .send(BookSnapshot {
-            asset_id: asset_id.to_owned(),
-            bids: snap_bids,
-            asks: snap_asks,
-        })
-        .await;
+    market_data.submit_book(BookSnapshot {
+        asset_id: asset_id.to_owned(),
+        bids: snap_bids,
+        asks: snap_asks,
+    });
 }
 
 // ── Logging helpers ───────────────────────────────────────────────────────────

@@ -86,8 +86,8 @@ pub enum AppEvent {
     Tick, // 1-Hz clock
     Price(PriceTick),
     Book(BookSnapshot),
-    /// Public CLOB market WS `last_trade_price` — one event per match (not coalesced).
-    ClobPublicTrade(crate::feeds::clob_ws::ClobTradePrint),
+    /// Coalesced public CLOB market WS `last_trade_price` prints.
+    ClobPublicTrades(Vec<crate::feeds::clob_ws::ClobTradePrint>),
     /// Seed rolling activity from Data API `GET /trades` after a market roll.
     ActivityTradesSeed(Vec<crate::feeds::clob_ws::ClobTradePrint>),
     /// New active market + buy-side trail settings (from env at roll; used for maker WSS fills).
@@ -480,7 +480,7 @@ pub struct AppState {
 
     pub default_size_usdc: f64,
     pub default_price: f64,
-    pub size_input: String, // buffer while editing size
+    pub size_input: String,  // buffer while editing size
     pub price_input: String, // buffer while editing default price
     pub limit_price_input: String,
     pub limit_size_input: String,
@@ -524,6 +524,7 @@ pub struct AppState {
     /// Cached result of `collect_book_watch_token_ids` — updated on every `apply()` call so
     /// `send_book_watch_if_changed` in `main.rs` can read it without recomputing.
     pub cached_book_watch_tokens: Vec<String>,
+    book_watch_tokens_dirty: bool,
     /// Last [`AppEvent::MarketRoll`] — arms trailing on **maker** user-channel BUY fills (resting limits).
     pub buy_trail_bps: u32,
     pub buy_trail_activation_bps: u32,
@@ -584,6 +585,7 @@ impl AppState {
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
             cached_book_watch_tokens: Vec::new(),
+            book_watch_tokens_dirty: false,
             buy_trail_bps: 0,
             buy_trail_activation_bps: 0,
             pending_ws_take_profit: None,
@@ -646,6 +648,7 @@ impl AppState {
                 });
             }
         }
+        self.book_watch_tokens_dirty = true;
         self.status_line = format!(
             "trailing: {} pending — arm when bid ≥ entry×(1+{activation_bps} bps) (from position)",
             outcome.as_str()
@@ -994,6 +997,7 @@ impl AppState {
         self.watched_books.retain(|k, _| k != tid);
         self.pending_trailing_sells.retain(|e| e.token_id != tid);
         self.trailing_sell_in_flight.retain(|k| k != tid);
+        self.book_watch_tokens_dirty = true;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1043,6 +1047,7 @@ impl AppState {
                 tracked_shares,
             },
         );
+        self.book_watch_tokens_dirty = true;
         self.status_line = format!(
             "trailing {out} — {trail_bps} bps trail on bid, SELL up to {plan_sell_shares:.2} sh",
             out = outcome.as_str()
@@ -1173,6 +1178,7 @@ impl AppState {
                     outcome,
                     sell_shares: sh,
                 });
+                self.book_watch_tokens_dirty = true;
             }
             self.status_line = format!(
                 "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — SELL {sh:.2} sh",
@@ -1242,6 +1248,13 @@ impl AppState {
         false
     }
 
+    fn record_public_trade_activity(&mut self, p: crate::feeds::clob_ws::ClobTradePrint) {
+        if self.token_watched_for_activity(p.asset_id.as_str()) {
+            let n = p.price * p.size;
+            self.traded_activity.record_trade(p.ts_ms, n);
+        }
+    }
+
     // ── Mutations ───────────────────────────────────────────────────
     pub async fn apply(&mut self, ev: AppEvent) {
         match ev {
@@ -1283,7 +1296,8 @@ impl AppState {
                 if let Some(m) = &self.market {
                     if clob_asset_ids_match(snap.asset_id.as_str(), m.up_token_id.as_str()) {
                         self.book_up = Some(Arc::clone(&snap));
-                    } else if clob_asset_ids_match(snap.asset_id.as_str(), m.down_token_id.as_str()) {
+                    } else if clob_asset_ids_match(snap.asset_id.as_str(), m.down_token_id.as_str())
+                    {
                         self.book_down = Some(Arc::clone(&snap));
                     }
                 }
@@ -1305,12 +1319,11 @@ impl AppState {
                 }
                 self.recompute_sentiment();
             }
-            AppEvent::ClobPublicTrade(p) => {
-                if self.token_watched_for_activity(p.asset_id.as_str()) {
-                    let n = p.price * p.size;
-                    self.traded_activity.record_trade(p.ts_ms, n);
-                    self.refresh_market_activity_cache();
+            AppEvent::ClobPublicTrades(prints) => {
+                for p in prints {
+                    self.record_public_trade_activity(p);
                 }
+                self.refresh_market_activity_cache();
             }
             AppEvent::ActivityTradesSeed(prints) => {
                 for p in prints {
@@ -1330,7 +1343,8 @@ impl AppState {
                 // Fold open mark-to-market PnL into `realized_pnl` before we drop books /
                 // positions. Otherwise `total_pnl` (rPnL + uPnL) would collapse to rPnL alone
                 // across the roll even though economics were unchanged at the last mark.
-                let roll_upnl = self.unrealized_pnl(Outcome::Up) + self.unrealized_pnl(Outcome::Down);
+                let roll_upnl =
+                    self.unrealized_pnl(Outcome::Up) + self.unrealized_pnl(Outcome::Down);
                 if roll_upnl.is_finite() {
                     self.realized_pnl += roll_upnl;
                 }
@@ -1362,6 +1376,7 @@ impl AppState {
                 self.cached_countdown_secs = None;
                 self.traded_activity.clear();
                 self.refresh_market_activity_cache();
+                self.book_watch_tokens_dirty = true;
             }
             AppEvent::PriceToBeatRefresh {
                 slug,
@@ -1441,6 +1456,7 @@ impl AppState {
                     self.rehydrate_trailing_from_positions_after_rest();
                     self.try_promote_pending_trail_any(m.up_token_id.as_str());
                 }
+                self.book_watch_tokens_dirty = true;
             }
             AppEvent::OpenOrdersLoaded { orders } => {
                 self.open_orders = orders;
@@ -1738,6 +1754,7 @@ impl AppState {
                 self.buy_trail_bps = 0;
                 self.buy_trail_activation_bps = 0;
                 self.pending_ws_take_profit = None;
+                self.book_watch_tokens_dirty = true;
             }
             AppEvent::RunTakeProfitAfterBuy { .. } => {
                 // Dispatched from `main::apply_app_event` (needs `TradingClient`); no UI state change here.
@@ -1755,6 +1772,7 @@ impl AppState {
                 self.trailing_sell_in_flight.retain(|k| *k != token_id);
                 self.pending_trailing_sells
                     .retain(|p| p.token_id != token_id);
+                self.book_watch_tokens_dirty = true;
                 let tid = token_id.clone();
                 if !success {
                     let had_sess = trailing_map_key_for_asset(&self.trailing, tid.as_str())
@@ -1823,12 +1841,14 @@ impl AppState {
             }
             AppEvent::Key(_) => {} // handled in main via `events::handle_key`
         }
-        self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
-        // Prune watched_books once per apply() after the watch list is authoritative,
-        // not on every book tick inside the Book handler.
-        let tokens = &self.cached_book_watch_tokens;
-        self.watched_books
-            .retain(|k, _| tokens.binary_search(k).is_ok());
+        if self.book_watch_tokens_dirty {
+            self.cached_book_watch_tokens = collect_book_watch_token_ids(self);
+            // Prune watched_books only after the watch list changes.
+            let tokens = &self.cached_book_watch_tokens;
+            self.watched_books
+                .retain(|k, _| tokens.binary_search(k).is_ok());
+            self.book_watch_tokens_dirty = false;
+        }
     }
 }
 
@@ -2617,7 +2637,7 @@ pub fn resolve_trailing_sell(
 mod tests {
     use super::*;
 
-    use crate::feeds::clob_ws::{BookLevel, BookSnapshot};
+    use crate::feeds::clob_ws::{BookLevel, BookSnapshot, ClobTradePrint};
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
@@ -2645,6 +2665,15 @@ mod tests {
         }
     }
 
+    fn public_print(asset_id: &str, price: f64, size: f64, ts_ms: i64) -> ClobTradePrint {
+        ClobTradePrint {
+            asset_id: asset_id.to_string(),
+            price,
+            size,
+            ts_ms,
+        }
+    }
+
     fn trade(
         id: &str,
         asset_id: &str,
@@ -2654,6 +2683,41 @@ mod tests {
         match_time: &str,
     ) -> ClobTrade {
         trade_with_status(id, asset_id, side, size, price, match_time, Some("MINED"))
+    }
+
+    #[tokio::test]
+    async fn public_trade_batches_update_activity_once_per_event() {
+        let mut s = test_state();
+        let m = test_market("111", "222", "cond");
+        s.apply(AppEvent::MarketRoll {
+            market: m,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+
+        s.apply(AppEvent::ClobPublicTrades(vec![
+            public_print("111", 0.50, 10.0, Utc::now().timestamp_millis()),
+            public_print("222", 0.25, 20.0, Utc::now().timestamp_millis()),
+            public_print("333", 0.99, 50.0, Utc::now().timestamp_millis()),
+        ]))
+        .await;
+
+        assert_eq!(s.cached_market_activity_notional, 10.0);
+    }
+
+    #[tokio::test]
+    async fn price_event_does_not_rebuild_book_watch_tokens() {
+        let mut s = test_state();
+        s.cached_book_watch_tokens = vec!["sentinel".into()];
+
+        s.apply(AppEvent::Price(PriceTick {
+            price: 100.0,
+            timestamp_ms: Utc::now().timestamp_millis() as u64,
+        }))
+        .await;
+
+        assert_eq!(s.cached_book_watch_tokens, vec!["sentinel".to_string()]);
     }
 
     fn trade_with_status(
@@ -3803,12 +3867,18 @@ mod tests {
             !trailing_exit_sell_meets_min_gross_profit_bps(threshold - 1e-6, entry, bps),
             "just below 1% gross should fail"
         );
-        assert!(trailing_exit_sell_meets_min_gross_profit_bps(threshold, entry, bps));
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(
+            threshold, entry, bps
+        ));
     }
 
     #[test]
     fn trailing_exit_min_profit_bps_skips_when_prices_invalid() {
-        assert!(trailing_exit_sell_meets_min_gross_profit_bps(f64::NAN, 0.5, 50));
+        assert!(trailing_exit_sell_meets_min_gross_profit_bps(
+            f64::NAN,
+            0.5,
+            50
+        ));
         assert!(trailing_exit_sell_meets_min_gross_profit_bps(0.6, 0.0, 50));
     }
 }

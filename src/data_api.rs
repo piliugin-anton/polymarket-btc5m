@@ -11,11 +11,27 @@ use std::collections::{HashMap, HashSet};
 
 use alloy_primitives::Address;
 use anyhow::{Context, Result};
+use serde::de::DeserializeOwned;
 use serde::Deserialize;
 
 use crate::trading::clob_asset_ids_match;
 
 pub const DATA_API_HOST: &str = "https://data-api.polymarket.com";
+
+fn body_snippet(body: &[u8]) -> String {
+    let text = String::from_utf8_lossy(body);
+    let trimmed = text.trim();
+    let max_chars = 500;
+    if trimmed.chars().count() <= max_chars {
+        trimmed.to_string()
+    } else {
+        format!("{}...", trimmed.chars().take(max_chars).collect::<String>())
+    }
+}
+
+fn decode_json_slice<T: DeserializeOwned>(body: &[u8], label: &str) -> Result<T> {
+    serde_json::from_slice(body).with_context(|| format!("decode {label}: {}", body_snippet(body)))
+}
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct DataPosition {
@@ -75,16 +91,15 @@ pub async fn fetch_redeemable_positions(
             .await
             .with_context(|| format!("GET {url}"))?;
         let status = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
+        let body = resp.bytes().await.unwrap_or_default();
         if !status.is_success() {
             anyhow::bail!(
                 "data-api GET /positions failed: {} — {}",
                 status,
-                txt.trim()
+                body_snippet(&body)
             );
         }
-        let batch: Vec<DataPosition> = serde_json::from_str(&txt)
-            .with_context(|| format!("decode /positions: {}", txt.trim()))?;
+        let batch: Vec<DataPosition> = decode_json_slice(&body, "/positions")?;
         let n = batch.len();
         out.extend(batch);
         if n < POSITIONS_PAGE as usize {
@@ -123,16 +138,15 @@ pub async fn fetch_positions_for_market(
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let body = resp.bytes().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
             "data-api GET /positions (market) failed: {} — {}",
             status,
-            txt.trim()
+            body_snippet(&body)
         );
     }
-    let batch: Vec<DataPosition> = serde_json::from_str(&txt)
-        .with_context(|| format!("decode /positions (market): {}", txt.trim()))?;
+    let batch: Vec<DataPosition> = decode_json_slice(&body, "/positions (market)")?;
     Ok(batch)
 }
 
@@ -166,16 +180,15 @@ pub async fn fetch_public_trades_for_market(
         .await
         .with_context(|| format!("GET {}", u.as_str()))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let body = resp.bytes().await.unwrap_or_default();
     if !status.is_success() {
         anyhow::bail!(
             "data-api GET /trades failed: {} — {}",
             status,
-            txt.trim()
+            body_snippet(&body)
         );
     }
-    let batch: Vec<DataApiPublicTrade> = serde_json::from_str(&txt)
-        .with_context(|| format!("decode /trades: {}", txt.trim()))?;
+    let batch: Vec<DataApiPublicTrade> = decode_json_slice(&body, "/trades")?;
     Ok(batch)
 }
 
@@ -204,6 +217,19 @@ pub fn positions_size_avg_for_tokens(
         }
     }
     (up, down)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_decode_error_includes_trimmed_body_snippet() {
+        let err = decode_json_slice::<Vec<DataPosition>>(b"  not-json-body  ", "/positions")
+            .expect_err("invalid JSON should fail");
+
+        assert!(err.to_string().contains("decode /positions: not-json-body"));
+    }
 }
 
 // ── Top holders (`GET /holders`) — sentiment proxy (sums are capped at API `limit` per outcome) ──
@@ -246,12 +272,15 @@ pub async fn fetch_top_holders_amount_sums(
         .await
         .with_context(|| format!("GET {url}"))?;
     let status = resp.status();
-    let txt = resp.text().await.unwrap_or_default();
+    let body = resp.bytes().await.unwrap_or_default();
     if !status.is_success() {
-        anyhow::bail!("data-api GET /holders failed: {} — {}", status, txt.trim());
+        anyhow::bail!(
+            "data-api GET /holders failed: {} — {}",
+            status,
+            body_snippet(&body)
+        );
     }
-    let meta: Vec<MetaHolder> =
-        serde_json::from_str(&txt).with_context(|| format!("decode /holders: {}", txt.trim()))?;
+    let meta: Vec<MetaHolder> = decode_json_slice(&body, "/holders")?;
 
     let mut by_wallet_up: HashMap<String, f64> = HashMap::new();
     let mut by_wallet_down: HashMap<String, f64> = HashMap::new();

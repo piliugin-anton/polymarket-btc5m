@@ -25,6 +25,7 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, Utc};
+use futures_util::future::join_all;
 use reqwest::StatusCode;
 use serde::Deserialize;
 use tracing::debug;
@@ -194,37 +195,21 @@ impl GammaClient {
         let now_ts = now.timestamp();
         let base = (now_ts / step) * step;
 
+        let slugs: Vec<String> = [0, step, -step, 2 * step, -2 * step]
+            .into_iter()
+            .filter_map(|off| profile.rolling_slug_for_window_start(base + off))
+            .collect();
         let mut candidates: Vec<RawMarket> = Vec::new();
-        for off in [0, step, -step, 2 * step, -2 * step] {
-            let ts = base + off;
-            let Some(slug) = profile.rolling_slug_for_window_start(ts) else {
-                continue;
-            };
-            let url = format!("{GAMMA_HOST}/markets/slug/{slug}");
-            debug!(%url, "gamma: fetch market by slug");
-
-            let resp = self
-                .http
-                .get(&url)
-                .send()
-                .await
-                .with_context(|| format!("gamma GET {url} failed"))?;
-
-            if resp.status() == StatusCode::NOT_FOUND {
-                continue;
+        for result in join_all(
+            slugs
+                .iter()
+                .map(|slug| self.fetch_open_raw_market_by_slug(slug)),
+        )
+        .await
+        {
+            if let Some(m) = result? {
+                candidates.push(m);
             }
-
-            let m: RawMarket = resp
-                .error_for_status()
-                .with_context(|| format!("gamma GET {url} bad status"))?
-                .json()
-                .await
-                .with_context(|| format!("gamma GET {url} decode failed"))?;
-
-            if m.closed {
-                continue;
-            }
-            candidates.push(m);
         }
 
         let pfx = format!(

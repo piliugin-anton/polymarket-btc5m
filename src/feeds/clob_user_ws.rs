@@ -29,9 +29,7 @@ use crate::app::{open_orders_from_clob, AppEvent, OpenOrderRow, Outcome};
 use crate::config::CLOB_WS_USER_URL;
 use crate::feeds::user_trade_sync::UserTradeSync;
 use crate::net;
-use crate::take_profit::{
-    clob_order_has_open_size, outcomes_with_duplicate_resting_sells,
-};
+use crate::take_profit::{clob_order_has_open_size, outcomes_with_duplicate_resting_sells};
 use crate::trading::{
     canonical_clob_token_id, clob_asset_ids_match, norm_order_id_key, parse_clob_side_str,
     parse_user_channel_values, try_parse_user_channel_trade, ClobOpenOrder, FillWaitRegistry, Side,
@@ -66,6 +64,13 @@ struct LedgerInner {
     up: String,
     down: String,
     by_id: HashMap<String, ClobOpenOrder>,
+}
+
+struct LedgerFrameApply {
+    order_sides_snapshot: HashMap<String, Side>,
+    known_order_keys: HashSet<String>,
+    orders_update: Option<Vec<OpenOrderRow>>,
+    raw_orders_after: Vec<ClobOpenOrder>,
 }
 
 impl UserOpenOrdersLedger {
@@ -132,28 +137,6 @@ impl UserOpenOrdersLedger {
         g.by_id.values().cloned().collect()
     }
 
-    /// Normalized CLOB order ids currently in the ledger (keys of [`LedgerInner::by_id`]).
-    /// Used to match user-channel `trade` payloads to **our** `maker_orders` leg, not another maker.
-    pub async fn normalized_order_keys(&self) -> HashSet<String> {
-        let g = self.inner.lock().await;
-        g.by_id.keys().cloned().collect()
-    }
-
-    /// `norm_order_id_key(order.id)` → side from the last known open-order row (WS + REST).
-    ///
-    /// Snapshot this **before** [`Self::apply_order_values`] in the same WS batch as a `trade`:
-    /// a full fill removes the order from the ledger, but we still need the placed side for fills
-    /// when `maker_orders[].side` is missing or disagrees with what you submitted (see
-    /// [Polymarket user-channel `trade`](https://docs.polymarket.com/market-data/websocket/user-channel)
-    /// — official examples omit `side` on maker legs).
-    pub async fn snapshot_order_side_by_norm_id(&self) -> HashMap<String, Side> {
-        let g = self.inner.lock().await;
-        g.by_id
-            .iter()
-            .filter_map(|(k, o)| parse_clob_side_str(&o.side).map(|s| (k.clone(), s)))
-            .collect()
-    }
-
     /// Same source as [`Self::snapshot_clob_orders`], formatted for the Open Orders panel.
     pub async fn open_orders_ui_snapshot(&self) -> Option<Vec<OpenOrderRow>> {
         let g = self.inner.lock().await;
@@ -179,90 +162,109 @@ impl UserOpenOrdersLedger {
     }
 
     /// Apply CLOB `order` events; returns new UI rows if anything changed.
+    #[cfg(test)]
     async fn apply_order_values(&self, values: &[Value]) -> Option<Vec<OpenOrderRow>> {
+        self.apply_frame_order_values(values).await.orders_update
+    }
+
+    async fn apply_frame_order_values(&self, values: &[Value]) -> LedgerFrameApply {
+        let mut g = self.inner.lock().await;
+        let order_sides_snapshot = g
+            .by_id
+            .iter()
+            .filter_map(|(k, o)| parse_clob_side_str(&o.side).map(|s| (k.clone(), s)))
+            .collect();
+
         let mut changed = false;
         for v in values {
             if !is_order_event(v) {
                 continue;
             }
-            if self.apply_one_order_value(v).await {
+            if apply_one_order_value_locked(&mut g, v) {
                 changed = true;
             }
         }
-        if !changed {
-            return None;
-        }
-        let g = self.inner.lock().await;
-        if g.market.is_empty() || (g.up.is_empty() && g.down.is_empty()) {
-            return None;
-        }
-        Some(open_orders_from_clob(
-            g.by_id.values().cloned().collect(),
-            g.up.as_str(),
-            g.down.as_str(),
-        ))
-    }
 
-    async fn apply_one_order_value(&self, v: &Value) -> bool {
-        let mut g = self.inner.lock().await;
-        let mkt = v
-            .get("market")
-            .and_then(|x| x.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty());
-        if let Some(ev) = mkt {
-            if !markets_eq(ev, g.market.as_str()) {
+        let known_order_keys = g.by_id.keys().cloned().collect();
+        let raw_orders_after: Vec<ClobOpenOrder> = g.by_id.values().cloned().collect();
+        let orders_update =
+            if changed && !g.market.is_empty() && (!g.up.is_empty() || !g.down.is_empty()) {
+                Some(open_orders_from_clob(
+                    raw_orders_after.clone(),
+                    g.up.as_str(),
+                    g.down.as_str(),
+                ))
+            } else {
+                None
+            };
+
+        LedgerFrameApply {
+            order_sides_snapshot,
+            known_order_keys,
+            orders_update,
+            raw_orders_after,
+        }
+    }
+}
+
+fn apply_one_order_value_locked(g: &mut LedgerInner, v: &Value) -> bool {
+    let mkt = v
+        .get("market")
+        .and_then(|x| x.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(ev) = mkt {
+        if !markets_eq(ev, g.market.as_str()) {
+            return false;
+        }
+    } else if let Some(a) = jstr2(v, "asset_id", "assetId") {
+        if !g.up.is_empty() {
+            let t = canonical_clob_token_id(a);
+            if t != g.up
+                && t != g.down
+                && !clob_asset_ids_match(a, g.up.as_str())
+                && !clob_asset_ids_match(a, g.down.as_str())
+            {
                 return false;
             }
-        } else if let Some(a) = jstr2(v, "asset_id", "assetId") {
-            if !g.up.is_empty() {
-                let t = canonical_clob_token_id(a);
-                if t != g.up
-                    && t != g.down
-                    && !clob_asset_ids_match(a, g.up.as_str())
-                    && !clob_asset_ids_match(a, g.down.as_str())
-                {
-                    return false;
-                }
-            }
         }
-        let raw_id = v
-            .get("id")
-            .and_then(|x| x.as_str())
-            .or_else(|| v.get("order_id").and_then(|x| x.as_str()));
-        let key = match raw_id {
-            Some(s) => {
-                let k = norm_order_id_key(s);
-                if k.is_empty() {
-                    return false;
-                }
-                k
-            }
-            None => return false,
-        };
-        let kind = v
-            .get("type")
-            .and_then(|x| x.as_str())
-            .map(|s| s.trim().to_ascii_uppercase());
-        if matches!(
-            kind.as_deref(),
-            Some("CANCELLATION" | "CANCELED" | "CANCELLED" | "EXPIRED")
-        ) {
-            return g.by_id.remove(&key).is_some();
-        }
-        if let Some(row) = clob_order_from_user_ws_order_value(v) {
-            let k2 = norm_order_id_key(&row.id);
-            if k2.is_empty() {
+    }
+    let raw_id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("order_id").and_then(|x| x.as_str()));
+    let key = match raw_id {
+        Some(s) => {
+            let k = norm_order_id_key(s);
+            if k.is_empty() {
                 return false;
             }
-            if !clob_order_has_open_size(&row) {
-                return g.by_id.remove(&k2).is_some();
-            }
-            g.by_id.insert(k2, row);
-            true
-        } else {
-            false
+            k
         }
+        None => return false,
+    };
+    let kind = v
+        .get("type")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_ascii_uppercase());
+    if matches!(
+        kind.as_deref(),
+        Some("CANCELLATION" | "CANCELED" | "CANCELLED" | "EXPIRED")
+    ) {
+        return g.by_id.remove(&key).is_some();
+    }
+    if let Some(row) = clob_order_from_user_ws_order_value(v) {
+        let k2 = norm_order_id_key(&row.id);
+        if k2.is_empty() {
+            return false;
+        }
+        if !clob_order_has_open_size(&row) {
+            return g.by_id.remove(&k2).is_some();
+        }
+        g.by_id.insert(k2, row);
+        true
+    } else {
+        false
     }
 }
 
@@ -547,18 +549,16 @@ async fn run_session(
                 // Side for fills: snapshot **before** `order` updates — a full fill removes the resting
                 // row, and `maker_orders[].side` is often absent or can disagree with the placed order
                 // ([user channel](https://docs.polymarket.com/market-data/websocket/user-channel)).
-                let order_sides_snapshot = open_ledger.snapshot_order_side_by_norm_id().await;
-                let orders_update = open_ledger.apply_order_values(&values).await;
-                let known_order_keys = open_ledger.normalized_order_keys().await;
+                let ledger_frame = open_ledger.apply_frame_order_values(&values).await;
                 registry.dispatch_trades_in_values(&values).await;
                 let bundle = market_watch.borrow().clone();
                 if bundle_has_markets(&bundle) {
                     for v in &values {
                         if let Some(f) = try_parse_user_channel_trade(
                             v,
-                            &known_order_keys,
+                            &ledger_frame.known_order_keys,
                             Some(creds.api_key.as_str()),
-                            &order_sides_snapshot,
+                            &ledger_frame.order_sides_snapshot,
                         ) {
                             let Some(outcome) = resolve_trade_outcome(&bundle, &f.asset_id) else {
                                 continue;
@@ -591,15 +591,14 @@ async fn run_session(
                         }
                     }
                 }
-                if let Some(orders) = orders_update {
+                if let Some(orders) = ledger_frame.orders_update {
                     let _ = app_tx.send(AppEvent::OpenOrdersLoaded { orders }).await;
                     // Fixed take-profit: if the ledger now shows multiple resting SELL on one outcome,
                     // ask main to merge them into a single GTD (sum of remaining sizes).
                     let active = &bundle.active;
                     if !active.condition_id.is_empty() {
-                        let raw = open_ledger.snapshot_clob_orders().await;
                         for outcome in outcomes_with_duplicate_resting_sells(
-                            &raw,
+                            &ledger_frame.raw_orders_after,
                             active.up_token_id.as_str(),
                             active.down_token_id.as_str(),
                         ) {
