@@ -691,7 +691,8 @@ impl AppState {
         }
     }
 
-    /// True if `token_id` already has a queued trailing exit or an in-flight FAK SELL.
+    /// True if `token_id` already has a queued trailing exit, in-flight FAK SELL, or active
+    /// resting SELL row that has already locked the position for sale.
     fn trailing_sell_queued_or_in_flight(&self, token_id: &str) -> bool {
         debug_assert_eq!(
             token_id,
@@ -702,6 +703,13 @@ impl AppState {
             .iter()
             .any(|e| e.token_id == token_id)
             || self.trailing_sell_in_flight.contains(token_id)
+            || self
+                .outcome_for_active_token(token_id)
+                .is_some_and(|outcome| {
+                    self.open_orders
+                        .iter()
+                        .any(|o| o.side == Side::Sell && o.outcome == outcome && o.remaining > 1e-9)
+                })
     }
 
     // ── Queries ─────────────────────────────────────────────────────
@@ -1951,7 +1959,9 @@ impl AppState {
                     }
                 } else if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
                     let remove = match self.trailing.get(&k) {
-                        Some(sess) => self.trail_live_shares(sess) <= 1e-9,
+                        Some(sess) => {
+                            sess.stop.is_triggered() || self.trail_live_shares(sess) <= 1e-9
+                        }
                         None => true,
                     };
                     if remove {
@@ -3955,6 +3965,150 @@ mod tests {
         assert!(
             s.trailing.contains_key("UP_PART_SELL"),
             "dispatch success must not clear a re-armed residual trail"
+        );
+    }
+
+    /// If CLOB already shows a resting/open SELL for the outcome, those shares are already locked
+    /// for sale; trailing must not submit another FAK SELL on the same position.
+    #[tokio::test]
+    async fn trailing_does_not_enqueue_when_open_sell_already_exists() {
+        let mut s = test_state();
+        let m = test_market("UP_OPEN_SELL", "DOWN_OPEN_SELL", "0xopensell");
+        s.market = Some(m.clone());
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_OPEN_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_OPEN_SELL".into(),
+            trail_bps: 500,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_OPEN_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }))
+        .await;
+        s.open_orders.push(OpenOrderRow {
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            price: 0.66,
+            remaining: 10.0,
+        });
+
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_OPEN_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+
+        assert!(
+            s.pending_trailing_sells.is_empty(),
+            "open SELL should block duplicate trailing FAK; pending={:?}",
+            s.pending_trailing_sells
+        );
+    }
+
+    /// A trailing sell accepted by CLOB as live/open may not have fill amounts yet. Once dispatch
+    /// reports that handoff as successful, the already-triggered trail must be removed so later
+    /// book ticks do not try to sell the same locked position again.
+    #[tokio::test]
+    async fn trailing_dispatch_success_clears_triggered_session_without_fill_ack() {
+        let mut s = test_state();
+        let m = test_market("UP_LIVE_SELL", "DOWN_LIVE_SELL", "0xlivesell");
+        s.market = Some(m.clone());
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_LIVE_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_LIVE_SELL".into(),
+            trail_bps: 500,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_LIVE_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_LIVE_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+        assert!(s.trailing["UP_LIVE_SELL"].stop.is_triggered());
+        s.trailing_sell_in_flight.insert("UP_LIVE_SELL".into());
+
+        s.apply(AppEvent::TrailingExitDispatchDone {
+            token_id: "UP_LIVE_SELL".into(),
+            success: true,
+            error: None,
+        })
+        .await;
+
+        assert!(
+            !s.trailing.contains_key("UP_LIVE_SELL"),
+            "accepted open/live trailing sell should retire the triggered trail"
         );
     }
 

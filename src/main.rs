@@ -610,6 +610,28 @@ async fn run_trailing_exit_fak_sell(
                         .await;
                     return;
                 } else {
+                    if trailing_exit_response_is_resting_without_fill_ack(&resp, shares, price) {
+                        info!(
+                            outcome = ?outcome,
+                            status = ?resp.status,
+                            order_id = ?resp.order_id,
+                            "trailing exit: SELL accepted without immediate fill ack; not retrying"
+                        );
+                        let _ = tx
+                            .send(AppEvent::StatusInfo(format!(
+                                "trailing {} SELL accepted — awaiting fill/open-order update",
+                                outcome.as_str()
+                            )))
+                            .await;
+                        let _ = tx
+                            .send(AppEvent::TrailingExitDispatchDone {
+                                token_id: token_id.clone(),
+                                success: true,
+                                error: None,
+                            })
+                            .await;
+                        return;
+                    }
                     if attempt < TRAILING_EXIT_FAK_ATTEMPTS {
                         debug!(
                             %attempt_label,
@@ -645,6 +667,22 @@ async fn run_trailing_exit_fak_sell(
             }
         }
     }
+}
+
+fn trailing_exit_response_is_resting_without_fill_ack(
+    resp: &trading::PostOrderResponse,
+    shares: f64,
+    price: f64,
+) -> bool {
+    if resp
+        .fak_fill_for_position_ack(Side::Sell, shares, price)
+        .is_some()
+    {
+        return false;
+    }
+    resp.status
+        .as_deref()
+        .is_some_and(|s| s.eq_ignore_ascii_case("live") || s.eq_ignore_ascii_case("open"))
 }
 
 /// POST a GTD limit order, retrying up to [`LIMIT_ORDER_MAX_ATTEMPTS`] times on network errors
@@ -2074,6 +2112,34 @@ mod tests {
         assert_eq!(backoff.next_delay(), Duration::from_secs(20));
         backoff.record_success();
         assert_eq!(backoff.next_delay(), Duration::from_secs(5));
+    }
+
+    #[test]
+    fn trailing_exit_detects_accepted_open_order_without_fill_ack() {
+        let response = |status: &str| trading::PostOrderResponse {
+            success: true,
+            order_id: Some("0xorder".into()),
+            status: Some(status.into()),
+            making_amount: None,
+            taking_amount: None,
+            error: None,
+        };
+
+        assert!(trailing_exit_response_is_resting_without_fill_ack(
+            &response("live"),
+            10.0,
+            0.50
+        ));
+        assert!(trailing_exit_response_is_resting_without_fill_ack(
+            &response("open"),
+            10.0,
+            0.50
+        ));
+        assert!(!trailing_exit_response_is_resting_without_fill_ack(
+            &response("matched"),
+            10.0,
+            0.50
+        ));
     }
 
     #[tokio::test]
