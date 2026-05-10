@@ -83,10 +83,15 @@ pub struct Config {
     /// **gross** basis points above cost basis (`avg_entry` or trail install entry) before `place_order`.
     /// `0` = no gate (legacy). If unset entry cannot be resolved, the sell is not blocked.
     pub trailing_exit_min_profit_bps: u32,
-    /// When true, STRONG strategy signals can submit automatic market FAK BUY orders.
+    /// When true, STRONG strategy signals can submit automatic **GTD limit BUY** orders at the
+    /// snapshot best ask (same sizing as manual limit buys).
     pub autotrading: bool,
     /// Maximum currently open auto-trading positions. Closed auto inventory frees capacity.
     pub autotrading_max_positions: usize,
+    /// When set, autotrading GTD BUY `expiration` is `now + this many seconds` (plus Polymarket’s
+    /// +60s signing offset — see [`crate::gamma::clob_gtd_expiration_secs_after_duration_from_now`]).
+    /// When unset, expiration matches manual limits: end of the current market window.
+    pub autotrading_order_expires_after_secs: Option<u64>,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -178,6 +183,11 @@ impl Config {
         let autotrading_max_positions = parse_autotrading_max_positions(
             std::env::var("AUTOTRADING_MAX_POSITIONS").ok().as_deref(),
         );
+        let autotrading_order_expires_after_secs = parse_autotrading_order_expires_after_secs(
+            std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
+                .ok()
+                .as_deref(),
+        );
 
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
@@ -232,6 +242,7 @@ impl Config {
             trailing_exit_min_profit_bps,
             autotrading,
             autotrading_max_positions,
+            autotrading_order_expires_after_secs,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
@@ -254,9 +265,17 @@ fn parse_autotrading_max_positions(value: Option<&str>) -> usize {
         .unwrap_or(1)
 }
 
+fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{parse_autotrading_max_positions, parse_env_bool};
+    use super::{
+        parse_autotrading_max_positions, parse_autotrading_order_expires_after_secs, parse_env_bool,
+    };
 
     #[test]
     fn parse_env_bool_accepts_common_values() {
@@ -274,5 +293,17 @@ mod tests {
         assert_eq!(parse_autotrading_max_positions(Some("0")), 1);
         assert_eq!(parse_autotrading_max_positions(Some("not-a-number")), 1);
         assert_eq!(parse_autotrading_max_positions(Some("3")), 3);
+    }
+
+    #[test]
+    fn parse_autotrading_order_expires_after_secs_accepts_positive_only() {
+        assert_eq!(parse_autotrading_order_expires_after_secs(None), None);
+        assert_eq!(parse_autotrading_order_expires_after_secs(Some("")), None);
+        assert_eq!(parse_autotrading_order_expires_after_secs(Some("0")), None);
+        assert_eq!(
+            parse_autotrading_order_expires_after_secs(Some("not-a-number")),
+            None
+        );
+        assert_eq!(parse_autotrading_order_expires_after_secs(Some("120")), Some(120));
     }
 }

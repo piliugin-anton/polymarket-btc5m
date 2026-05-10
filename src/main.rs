@@ -114,8 +114,10 @@ const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(40);
 
 /// Retries (no added sleep here; each attempt awaits the full `place_order` future).
 const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
-const AUTOTRADING_FAK_BUY_ATTEMPTS: u32 = 3;
-const AUTOTRADING_FAK_BUY_RETRY_MS: u64 = 250;
+/// Outer attempts after `place_limit_with_retries` exhausts its inner retries; each batch re-checks
+/// the strong signal. No sleep before the first batch (signal → POST as soon as the task runs).
+const AUTOTRADING_LIMIT_BUY_OUTER_ATTEMPTS: u32 = 3;
+const AUTOTRADING_LIMIT_BUY_OUTER_RETRY_MS: u64 = 250;
 
 /// GTD limit orders: 1 initial attempt + 3 retries on network error or CLOB soft rejection.
 const LIMIT_ORDER_MAX_ATTEMPTS: u32 = 4;
@@ -174,25 +176,23 @@ struct ResolvedAutoTradingBuy {
     price: f64,
 }
 
-fn resolve_market_buy_from_ask(
-    ask: f64,
+#[derive(Debug, Clone)]
+struct AutotradingLimitBuyTicket {
+    market: gamma::ActiveMarket,
+    outcome: Outcome,
+    token_id: String,
+    limit_price: f64,
+    shares: f64,
     size_usdc: f64,
-    buy_slippage_bps: u32,
-) -> Option<(f64, f64, OrderType)> {
-    if !ask.is_finite() || ask <= 0.0 || !size_usdc.is_finite() || size_usdc <= 0.0 {
-        return None;
-    }
-    let slip = buy_slippage_bps as f64 / 10_000.0;
-    let price = clamp_prob(ask * (1.0 + slip));
-    let shares = (size_usdc / ask).max(0.01);
-    Some((shares, price, OrderType::Fak))
+    expiration_unix_secs: u64,
 }
 
-fn resolve_autotrading_snapshot_buy(
+/// Limit BUY at the **best ask captured in the snapshot** (signal time), same share sizing as manual
+/// limit buys: `shares = size_usdc / limit_price` (min [`MIN_LIMIT_ORDER_SHARES`]).
+fn resolve_autotrading_limit_buy_at_signal(
     snapshot: &AutoTradingSnapshot,
     outcome: Outcome,
     token_id: &str,
-    buy_slippage_bps: u32,
 ) -> Option<ResolvedAutoTradingBuy> {
     if snapshot.signal_outcome != Some(outcome) {
         return None;
@@ -209,13 +209,41 @@ fn resolve_autotrading_snapshot_buy(
         Outcome::Up => snapshot.best_ask_up,
         Outcome::Down => snapshot.best_ask_down,
     }?;
-    let (shares, price, _) =
-        resolve_market_buy_from_ask(ask, snapshot.size_usdc, buy_slippage_bps)?;
+    if !ask.is_finite()
+        || ask <= 0.0
+        || !snapshot.size_usdc.is_finite()
+        || snapshot.size_usdc <= 0.0
+    {
+        return None;
+    }
+    let limit_price = clamp_prob(ask);
+    let shares = (snapshot.size_usdc / limit_price).max(0.01);
+    if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+        return None;
+    }
     Some(ResolvedAutoTradingBuy {
         market,
         shares,
-        price,
+        price: limit_price,
     })
+}
+
+fn autotrading_snapshot_allows_limit_retry(
+    snapshot: &AutoTradingSnapshot,
+    outcome: Outcome,
+    token_id: &str,
+) -> bool {
+    if snapshot.signal_outcome != Some(outcome) {
+        return false;
+    }
+    let Some(market) = snapshot.market.as_ref() else {
+        return false;
+    };
+    let expected = match outcome {
+        Outcome::Up => market.up_token_id.as_str(),
+        Outcome::Down => market.down_token_id.as_str(),
+    };
+    clob_asset_ids_match(expected, token_id)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -646,29 +674,58 @@ fn try_spawn_autotrading_buy(
         Outcome::Down => market.down_token_id.clone(),
     };
     let snapshot = AutoTradingSnapshot::from_state(state);
-    if resolve_autotrading_snapshot_buy(&snapshot, outcome, &token_id, cfg.market_buy_slippage_bps)
-        .is_none()
-    {
+    let Some(resolved) = resolve_autotrading_limit_buy_at_signal(&snapshot, outcome, &token_id)
+    else {
         return;
-    }
+    };
+    let expiration_unix_secs = match cfg.autotrading_order_expires_after_secs {
+        Some(secs) => match gamma::clob_gtd_expiration_secs_after_duration_from_now(secs) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    secs,
+                    "autotrading: limit BUY skipped — invalid GTD expiration from AUTOTRADING_ORDER_EXPIRES_AFTER"
+                );
+                return;
+            }
+        },
+        None => match gamma::clob_gtd_expiration_secs_at_window_end(resolved.market.closes_at) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "autotrading: limit BUY skipped — could not compute GTD expiration at window end"
+                );
+                return;
+            }
+        },
+    };
     if !state.autotrading_mark_in_flight(token_id.clone()) {
         return;
     }
 
+    let ticket = AutotradingLimitBuyTicket {
+        market: resolved.market,
+        outcome,
+        token_id: token_id.clone(),
+        limit_price: resolved.price,
+        shares: resolved.shares,
+        size_usdc: snapshot.size_usdc,
+        expiration_unix_secs,
+    };
+
     let runner_rx = snapshot_rx.clone();
     let trading = Arc::clone(trading);
     let tx = tx.clone();
-    let buy_slippage_bps = cfg.market_buy_slippage_bps;
     let take_profit_bps = cfg.take_profit_bps;
     let trail_bps = cfg.buy_trail_bps;
     tokio::spawn(async move {
-        run_autotrading_fak_buy_with_retries(
+        run_autotrading_limit_buy_with_retries(
             trading,
             tx,
             runner_rx,
-            outcome,
-            token_id,
-            buy_slippage_bps,
+            ticket,
             take_profit_bps,
             trail_bps,
         )
@@ -676,23 +733,29 @@ fn try_spawn_autotrading_buy(
     });
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn run_autotrading_fak_buy_with_retries(
+async fn run_autotrading_limit_buy_with_retries(
     trading: Arc<TradingClient>,
     tx: mpsc::Sender<AppEvent>,
     snapshot_rx: watch::Receiver<AutoTradingSnapshot>,
-    outcome: Outcome,
-    token_id: String,
-    buy_slippage_bps: u32,
+    ticket: AutotradingLimitBuyTicket,
     take_profit_bps: u32,
     trail_bps: u32,
 ) {
+    let AutotradingLimitBuyTicket {
+        market,
+        outcome,
+        token_id,
+        limit_price,
+        shares,
+        size_usdc,
+        expiration_unix_secs,
+    } = ticket;
+
     let mut last_error = "no fill".to_string();
-    for attempt in 1..=AUTOTRADING_FAK_BUY_ATTEMPTS {
+
+    for attempt in 1..=AUTOTRADING_LIMIT_BUY_OUTER_ATTEMPTS {
         let snapshot = snapshot_rx.borrow().clone();
-        let Some(resolved) =
-            resolve_autotrading_snapshot_buy(&snapshot, outcome, &token_id, buy_slippage_bps)
-        else {
+        if !autotrading_snapshot_allows_limit_retry(&snapshot, outcome, &token_id) {
             let _ = tx
                 .send(AppEvent::AutoTradingBuyDone {
                     token_id,
@@ -707,45 +770,45 @@ async fn run_autotrading_fak_buy_with_retries(
                 })
                 .await;
             return;
-        };
+        }
 
         let _ = tx
             .send(AppEvent::StatusInfo(format!(
-                "autotrading: BUY {} attempt {attempt}/{AUTOTRADING_FAK_BUY_ATTEMPTS}",
+                "autotrading: GTD BUY {} attempt {attempt}/{AUTOTRADING_LIMIT_BUY_OUTER_ATTEMPTS}",
                 outcome.as_str()
             )))
             .await;
         let args = OrderArgs {
             token_id: token_id.clone(),
             side: Side::Buy,
-            price: resolved.price,
-            size: resolved.shares,
-            neg_risk: resolved.market.neg_risk,
-            tick_size: resolved.market.tick_size.clone(),
-            buy_notional_usdc: Some(snapshot.size_usdc),
-            expiration_unix_secs: 0,
+            price: limit_price,
+            size: shares,
+            neg_risk: market.neg_risk,
+            tick_size: market.tick_size.clone(),
+            buy_notional_usdc: Some(size_usdc),
+            expiration_unix_secs,
             sell_skip_pre_post_settle: false,
         };
 
-        match trading.place_order(args, OrderType::Fak).await {
+        match place_limit_with_retries(&trading, args, outcome).await {
             Ok(resp) => {
                 debug!(
                     outcome = ?outcome,
                     attempt,
-                    req_shares = resolved.shares,
-                    limit_price = resolved.price,
+                    req_shares = shares,
+                    limit_price,
                     success = resp.success,
                     status = ?resp.status,
                     order_id = ?resp.order_id,
                     making_amount = ?resp.making_amount,
                     taking_amount = ?resp.taking_amount,
                     error_msg = ?resp.error,
-                    "autotrading FAK BUY response"
+                    "autotrading GTD BUY response"
                 );
                 if clob_response_accepted(&resp) {
-                    if let Some((ack_qty, ack_price)) =
-                        resp.fak_fill_for_position_ack(Side::Buy, resolved.shares, resolved.price)
-                    {
+                    let ack =
+                        resp.fill_for_position_ack(Side::Buy, shares, limit_price, OrderType::Gtd);
+                    if let Some((ack_qty, ack_price)) = ack {
                         let _ = tx
                             .send(AppEvent::OrderAck {
                                 side: Side::Buy,
@@ -756,17 +819,17 @@ async fn run_autotrading_fak_buy_with_retries(
                                 token_id: token_id.clone(),
                             })
                             .await;
-                        if take_profit_bps > 0 && trail_bps == 0 && resolved.price < 0.99 {
+                        if take_profit_bps > 0 && trail_bps == 0 && limit_price < 0.99 {
                             let _ = tx
                                 .send(AppEvent::RunTakeProfitAfterBuy {
-                                    market: resolved.market.clone(),
+                                    market: market.clone(),
                                     outcome,
                                     take_profit_bps,
                                     buy_ack_qty: ack_qty,
                                 })
                                 .await;
                         }
-                        if trail_bps > 0 && resolved.price < 0.99 {
+                        if trail_bps > 0 && limit_price < 0.99 {
                             let _ = tx
                                 .send(AppEvent::RequestTrailingArm {
                                     outcome,
@@ -775,7 +838,7 @@ async fn run_autotrading_fak_buy_with_retries(
                                     token_id: token_id.clone(),
                                     trail_bps,
                                     activation_bps: take_profit_bps,
-                                    market: resolved.market.clone(),
+                                    market: market.clone(),
                                 })
                                 .await;
                         }
@@ -802,7 +865,35 @@ async fn run_autotrading_fak_buy_with_retries(
                             .await;
                         return;
                     }
-                    last_error = "accepted without fill amounts".to_string();
+
+                    let _ = tx
+                        .send(AppEvent::StatusInfo(format!(
+                            "autotrading: {} GTD BUY limit resting (no immediate fill) — see Open Orders",
+                            outcome.as_str()
+                        )))
+                        .await;
+                    let cli = Arc::clone(&trading);
+                    let refresh_token = token_id.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = cli
+                            .refresh_conditional_balance_allowance_cache(&refresh_token)
+                            .await
+                        {
+                            debug!(
+                                error = %e,
+                                token_id = %refresh_token,
+                                "autotrading post-BUY delayed balance-allowance cache refresh failed"
+                            );
+                        }
+                    });
+                    let _ = tx
+                        .send(AppEvent::AutoTradingBuyDone {
+                            token_id,
+                            filled_qty: None,
+                            error: None,
+                        })
+                        .await;
+                    return;
                 } else {
                     last_error = resp
                         .error
@@ -815,13 +906,16 @@ async fn run_autotrading_fak_buy_with_retries(
                     error = %last_error,
                     outcome = ?outcome,
                     attempt,
-                    "autotrading FAK BUY request failed"
+                    "autotrading GTD BUY place_limit_with_retries failed"
                 );
             }
         }
 
-        if attempt < AUTOTRADING_FAK_BUY_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(AUTOTRADING_FAK_BUY_RETRY_MS)).await;
+        if attempt < AUTOTRADING_LIMIT_BUY_OUTER_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(
+                AUTOTRADING_LIMIT_BUY_OUTER_RETRY_MS,
+            ))
+            .await;
         }
     }
 
@@ -1576,6 +1670,7 @@ async fn main() -> Result<()> {
         trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
         autotrading = cfg.autotrading,
         autotrading_max_positions = cfg.autotrading_max_positions,
+        autotrading_order_expires_after_secs = ?cfg.autotrading_order_expires_after_secs,
         "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
@@ -2600,26 +2695,26 @@ mod tests {
     fn autotrading_snapshot_resolves_buy_from_current_tui_size() {
         let state = test_autotrading_state();
         let snap = AutoTradingSnapshot::from_state(&state);
-        let resolved = resolve_autotrading_snapshot_buy(&snap, Outcome::Up, "111", 50).unwrap();
+        let resolved = resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111").unwrap();
 
         assert!((resolved.shares - 25.0).abs() < 1e-9);
-        assert!((resolved.price - 0.5025).abs() < 1e-9);
+        assert!((resolved.price - 0.50).abs() < 1e-9);
     }
 
     #[test]
     fn autotrading_snapshot_rejects_when_signal_flips_or_market_rolls() {
         let mut state = test_autotrading_state();
         let snap = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_snapshot_buy(&snap, Outcome::Up, "111", 50).is_some());
+        assert!(resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111").is_some());
 
         state.spot_price = Some(99.70);
         let flipped = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_snapshot_buy(&flipped, Outcome::Up, "111", 50).is_none());
+        assert!(resolve_autotrading_limit_buy_at_signal(&flipped, Outcome::Up, "111").is_none());
 
         state.spot_price = Some(100.30);
         state.market.as_mut().unwrap().up_token_id = "333".into();
         let rolled = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_snapshot_buy(&rolled, Outcome::Up, "111", 50).is_none());
+        assert!(resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111").is_none());
     }
 }
 

@@ -97,6 +97,26 @@ pub fn clob_gtd_expiration_secs_at_window_end(window_end: DateTime<Utc>) -> Resu
     Ok(signed as u64)
 }
 
+/// Signed CLOB `expiration` for a **GTD** limit whose resting period should end about
+/// `duration_secs` wall-clock seconds after this function runs.
+///
+/// Uses the same **+60s** convention as [`clob_gtd_expiration_secs_at_window_end`]: Polymarket’s
+/// security offset means the order stops resting around `signed_expiration − 60` ≈ `now + duration_secs`.
+pub fn clob_gtd_expiration_secs_after_duration_from_now(duration_secs: u64) -> Result<u64> {
+    if duration_secs == 0 {
+        bail!("GTD expiration duration must be positive");
+    }
+    let now = Utc::now().timestamp();
+    let signed = now
+        .checked_add(duration_secs as i64)
+        .and_then(|t| t.checked_add(60))
+        .ok_or_else(|| anyhow!("could not compute GTD expiration from duration (overflow)"))?;
+    if signed <= now {
+        bail!("computed GTD expiration is not in the future");
+    }
+    Ok(signed as u64)
+}
+
 // ── Raw Gamma JSON shapes ───────────────────────────────────────────
 // The Gamma API returns fields in mixed camelCase / snake_case; we
 // deserialise with serde(rename_all) and keep only what we actually use.
@@ -614,5 +634,29 @@ mod tick_string_tests {
         assert_eq!(gamma_tick_f64_to_string(0.001), "0.001");
         assert_eq!(gamma_tick_f64_to_string(0.15), "0.15");
         assert_eq!(gamma_tick_f64_to_string(0.123456789012), "0.123456789012");
+    }
+}
+
+#[cfg(test)]
+mod gtd_expiration_after_duration_tests {
+    use super::clob_gtd_expiration_secs_after_duration_from_now;
+    use chrono::Utc;
+
+    #[test]
+    fn duration_expiration_is_about_now_plus_duration_plus_offset() {
+        let d = 300u64;
+        let got = clob_gtd_expiration_secs_after_duration_from_now(d).unwrap();
+        let now = Utc::now().timestamp() as u64;
+        let low = now + d + 55;
+        let high = now + d + 90;
+        assert!(
+            (low..=high).contains(&got),
+            "expected ~now+d+60, got {got} (now≈{now}, d={d})"
+        );
+    }
+
+    #[test]
+    fn duration_zero_errors() {
+        assert!(clob_gtd_expiration_secs_after_duration_from_now(0).is_err());
     }
 }

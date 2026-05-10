@@ -213,8 +213,9 @@ pub enum AppEvent {
         success: bool,
         error: Option<String>,
     },
-    /// Auto-trading FAK BUY task finished; clears the per-token in-flight guard and, on fill,
-    /// opens one tracked auto position for the live-position cap.
+    /// Auto-trading GTD limit BUY task finished; clears the per-token in-flight guard and, on fill
+    /// ack from the POST response, opens one tracked auto position for the live-position cap.
+    /// Maker fills on a resting auto limit are applied from [`AppEvent::UserChannelFill`].
     AutoTradingBuyDone {
         token_id: String,
         filled_qty: Option<f64>,
@@ -1769,8 +1770,17 @@ impl AppState {
                     return;
                 }
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
-                if side == Side::Sell {
-                    self.autotrading_apply_fill(&token_id, side, qty);
+                match side {
+                    Side::Sell => {
+                        self.autotrading_apply_fill(&token_id, side, qty);
+                    }
+                    Side::Buy if from_maker_leg => {
+                        // Resting auto-trading GTD: POST may be `live` with no fill ack — track
+                        // inventory when the user channel reports a maker BUY leg (immediate fills
+                        // use [`AppEvent::AutoTradingBuyDone`]).
+                        self.autotrading_apply_fill(&token_id, side, qty);
+                    }
+                    _ => {}
                 }
                 if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
                     let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);
@@ -1975,7 +1985,9 @@ impl AppState {
                 } else if let Some(e) = error {
                     self.status_line = format!("autotrading: stopped — {e}");
                 } else {
-                    self.status_line = "autotrading: stopped".into();
+                    self.status_line = "autotrading: GTD BUY accepted (resting or no fill in response); \
+                                        maker fills update the auto position via trades"
+                        .into();
                 }
             }
             AppEvent::OrderErrModal(e) => {
