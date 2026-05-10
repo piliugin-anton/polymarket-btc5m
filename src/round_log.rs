@@ -444,15 +444,16 @@ pub fn run_inspect_cli(args: &[String]) -> Result<()> {
     let mut total_lines = 0u64;
     let mut bad_lines = 0u64;
     let mut counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
-    let mut snaps_per_cid: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut snaps_per_cid: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
     let mut sig_hist = [0u64; 4];
     let mut sent_hist = [0u64; 4];
     let mut rounds_missing_book = std::collections::HashSet::<String>::new();
     let mut incomplete_closes = 0u64;
 
     for path in &paths {
-        let text = std::fs::read_to_string(path)
-            .with_context(|| format!("read {}", path.display()))?;
+        let text =
+            std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
         for (lineno, line) in text.lines().enumerate() {
             if line.trim().is_empty() {
                 continue;
@@ -528,7 +529,10 @@ pub fn run_inspect_cli(args: &[String]) -> Result<()> {
     }
     println!("sig histogram [NoTrade, Watch, StrongUp, StrongDown]: {sig_hist:?}");
     println!("sent histogram [Up, Down, Neutral, Unknown]: {sent_hist:?}");
-    println!("Rounds with any snap missing full book (ubu/uba/dbu/dba/ubas/dbas): {}", rounds_missing_book.len());
+    println!(
+        "Rounds with any snap missing full book (ubu/uba/dbu/dba/ubas/dbas): {}",
+        rounds_missing_book.len()
+    );
     println!("close lines with src=incomplete: {incomplete_closes}");
 
     if bad_lines > 0 {
@@ -547,7 +551,10 @@ fn list_jsonl_files(dir: &Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
         let p = ent.path();
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             if let Some(d) = day {
-                if p.file_stem().map(|s| s.to_string_lossy() == d).unwrap_or(false) {
+                if p.file_stem()
+                    .map(|s| s.to_string_lossy() == d)
+                    .unwrap_or(false)
+                {
                     out.push(p);
                 }
             } else {

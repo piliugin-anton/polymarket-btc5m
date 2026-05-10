@@ -2034,9 +2034,10 @@ impl AppState {
                 } else if let Some(e) = error {
                     self.status_line = format!("autotrading: stopped — {e}");
                 } else {
-                    self.status_line = "autotrading: GTD BUY accepted (resting or no fill in response); \
+                    self.status_line =
+                        "autotrading: GTD BUY accepted (resting or no fill in response); \
                                         maker fills update the auto position via trades"
-                        .into();
+                            .into();
                 }
             }
             AppEvent::OrderErrModal(e) => {

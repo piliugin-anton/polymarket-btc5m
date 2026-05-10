@@ -51,7 +51,6 @@ use app::{
 };
 use chrono::Utc;
 use config::Config;
-use round_log::{RoundLogHandle, RoundLogWriterConfig};
 use crossterm::{
     event::{
         DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode, KeyEvent,
@@ -67,6 +66,7 @@ use feeds::clob_ws::ClobTradePrint;
 use fees::take_profit_limit_price_crypto_after_fees;
 use futures_util::StreamExt;
 use ratatui::{backend::CrosstermBackend, Terminal};
+use round_log::{RoundLogHandle, RoundLogWriterConfig};
 use std::{
     collections::{HashSet, VecDeque},
     future::Future,
@@ -196,6 +196,7 @@ fn resolve_autotrading_limit_buy_at_signal(
     snapshot: &AutoTradingSnapshot,
     outcome: Outcome,
     token_id: &str,
+    max_entry_price: Option<f64>,
 ) -> Option<ResolvedAutoTradingBuy> {
     if snapshot.signal_outcome != Some(outcome) {
         return None;
@@ -220,6 +221,9 @@ fn resolve_autotrading_limit_buy_at_signal(
         return None;
     }
     let limit_price = clamp_prob(ask);
+    if max_entry_price.is_some_and(|cap| limit_price > cap + 1e-12) {
+        return None;
+    }
     let shares = (snapshot.size_usdc / limit_price).max(0.01);
     if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
         return None;
@@ -699,8 +703,12 @@ fn try_spawn_autotrading_buy(
         Outcome::Down => market.down_token_id.clone(),
     };
     let snapshot = AutoTradingSnapshot::from_state(state);
-    let Some(resolved) = resolve_autotrading_limit_buy_at_signal(&snapshot, outcome, &token_id)
-    else {
+    let Some(resolved) = resolve_autotrading_limit_buy_at_signal(
+        &snapshot,
+        outcome,
+        &token_id,
+        cfg.autotrading_max_entry_price,
+    ) else {
         return;
     };
     let expiration_unix_secs = match cfg.autotrading_order_expires_after_secs {
@@ -937,10 +945,7 @@ async fn run_autotrading_limit_buy_with_retries(
         }
 
         if attempt < AUTOTRADING_LIMIT_BUY_OUTER_ATTEMPTS {
-            tokio::time::sleep(Duration::from_millis(
-                AUTOTRADING_LIMIT_BUY_OUTER_RETRY_MS,
-            ))
-            .await;
+            tokio::time::sleep(Duration::from_millis(AUTOTRADING_LIMIT_BUY_OUTER_RETRY_MS)).await;
         }
     }
 
@@ -2762,9 +2767,25 @@ mod tests {
     fn autotrading_snapshot_resolves_buy_from_current_tui_size() {
         let state = test_autotrading_state();
         let snap = AutoTradingSnapshot::from_state(&state);
-        let resolved = resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111").unwrap();
+        let resolved =
+            resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", None).unwrap();
 
         assert!((resolved.shares - 25.0).abs() < 1e-9);
+        assert!((resolved.price - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
+    fn autotrading_snapshot_rejects_buy_above_max_entry_price() {
+        let state = test_autotrading_state();
+        let snap = AutoTradingSnapshot::from_state(&state);
+
+        assert!(
+            resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", Some(0.49))
+                .is_none()
+        );
+
+        let resolved =
+            resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", Some(0.50)).unwrap();
         assert!((resolved.price - 0.50).abs() < 1e-9);
     }
 
@@ -2772,16 +2793,20 @@ mod tests {
     fn autotrading_snapshot_rejects_when_signal_flips_or_market_rolls() {
         let mut state = test_autotrading_state();
         let snap = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111").is_some());
+        assert!(resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", None).is_some());
 
         state.spot_price = Some(99.70);
         let flipped = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_limit_buy_at_signal(&flipped, Outcome::Up, "111").is_none());
+        assert!(
+            resolve_autotrading_limit_buy_at_signal(&flipped, Outcome::Up, "111", None).is_none()
+        );
 
         state.spot_price = Some(100.30);
         state.market.as_mut().unwrap().up_token_id = "333".into();
         let rolled = AutoTradingSnapshot::from_state(&state);
-        assert!(resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111").is_none());
+        assert!(
+            resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111", None).is_none()
+        );
     }
 }
 

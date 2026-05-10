@@ -132,6 +132,7 @@ Optional but useful:
 | `AUTOTRADING` | `true` enables automatic **GTD limit BUY** entries at the **best ask seen when the `STRONG UP` / `STRONG DOWN` signal fires** (`false` by default) |
 | `AUTOTRADING_MAX_POSITIONS` | Maximum currently open auto-trading positions; sold/closed auto inventory frees capacity (`1` by default) |
 | `AUTOTRADING_ORDER_EXPIRES_AFTER` | Optional. Positive **seconds**: autotrading GTD BUY expires about that long after the order is built (Polymarket uses a +60s signing offset; unset = same as manual limits — expire near **window end**) |
+| `AUTOTRADING_MAX_ENTRY_PRICE` | Optional. Skip automatic GTD BUY entries when the signal-time best ask is above this probability price, e.g. `0.95` to avoid chasing `0.99` entries |
 | `STRATEGY_STRONG_GAP_MULT` | **Safest first knob** for more `STRONG` signals: multiply the required spot-vs-Price-to-Beat gap (default `1.0`, clamped ~`0.55`–`1.15`). Try `0.85`–`0.92` before loosening spreads |
 | `STRATEGY_MAX_SPREAD_MULT` | Scale max allowed bid–ask spread for strategy book checks (default `1.0`, up to ~`1.35`). **Higher → more signals, worse fill risk** |
 | `STRATEGY_MIN_TOP_ASK_SHARES` | Minimum best-ask size to treat a book as tradable (default `5`, clamped `2`–`50`). **Lower → more signals, thinner book risk** |
@@ -267,6 +268,8 @@ Set `AUTOTRADING=true` to let the app automatically submit **GTD limit BUY** ord
 Before each **outer** retry batch (after inner limit-order retries are exhausted), the bot re-checks that the same strong signal is still present for the same market token. The limit price and share count are **fixed at detection** — they are not recomputed from a later book. `AUTOTRADING_MAX_POSITIONS` limits currently open auto-trading positions; when matching sell fills reduce the tracked auto inventory, capacity opens again. Resting limit fills that arrive later as **maker** legs are applied to that ledger from the user-channel trade stream.
 
 Set **`AUTOTRADING_ORDER_EXPIRES_AFTER`** (seconds, positive integer) to cap how long an autotrading limit rests: the signed CLOB expiration is chosen so the order stops about that many seconds after it is submitted (Polymarket’s +60s offset applies — same convention as other GTD orders in this app). If unset, autotrading uses the **window-end** expiration, matching manual limit orders for that market.
+
+Set **`AUTOTRADING_MAX_ENTRY_PRICE`** (probability price, `0.01`–`0.99`) to skip automatic entries whose signal-time best ask is too expensive. For example, `0.95` prevents autotrading from chasing late `0.99` books; leaving it unset keeps the existing behavior.
 
 Autotrading only buys. Exits are still handled by your existing `TAKE_PROFIT_BPS` / `BUY_TRAIL_BPS` settings or by manual sells.
 

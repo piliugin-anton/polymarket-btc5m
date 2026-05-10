@@ -7,7 +7,9 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
 use crate::round_log::{u8_to_label, u8_to_sentiment, RoundLogStrategyTunables};
-use crate::strategy::{evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel};
+use crate::strategy::{
+    evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalMode {
@@ -75,7 +77,10 @@ fn list_jsonl_files(dir: &std::path::Path, day: Option<&str>) -> Result<Vec<Path
         let p = ent.path();
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             if let Some(d) = day {
-                if p.file_stem().map(|s| s.to_string_lossy() == d).unwrap_or(false) {
+                if p.file_stem()
+                    .map(|s| s.to_string_lossy() == d)
+                    .unwrap_or(false)
+                {
                     out.push(p);
                 }
             } else {
@@ -123,10 +128,7 @@ fn ingest_jsonl(path: &std::path::Path, rounds: &mut HashMap<String, RoundAccum>
                         .get("min_top_ask_shares")
                         .and_then(|x| x.as_f64())
                         .unwrap_or(5.0),
-                    watch_ratio: v
-                        .get("watch_ratio")
-                        .and_then(|x| x.as_f64())
-                        .unwrap_or(0.6),
+                    watch_ratio: v.get("watch_ratio").and_then(|x| x.as_f64()).unwrap_or(0.6),
                 });
             }
             "snap" => {
@@ -199,9 +201,15 @@ fn snap_to_input(
         window_secs: Some((we - ws).max(1)),
         sentiment: sent,
         activity_notional_60s: s.act,
-        strong_gap_mult: overrides.strong_gap_mult.unwrap_or(tunables.strong_gap_mult),
-        max_spread_mult: overrides.max_spread_mult.unwrap_or(tunables.max_spread_mult),
-        min_top_ask_shares: overrides.min_top_ask_shares.unwrap_or(tunables.min_top_ask_shares),
+        strong_gap_mult: overrides
+            .strong_gap_mult
+            .unwrap_or(tunables.strong_gap_mult),
+        max_spread_mult: overrides
+            .max_spread_mult
+            .unwrap_or(tunables.max_spread_mult),
+        min_top_ask_shares: overrides
+            .min_top_ask_shares
+            .unwrap_or(tunables.min_top_ask_shares),
         watch_ratio: overrides.watch_ratio.unwrap_or(tunables.watch_ratio),
     })
 }
@@ -221,7 +229,11 @@ fn predicted_side_strong(label: ManualSignalLabel) -> Option<&'static str> {
     }
 }
 
-fn predicted_side_watch_hint(label: ManualSignalLabel, spot: Option<f64>, ptb: Option<f64>) -> Option<&'static str> {
+fn predicted_side_watch_hint(
+    label: ManualSignalLabel,
+    spot: Option<f64>,
+    ptb: Option<f64>,
+) -> Option<&'static str> {
     match label {
         ManualSignalLabel::StrongUp => Some("up"),
         ManualSignalLabel::StrongDown => Some("down"),
@@ -391,7 +403,10 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         println!("  rounds (total): {}", summary.rounds_total);
         println!("  rounds with win up/down: {}", summary.rounds_with_win);
         println!("  snaps total: {}", summary.snaps_total);
-        println!("  snaps with full book (replayable): {}", summary.snaps_usable_book);
+        println!(
+            "  snaps with full book (replayable): {}",
+            summary.snaps_usable_book
+        );
         println!("  strong calls (replay): {}", summary.strong_calls);
         if summary.strong_calls > 0 {
             println!(
@@ -500,4 +515,3 @@ mod signal_eval_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
-
