@@ -237,6 +237,29 @@ The TUI strategy compares **live spot** to **Price to Beat** and requires a mini
 
 Restart the app after changing `.env`. Watch logs for loaded `strategy_*` values.
 
+### Session logging (JSONL) and offline `signal-eval`
+
+For **calibrating** strategy tunables against saved sessions, enable optional append-only logs (one file per UTC day, e.g. `data/rounds/2026-05-10.jsonl`):
+
+| Variable | Meaning |
+|----------|---------|
+| `ROUND_LOG_ENABLED` | `true` / `1` to record `open` / `snap` / `close` lines |
+| `ROUND_LOG_DIR` | Directory for `YYYY-MM-DD.jsonl` (default `./data/rounds`) |
+| `ROUND_LOG_SNAP_INTERVAL_SECS` | Min seconds between `snap` rows while a round is active (default `10`, clamped `2`–`120`) |
+| `ROUND_LOG_FILLS` | When `true`, also append `fill` lines (diagnostics only; default `false`) |
+
+**Schema (`v:1`):** each line is JSON with `"t"` = `open` | `snap` | `close` | `fill`. Rounds are keyed by Gamma `condition_id` (`cid`). On each new `MarketRoll`, the logger emits a `close` for the **previous** window (winner `win` is **approximate**: last spot vs price-to-beat, `src: approx_spot`) and an `open` for the new window with strategy tunables copied from state. **`close.win` is not official Polymarket resolution** — use metrics only for relative tuning.
+
+**CLIs** (after `cargo run --` or the installed binary):
+
+```text
+polymarket-crypto round-log-inspect --dir ./data/rounds [--day YYYY-MM-DD]
+polymarket-crypto signal-eval --dir ./data/rounds [--day YYYY-MM-DD] [--mode strong-only|watch-as-hint]
+  [--strong-gap-mult F] [--max-spread-mult F] [--min-top-ask-shares F] [--watch-ratio F] [--json]
+```
+
+`signal-eval` rebuilds [`ManualSignalInput`](src/strategy.rs) from each `snap` and compares replayed labels to `close.win` where it is `up` or `down`. A small example log lives at [`tests/fixtures/round_log_small.jsonl`](tests/fixtures/round_log_small.jsonl).
+
 ### Autotrading
 
 Set `AUTOTRADING=true` to let the app automatically submit **GTD limit BUY** orders when the strategy signal is `STRONG UP` or `STRONG DOWN`. The limit **price** is the outcome token’s **best ask at the instant the signal is detected** (same moment as the UI snapshot); **size** is the same USDC notional as manual orders: `DEFAULT_SIZE_USDC` at startup, then whatever you edit with **`e`**. `WATCH` and `NO TRADE` never place automatic orders.

@@ -572,6 +572,9 @@ pub struct AppState {
     /// Watch threshold as fraction of strong gap (`STRATEGY_WATCH_RATIO`).
     pub strategy_watch_ratio: f64,
 
+    /// Optional JSONL session logger ([`crate::round_log::RoundLogHandle`]).
+    pub round_log: Option<std::sync::Arc<crate::round_log::RoundLogHandle>>,
+
     traded_activity: RollingTradedNotional,
 }
 
@@ -639,6 +642,7 @@ impl AppState {
             strategy_max_spread_mult: 1.0,
             strategy_min_top_ask_shares: 5.0,
             strategy_watch_ratio: 0.60,
+            round_log: None,
             traded_activity: RollingTradedNotional::new(),
         }
     }
@@ -815,7 +819,12 @@ impl AppState {
     }
 
     pub fn manual_signal_label(&self) -> ManualSignalLabel {
-        evaluate_manual_signal(&ManualSignalInput {
+        evaluate_manual_signal(&self.manual_signal_input_snapshot())
+    }
+
+    /// Snapshot of inputs passed to [`evaluate_manual_signal`] (for JSONL `snap` replay).
+    pub fn manual_signal_input_snapshot(&self) -> ManualSignalInput {
+        ManualSignalInput {
             spot_price: self.spot_price,
             price_to_beat: self.price_to_beat(),
             up: self.manual_signal_book_side(Outcome::Up),
@@ -837,7 +846,27 @@ impl AppState {
             max_spread_mult: self.strategy_max_spread_mult,
             min_top_ask_shares: self.strategy_min_top_ask_shares,
             watch_ratio: self.strategy_watch_ratio,
-        })
+        }
+    }
+
+    fn maybe_log_round_fill(&self, fill: &Fill) {
+        let Some(ref rl) = self.round_log else {
+            return;
+        };
+        if !rl.log_fills_enabled() {
+            return;
+        }
+        let cid = self.market.as_ref().map(|m| m.condition_id.as_str());
+        rl.log_fill(
+            cid,
+            fill.ts,
+            fill.side,
+            fill.outcome,
+            fill.qty,
+            fill.price,
+            fill.realized,
+            fill.clob_trade_id.clone(),
+        );
     }
 
     pub fn manual_signal_buy_outcome(&self) -> Option<Outcome> {
@@ -1812,7 +1841,7 @@ impl AppState {
                     // tape can show SELL on one outcome while the user's intent was a limit BUY on the
                     // other leg; suppressing "zero-inventory SELL" rows hid legitimate fills (see debug).
                     if qty > 1e-12 {
-                        self.fills.push_back(Fill {
+                        let fill = Fill {
                             ts,
                             side,
                             outcome: ui_oc,
@@ -1824,7 +1853,9 @@ impl AppState {
                             } else {
                                 Some(clob_trade_id.clone())
                             },
-                        });
+                        };
+                        self.maybe_log_round_fill(&fill);
+                        self.fills.push_back(fill);
                         trim_fills_to_cap(&mut self.fills, 64);
                     }
                     self.reconcile_position_shares_with_fill_deque(ui_oc);
@@ -1914,7 +1945,7 @@ impl AppState {
                             }
                         }
                         if qty > 1e-12 {
-                            self.fills.push_back(Fill {
+                            let fill = Fill {
                                 ts: Utc::now(),
                                 side,
                                 outcome: ui_oc,
@@ -1922,7 +1953,9 @@ impl AppState {
                                 price,
                                 realized,
                                 clob_trade_id: None,
-                            });
+                            };
+                            self.maybe_log_round_fill(&fill);
+                            self.fills.push_back(fill);
                         }
                     } else {
                         self.apply_background_trailing_fill(&token_id, side, qty);

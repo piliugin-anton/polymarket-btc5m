@@ -109,6 +109,15 @@ pub struct Config {
     pub relayer_api_key_address: Option<Address>,
     /// Polygon JSON-RPC URL for `eth_call` (neg-risk balances). Public default if unset.
     pub polygon_rpc_url: String,
+
+    /// When true, append JSONL round logs under [`Self::round_log_dir`].
+    pub round_log_enabled: bool,
+    /// Directory for daily `YYYY-MM-DD.jsonl` session files.
+    pub round_log_dir: std::path::PathBuf,
+    /// Minimum seconds between `snap` lines while a round is active (clamped 2–120).
+    pub round_log_snap_interval_secs: u64,
+    /// When true and round logging is enabled, also append `fill` lines (diagnostics).
+    pub round_log_fills: bool,
 }
 
 impl Config {
@@ -227,6 +236,24 @@ impl Config {
             .filter(|s| !s.trim().is_empty())
             .unwrap_or_else(|| "https://polygon-rpc.com".to_string());
 
+        let round_log_enabled = std::env::var("ROUND_LOG_ENABLED")
+            .ok()
+            .as_deref()
+            .and_then(parse_env_bool)
+            .unwrap_or(false);
+        let round_log_dir = std::env::var("ROUND_LOG_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("./data/rounds"));
+        let round_log_snap_interval_secs =
+            parse_round_log_snap_interval_secs(std::env::var("ROUND_LOG_SNAP_INTERVAL_SECS").ok().as_deref());
+        let round_log_fills = std::env::var("ROUND_LOG_FILLS")
+            .ok()
+            .as_deref()
+            .and_then(parse_env_bool)
+            .unwrap_or(false);
+
         let signer: alloy_signer_local::PrivateKeySigner = private_key
             .parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
@@ -273,8 +300,20 @@ impl Config {
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
+            round_log_enabled,
+            round_log_dir,
+            round_log_snap_interval_secs,
+            round_log_fills,
         })
     }
+}
+
+fn parse_round_log_snap_interval_secs(value: Option<&str>) -> u64 {
+    const DEFAULT: u64 = 10;
+    let Some(raw) = value.and_then(|s| s.trim().parse::<u64>().ok()) else {
+        return DEFAULT;
+    };
+    raw.clamp(2, 120)
 }
 
 fn parse_env_bool(value: &str) -> Option<bool> {
@@ -346,8 +385,8 @@ fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
 mod tests {
     use super::{
         parse_autotrading_max_positions, parse_autotrading_order_expires_after_secs, parse_env_bool,
-        parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
-        parse_strategy_strong_gap_mult, parse_strategy_watch_ratio,
+        parse_round_log_snap_interval_secs, parse_strategy_max_spread_mult,
+        parse_strategy_min_top_ask_shares, parse_strategy_strong_gap_mult, parse_strategy_watch_ratio,
     };
 
     #[test]
@@ -397,5 +436,13 @@ mod tests {
 
         assert!((parse_strategy_watch_ratio(Some("0.5")) - 0.5).abs() < 1e-9);
         assert!((parse_strategy_watch_ratio(Some("0.2")) - 0.40).abs() < 1e-9);
+    }
+
+    #[test]
+    fn parse_round_log_snap_interval_secs_clamps() {
+        assert_eq!(parse_round_log_snap_interval_secs(None), 10);
+        assert_eq!(parse_round_log_snap_interval_secs(Some("10")), 10);
+        assert_eq!(parse_round_log_snap_interval_secs(Some("1")), 2);
+        assert_eq!(parse_round_log_snap_interval_secs(Some("500")), 120);
     }
 }

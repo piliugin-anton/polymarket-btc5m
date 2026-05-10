@@ -32,6 +32,8 @@ mod market_profile;
 mod poly1271;
 mod polymarket_relayer;
 mod redeem;
+mod round_log;
+mod signal_eval;
 mod strategy;
 mod take_profit;
 
@@ -49,6 +51,7 @@ use app::{
 };
 use chrono::Utc;
 use config::Config;
+use round_log::{RoundLogHandle, RoundLogWriterConfig};
 use crossterm::{
     event::{
         DisableFocusChange, EnableFocusChange, Event as CtEvent, EventStream, KeyCode, KeyEvent,
@@ -508,7 +511,29 @@ async fn apply_app_event(
                     // Trailing stops trip only on book ticks — only run the dispatch check
                     // after Book events so we skip the call on every Price/Tick/etc. message.
                     let is_book_ev = matches!(ev, AppEvent::Book(_));
+                    let market_roll_data = if let AppEvent::MarketRoll { market, .. } = &ev {
+                        Some((state.market.clone(), state.spot_price, market.clone()))
+                    } else {
+                        None
+                    };
+                    let do_snap = matches!(&ev, AppEvent::Price(_) | AppEvent::Tick);
                     state.apply(ev).await;
+                    if let Some((prev, spot_last, new_market)) = market_roll_data {
+                        if let Some(ref rl) = state.round_log {
+                            rl.on_market_roll(
+                                prev.as_ref(),
+                                &new_market,
+                                spot_last,
+                                state,
+                                state.market_profile.as_deref(),
+                            );
+                        }
+                    }
+                    if do_snap {
+                        if let Some(ref rl) = state.round_log {
+                            rl.maybe_snap(state);
+                        }
+                    }
                     if let Some((outcome, buy_ack_qty)) = state.take_pending_ws_take_profit() {
                         if cfg.buy_trail_bps == 0 && cfg.take_profit_bps > 0 {
                             if let Some(market) = state.market.clone() {
@@ -1642,6 +1667,12 @@ async fn main() -> Result<()> {
         Some("deploy-wallet") => {
             return deploy_wallet_cmd::run().await;
         }
+        Some("round-log-inspect") => {
+            return round_log::run_inspect_cli(&args[2..]).map_err(Into::into);
+        }
+        Some("signal-eval") => {
+            return signal_eval::run_signal_eval_cli(&args[2..]).map_err(Into::into);
+        }
         Some("help") | Some("-h") | Some("--help") => {
             println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
             println!("Without a subcommand, launches the interactive TUI.\n");
@@ -1655,6 +1686,8 @@ async fn main() -> Result<()> {
                 "                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default)."
             );
             println!("  help           Show this help.");
+            println!("  round-log-inspect  Summarize JSONL session logs (--dir, --day).");
+            println!("  signal-eval    Offline strategy replay vs logged approx wins (--dir, --mode, …).");
             return Ok(());
         }
         _ => {}
@@ -1675,6 +1708,10 @@ async fn main() -> Result<()> {
         strategy_max_spread_mult = cfg.strategy_max_spread_mult,
         strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares,
         strategy_watch_ratio = cfg.strategy_watch_ratio,
+        round_log_enabled = cfg.round_log_enabled,
+        round_log_dir = %cfg.round_log_dir.display(),
+        round_log_snap_interval_secs = cfg.round_log_snap_interval_secs,
+        round_log_fills = cfg.round_log_fills,
         "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
@@ -2282,6 +2319,15 @@ async fn main() -> Result<()> {
     state.strategy_max_spread_mult = cfg.strategy_max_spread_mult;
     state.strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares;
     state.strategy_watch_ratio = cfg.strategy_watch_ratio;
+    state.round_log = if cfg.round_log_enabled {
+        Some(Arc::new(RoundLogHandle::spawn(RoundLogWriterConfig {
+            dir: cfg.round_log_dir.clone(),
+            snap_interval: Duration::from_secs(cfg.round_log_snap_interval_secs),
+            log_fills: cfg.round_log_fills,
+        })))
+    } else {
+        None
+    };
     let (autotrading_snapshot_tx, autotrading_snapshot_rx) =
         watch::channel(AutoTradingSnapshot::from_state(&state));
     let mut discovery_spawned = false;
@@ -2488,6 +2534,8 @@ async fn main() -> Result<()> {
         }
     };
 
+    round_log_shutdown_best_effort(&state);
+
     // ── teardown ─────────────────────────────────────────────────────
     disable_raw_mode()?;
     if KEYBOARD_PROTOCOL_ACTIVE.load(Ordering::Relaxed) {
@@ -2500,6 +2548,17 @@ async fn main() -> Result<()> {
         error!(error = %e, "exited with error");
     }
     result
+}
+
+fn round_log_shutdown_best_effort(state: &AppState) {
+    let Some(ref rl) = state.round_log else {
+        return;
+    };
+    if let Some(m) = &state.market {
+        rl.shutdown_incomplete(m, state.spot_price);
+    }
+    rl.request_shutdown();
+    std::thread::sleep(std::time::Duration::from_millis(200));
 }
 
 // ── event forwarders ────────────────────────────────────────────────
