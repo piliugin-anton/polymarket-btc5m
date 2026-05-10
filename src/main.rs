@@ -520,6 +520,22 @@ async fn run_trailing_exit_fak_sell(
         "trailing: FAK SELL (await place_order, up to {n} attempts)",
         n = TRAILING_EXIT_FAK_ATTEMPTS,
     );
+    if trailing_exit_sell_size_is_dust(shares) {
+        let _ = tx
+            .send(AppEvent::StatusInfo(format!(
+                "trailing {} SELL skipped — dust residual",
+                outcome.as_str()
+            )))
+            .await;
+        let _ = tx
+            .send(AppEvent::TrailingExitDispatchDone {
+                token_id,
+                success: true,
+                error: None,
+            })
+            .await;
+        return;
+    }
     for attempt in 1u32..=TRAILING_EXIT_FAK_ATTEMPTS {
         let args = OrderArgs {
             token_id: token_id.clone(),
@@ -667,6 +683,10 @@ async fn run_trailing_exit_fak_sell(
             }
         }
     }
+}
+
+fn trailing_exit_sell_size_is_dust(shares: f64) -> bool {
+    !shares.is_finite() || shares <= crate::take_profit::CLOB_ORDER_REMAINING_DUST
 }
 
 fn trailing_exit_response_is_resting_without_fill_ack(
@@ -2139,6 +2159,19 @@ mod tests {
             &response("matched"),
             10.0,
             0.50
+        ));
+    }
+
+    #[test]
+    fn trailing_exit_sell_size_dust_is_not_dispatched() {
+        assert!(trailing_exit_sell_size_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST
+        ));
+        assert!(trailing_exit_sell_size_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST / 2.0
+        ));
+        assert!(!trailing_exit_sell_size_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST * 2.0
         ));
     }
 

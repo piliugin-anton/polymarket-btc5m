@@ -21,7 +21,9 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_activity::RollingTradedNotional;
 use crate::market_profile::MarketProfile;
-use crate::take_profit::{clob_order_has_open_size, clob_order_remaining_size};
+use crate::take_profit::{
+    clob_order_has_open_size, clob_order_remaining_size, CLOB_ORDER_REMAINING_DUST,
+};
 use crate::trading::{
     canonical_clob_token_id, clob_asset_ids_match, norm_clob_owner, norm_order_id_key,
     parse_clob_side_str, taker_trade_fill_shares, ClobMakerOrder, ClobOpenOrder, ClobTrade,
@@ -706,9 +708,11 @@ impl AppState {
             || self
                 .outcome_for_active_token(token_id)
                 .is_some_and(|outcome| {
-                    self.open_orders
-                        .iter()
-                        .any(|o| o.side == Side::Sell && o.outcome == outcome && o.remaining > 1e-9)
+                    self.open_orders.iter().any(|o| {
+                        o.side == Side::Sell
+                            && o.outcome == outcome
+                            && o.remaining > CLOB_ORDER_REMAINING_DUST
+                    })
                 })
     }
 
@@ -1072,7 +1076,10 @@ impl AppState {
 
         let live_shares = self.trail_live_shares(&sess);
         let remaining_plan = (sess.plan_sell_shares - sold_qty).max(0.0).min(live_shares);
-        if live_shares <= 1e-9 || remaining_plan <= 1e-9 || sess.trail_bps == 0 {
+        if live_shares <= CLOB_ORDER_REMAINING_DUST
+            || remaining_plan <= CLOB_ORDER_REMAINING_DUST
+            || sess.trail_bps == 0
+        {
             return false;
         }
 
@@ -1280,7 +1287,7 @@ impl AppState {
         // became wrong when the feed switched from mid to best bid — bid at the stop is often
         // ≤ entry even for profitable round-trips (spread), which suppressed all SELLs.
         let sh = live.min(plan);
-        if sh > 1e-9 {
+        if sh > CLOB_ORDER_REMAINING_DUST {
             if !self.trailing_sell_queued_or_in_flight(&token_id) {
                 self.pending_trailing_sells.push_back(TrailingExit {
                     token_id,
@@ -1295,6 +1302,7 @@ impl AppState {
                 outcome.as_str()
             );
         } else {
+            self.remove_trailing_and_pending_arm_for_token(&token_id);
             self.status_line = format!(
                 "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — no shares to SELL",
                 outcome.as_str()
@@ -1903,10 +1911,10 @@ impl AppState {
                     let mut re_armed = false;
                     if let Some(sess) = had_sess {
                         let pos_sh = self.trail_live_shares(&sess);
-                        if pos_sh > 1e-9
+                        if pos_sh > CLOB_ORDER_REMAINING_DUST
                             && sess.trail_bps > 0
                             && sess.plan_sell_shares.is_finite()
-                            && sess.plan_sell_shares > 0.0
+                            && sess.plan_sell_shares > CLOB_ORDER_REMAINING_DUST
                         {
                             let entry = if self
                                 .market
@@ -1960,7 +1968,8 @@ impl AppState {
                 } else if let Some(k) = trailing_map_key_for_asset(&self.trailing, tid.as_str()) {
                     let remove = match self.trailing.get(&k) {
                         Some(sess) => {
-                            sess.stop.is_triggered() || self.trail_live_shares(sess) <= 1e-9
+                            sess.stop.is_triggered()
+                                || self.trail_live_shares(sess) <= CLOB_ORDER_REMAINING_DUST
                         }
                         None => true,
                     };
@@ -3965,6 +3974,126 @@ mod tests {
         assert!(
             s.trailing.contains_key("UP_PART_SELL"),
             "dispatch success must not clear a re-armed residual trail"
+        );
+    }
+
+    /// A near-full trailing SELL can leave CLOB/UI dust. That residual is below the exchange's
+    /// usable order size, so trailing must unregister instead of re-arming a zero-amount SELL.
+    #[tokio::test]
+    async fn trailing_near_full_sell_ack_clears_dust_residual() {
+        let mut s = test_state();
+        let m = test_market("UP_DUST_SELL", "DOWN_DUST_SELL", "0xdustsell");
+        s.market = Some(m.clone());
+        s.buy_trail_bps = 100;
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_DUST_SELL".into(),
+            bids: vec![BookLevel {
+                price: 0.55,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.57,
+                size: 100.0,
+            }],
+        }));
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_DUST_SELL".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.trailing_sell_in_flight.insert("UP_DUST_SELL".into());
+
+        s.apply(AppEvent::OrderAck {
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            qty: 10.0 - crate::take_profit::CLOB_ORDER_REMAINING_DUST / 2.0,
+            price: 0.54,
+            clob_order_id: Some("near-full-trailing-sell".into()),
+            token_id: "UP_DUST_SELL".into(),
+        })
+        .await;
+
+        assert!(
+            s.position(Outcome::Up).shares < crate::take_profit::CLOB_ORDER_REMAINING_DUST,
+            "test setup should leave only dust"
+        );
+        assert!(
+            !s.trailing.contains_key("UP_DUST_SELL"),
+            "dust residual should unregister trailing instead of re-arming"
+        );
+    }
+
+    /// If only dust inventory remains when a trail trips, do not queue a FAK SELL that will round
+    /// to zero maker/taker amounts.
+    #[tokio::test]
+    async fn trailing_trigger_with_dust_inventory_unregisters_without_queueing() {
+        let mut s = test_state();
+        let m = test_market("UP_DUST_TRIGGER", "DOWN_DUST_TRIGGER", "0xdusttrigger");
+        s.market = Some(m.clone());
+        s.position_up = Position {
+            shares: crate::take_profit::CLOB_ORDER_REMAINING_DUST / 2.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_DUST_TRIGGER".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_DUST_TRIGGER".into(),
+            trail_bps: 500,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DUST_TRIGGER".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }))
+        .await;
+
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DUST_TRIGGER".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+
+        assert!(s.pending_trailing_sells.is_empty());
+        assert!(
+            !s.trailing.contains_key("UP_DUST_TRIGGER"),
+            "dust-only position should unregister the triggered trail"
         );
     }
 
