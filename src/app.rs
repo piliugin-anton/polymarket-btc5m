@@ -21,6 +21,10 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_activity::RollingTradedNotional;
 use crate::market_profile::MarketProfile;
+use crate::strategy::{
+    evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
+    ManualSignalSentiment,
+};
 use crate::take_profit::{
     clob_order_has_open_size, clob_order_remaining_size, CLOB_ORDER_REMAINING_DUST,
 };
@@ -771,6 +775,49 @@ impl AppState {
     pub fn mark(&self, outcome: Outcome) -> Option<f64> {
         let b = self.book_for(outcome)?;
         book_mid(b)
+    }
+
+    pub fn manual_signal_label(&self) -> ManualSignalLabel {
+        evaluate_manual_signal(&ManualSignalInput {
+            spot_price: self.spot_price,
+            price_to_beat: self.price_to_beat(),
+            up: self.manual_signal_book_side(Outcome::Up),
+            down: self.manual_signal_book_side(Outcome::Down),
+            seconds_to_close: self.cached_countdown_secs.or_else(|| {
+                self.market
+                    .as_ref()
+                    .map(|m| (m.closes_at - Utc::now()).num_seconds().max(0))
+            }),
+            window_secs: self.manual_signal_window_secs(),
+            sentiment: match self.cached_sentiment {
+                SentimentDir::Up => ManualSignalSentiment::Up,
+                SentimentDir::Down => ManualSignalSentiment::Down,
+                SentimentDir::Neutral => ManualSignalSentiment::Neutral,
+                SentimentDir::Unknown => ManualSignalSentiment::Unknown,
+            },
+            activity_notional_60s: self.cached_market_activity_notional,
+        })
+    }
+
+    fn manual_signal_book_side(&self, outcome: Outcome) -> ManualSignalBookSide {
+        let book = self.book_for(outcome);
+        ManualSignalBookSide {
+            best_bid: book.and_then(|b| b.bids.first().map(|l| l.price)),
+            best_ask: book.and_then(|b| b.asks.first().map(|l| l.price)),
+            best_ask_size: book.and_then(|b| b.asks.first().map(|l| l.size)),
+        }
+    }
+
+    fn manual_signal_window_secs(&self) -> Option<i64> {
+        self.market_profile
+            .as_ref()
+            .and_then(|p| p.timeframe.window_sec_rolling())
+            .or_else(|| {
+                self.market
+                    .as_ref()
+                    .map(|m| (m.closes_at - m.opens_at).num_seconds())
+                    .filter(|s| *s > 0)
+            })
     }
 
     /// Best bid for `token_id` (UI or watched book).
@@ -2838,6 +2885,42 @@ mod tests {
             size,
             ts_ms,
         }
+    }
+
+    fn book(asset_id: &str, bid: f64, ask: f64, ask_size: f64) -> BookSnapshot {
+        BookSnapshot {
+            asset_id: asset_id.to_string(),
+            bids: vec![BookLevel {
+                price: bid,
+                size: 50.0,
+            }],
+            asks: vec![BookLevel {
+                price: ask,
+                size: ask_size,
+            }],
+        }
+    }
+
+    #[test]
+    fn app_state_exposes_manual_strategy_signal_from_live_ui_data() {
+        let mut s = test_state();
+        let now = Utc::now();
+        let mut m = test_market("111", "222", "cond");
+        m.price_to_beat = Some(100.0);
+        m.opens_at = now - chrono::Duration::seconds(180);
+        m.closes_at = now + chrono::Duration::seconds(120);
+        s.market = Some(m);
+        s.spot_price = Some(100.80);
+        s.book_up = Some(Arc::new(book("111", 0.34, 0.35, 80.0)));
+        s.book_down = Some(Arc::new(book("222", 0.65, 0.66, 80.0)));
+        s.cached_countdown_secs = Some(120);
+        s.cached_sentiment = SentimentDir::Down;
+        s.cached_market_activity_notional = 500.0;
+
+        assert_eq!(
+            s.manual_signal_label(),
+            crate::strategy::ManualSignalLabel::StrongUp
+        );
     }
 
     fn trade(

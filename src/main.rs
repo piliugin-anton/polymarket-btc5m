@@ -32,6 +32,7 @@ mod market_profile;
 mod poly1271;
 mod polymarket_relayer;
 mod redeem;
+mod strategy;
 mod take_profit;
 
 use market_profile::{MarketProfile, Timeframe, CRYPTO_ASSETS};

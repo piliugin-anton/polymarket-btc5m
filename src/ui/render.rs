@@ -22,6 +22,7 @@ use crate::app::{
 use crate::bridge_deposit::SOLANA_MAINNET_USDC_MINT;
 use crate::market_activity::format_compact_notional;
 use crate::market_profile::Timeframe;
+use crate::strategy::ManualSignalLabel;
 
 const SPACES: &str = "                                "; // 32 spaces — wider than any balance panel
 const HELP_KEYS_LINES: u16 = 1;
@@ -322,6 +323,19 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
+    let signal = s.manual_signal_label();
+    line1_parts.push(Span::raw("  "));
+    line1_parts.push(Span::styled(
+        "Signal:",
+        Style::default().fg(Color::DarkGray),
+    ));
+    line1_parts.push(Span::raw(" "));
+    line1_parts.push(Span::styled(
+        signal.as_str(),
+        Style::default()
+            .fg(manual_signal_color(signal))
+            .add_modifier(Modifier::BOLD),
+    ));
     let line1 = Line::from(line1_parts);
     // Line 2: price to beat + countdown + market (+ background trailing sessions)
     let bg_trail = s.background_trail_count();
@@ -372,6 +386,15 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
         .block(block)
         .wrap(Wrap { trim: false });
     f.render_widget(p, area);
+}
+
+fn manual_signal_color(signal: ManualSignalLabel) -> Color {
+    match signal {
+        ManualSignalLabel::NoTrade => Color::DarkGray,
+        ManualSignalLabel::Watch => Color::Yellow,
+        ManualSignalLabel::StrongUp => Color::Green,
+        ManualSignalLabel::StrongDown => Color::Red,
+    }
 }
 
 // ── Main (book + positions) ─────────────────────────────────────────
