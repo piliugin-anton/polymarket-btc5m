@@ -27,6 +27,7 @@ const SPACES: &str = "                                "; // 32 spaces — wider 
 const HELP_KEYS_LINES: u16 = 1;
 /// Key row + rounded block border (top + bottom).
 const HELP_BLOCK_HEIGHT: u16 = HELP_KEYS_LINES + 2;
+const UPNL_DUST_USDC: f64 = 0.01;
 
 pub fn draw(f: &mut Frame, s: &AppState) {
     let now = Instant::now();
@@ -492,7 +493,7 @@ fn draw_positions(f: &mut Frame, area: Rect, s: &AppState) {
 
 fn render_position_line(f: &mut Frame, area: Rect, s: &AppState, outcome: Outcome, colour: Color) {
     let p = s.position(outcome);
-    let upnl = s.unrealized_pnl(outcome);
+    let upnl = display_upnl(s.unrealized_pnl(outcome));
     let mark = s
         .mark(outcome)
         .map(|m| format!("{:.2}", m))
@@ -1223,9 +1224,35 @@ fn pnl_style(v: f64) -> Style {
     }
 }
 
+fn display_upnl(v: f64) -> f64 {
+    if v.is_finite() && v.abs() < UPNL_DUST_USDC {
+        0.0
+    } else {
+        v
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    use crate::feeds::{
+        clob_ws::{BookLevel, BookSnapshot},
+        user_trade_sync::UserTradeSync,
+    };
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+    fn find_text(buf: &Buffer, needle: &str) -> Option<(u16, u16)> {
+        let width = buf.area.width as usize;
+        for (y, row) in buf.content().chunks(width).enumerate() {
+            let line = row.iter().map(|c| c.symbol()).collect::<String>();
+            if let Some(x) = line.find(needle) {
+                return Some((x as u16, y as u16));
+            }
+        }
+        None
+    }
 
     #[test]
     fn fmt_money_basic() {
@@ -1259,5 +1286,41 @@ mod tests {
     #[test]
     fn help_block_height_matches_layout() {
         assert_eq!(HELP_BLOCK_HEIGHT, HELP_KEYS_LINES + 2);
+    }
+
+    #[test]
+    fn upnl_display_treats_sub_cent_changes_as_dust() {
+        let mut state = AppState::new(10.0, 0.50, Arc::new(UserTradeSync::new()));
+        state.ui_phase = UiPhase::Trading;
+        state.position_up = crate::app::Position {
+            shares: 1.0,
+            // With a 0.50 mark and taker sell fee, this produces +$0.009 uPnL.
+            avg_entry: 0.473,
+        };
+        state.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "up".to_string(),
+            bids: vec![BookLevel {
+                price: 0.49,
+                size: 1.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.51,
+                size: 1.0,
+            }],
+        }));
+
+        let backend = TestBackend::new(100, 32);
+        let mut terminal = Terminal::new(backend).expect("test terminal");
+        terminal
+            .draw(|f| draw(f, &state))
+            .expect("draw should succeed");
+        let buf = terminal.backend().buffer();
+
+        let (x, y) = find_text(buf, "uPnL $+0.00").expect("dust uPnL should render as zero");
+        assert_eq!(buf[(x, y)].fg, Color::Gray);
+        assert!(
+            find_text(buf, "uPnL $+0.01").is_none(),
+            "sub-cent uPnL should not round up into a colored gain"
+        );
     }
 }
