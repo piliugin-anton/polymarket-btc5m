@@ -49,6 +49,12 @@ pub enum SignatureType {
     Poly1271 = 3,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutotradingSignalMin {
+    Strong,
+    Watch,
+}
+
 /// Runtime configuration — resolved once at startup.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -95,6 +101,9 @@ pub struct Config {
     /// Optional safety cap for automatic GTD limit BUY entries. When set, autotrading skips a
     /// STRONG signal if the snapshot best ask is above this price.
     pub autotrading_max_entry_price: Option<f64>,
+    /// Minimum strategy label that may submit automatic BUYs. `Strong` preserves legacy behavior;
+    /// `Watch` allows earlier, lower-confidence entries when the direction is already clear.
+    pub autotrading_signal_min: AutotradingSignalMin,
     /// Multiplier on the required spot-vs-Price-to-Beat gap for a `STRONG` signal (default `1.0`).
     /// Clamped to roughly `[0.55, 1.15]` — values below `1.0` fire more often but are less selective.
     pub strategy_strong_gap_mult: f64,
@@ -214,6 +223,8 @@ impl Config {
         let autotrading_max_entry_price = parse_autotrading_max_entry_price(
             std::env::var("AUTOTRADING_MAX_ENTRY_PRICE").ok().as_deref(),
         );
+        let autotrading_signal_min =
+            parse_autotrading_signal_min(std::env::var("AUTOTRADING_SIGNAL_MIN").ok().as_deref());
 
         let strategy_strong_gap_mult = parse_strategy_strong_gap_mult(
             std::env::var("STRATEGY_STRONG_GAP_MULT").ok().as_deref(),
@@ -303,6 +314,7 @@ impl Config {
             autotrading_max_positions,
             autotrading_order_expires_after_secs,
             autotrading_max_entry_price,
+            autotrading_signal_min,
             strategy_strong_gap_mult,
             strategy_max_spread_mult,
             strategy_min_top_ask_shares,
@@ -353,6 +365,13 @@ fn parse_autotrading_max_entry_price(value: Option<&str>) -> Option<f64> {
         .filter(|p| p.is_finite() && (0.01..=0.99).contains(p))
 }
 
+fn parse_autotrading_signal_min(value: Option<&str>) -> AutotradingSignalMin {
+    match value.map(str::trim).map(str::to_ascii_lowercase).as_deref() {
+        Some("watch") => AutotradingSignalMin::Watch,
+        _ => AutotradingSignalMin::Strong,
+    }
+}
+
 fn parse_strategy_strong_gap_mult(value: Option<&str>) -> f64 {
     const DEFAULT: f64 = 1.0;
     let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
@@ -401,10 +420,10 @@ fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
 mod tests {
     use super::{
         parse_autotrading_max_entry_price, parse_autotrading_max_positions,
-        parse_autotrading_order_expires_after_secs, parse_env_bool,
+        parse_autotrading_order_expires_after_secs, parse_autotrading_signal_min, parse_env_bool,
         parse_round_log_snap_interval_secs, parse_strategy_max_spread_mult,
         parse_strategy_min_top_ask_shares, parse_strategy_strong_gap_mult,
-        parse_strategy_watch_ratio,
+        parse_strategy_watch_ratio, AutotradingSignalMin,
     };
 
     #[test]
@@ -452,6 +471,34 @@ mod tests {
         assert_eq!(parse_autotrading_max_entry_price(Some("1.0")), None);
         assert_eq!(parse_autotrading_max_entry_price(Some("0.95")), Some(0.95));
         assert_eq!(parse_autotrading_max_entry_price(Some("0.99")), Some(0.99));
+    }
+
+    #[test]
+    fn parse_autotrading_signal_min_defaults_to_strong_and_accepts_watch() {
+        assert_eq!(
+            parse_autotrading_signal_min(None),
+            AutotradingSignalMin::Strong
+        );
+        assert_eq!(
+            parse_autotrading_signal_min(Some("")),
+            AutotradingSignalMin::Strong
+        );
+        assert_eq!(
+            parse_autotrading_signal_min(Some("strong")),
+            AutotradingSignalMin::Strong
+        );
+        assert_eq!(
+            parse_autotrading_signal_min(Some("watch")),
+            AutotradingSignalMin::Watch
+        );
+        assert_eq!(
+            parse_autotrading_signal_min(Some("WATCH")),
+            AutotradingSignalMin::Watch
+        );
+        assert_eq!(
+            parse_autotrading_signal_min(Some("no-trade")),
+            AutotradingSignalMin::Strong
+        );
     }
 
     #[test]

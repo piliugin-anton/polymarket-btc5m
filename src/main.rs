@@ -161,14 +161,34 @@ struct AutoTradingSnapshot {
 }
 
 impl AutoTradingSnapshot {
-    fn from_state(state: &AppState) -> Self {
+    fn from_state(state: &AppState, signal_min: config::AutotradingSignalMin) -> Self {
         Self {
             market: state.market.clone(),
-            signal_outcome: state.manual_signal_buy_outcome(),
+            signal_outcome: autotrading_signal_outcome(state, signal_min),
             size_usdc: state.current_size(),
             best_ask_up: state.best_ask(Outcome::Up),
             best_ask_down: state.best_ask(Outcome::Down),
         }
+    }
+}
+
+fn autotrading_signal_outcome(
+    state: &AppState,
+    signal_min: config::AutotradingSignalMin,
+) -> Option<Outcome> {
+    let label = state.manual_signal_label();
+    if let Some(outcome) = app::manual_signal_label_to_buy_outcome(label) {
+        return Some(outcome);
+    }
+    if signal_min != config::AutotradingSignalMin::Watch
+        || label != strategy::ManualSignalLabel::Watch
+    {
+        return None;
+    }
+    match state.spot_above_target() {
+        Some(true) => Some(Outcome::Up),
+        Some(false) => Some(Outcome::Down),
+        None => None,
     }
 }
 
@@ -372,7 +392,10 @@ fn update_autotrading_snapshot_and_maybe_spawn(
     autotrading_snapshot_tx: &watch::Sender<AutoTradingSnapshot>,
     autotrading_snapshot_rx: &watch::Receiver<AutoTradingSnapshot>,
 ) {
-    let _ = autotrading_snapshot_tx.send(AutoTradingSnapshot::from_state(state));
+    let _ = autotrading_snapshot_tx.send(AutoTradingSnapshot::from_state(
+        state,
+        cfg.autotrading_signal_min,
+    ));
     try_spawn_autotrading_buy(state, trading, tx, cfg, autotrading_snapshot_rx);
 }
 
@@ -702,7 +725,7 @@ fn try_spawn_autotrading_buy(
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
     };
-    let snapshot = AutoTradingSnapshot::from_state(state);
+    let snapshot = AutoTradingSnapshot::from_state(state, cfg.autotrading_signal_min);
     let Some(resolved) = resolve_autotrading_limit_buy_at_signal(
         &snapshot,
         outcome,
@@ -2333,8 +2356,9 @@ async fn main() -> Result<()> {
     } else {
         None
     };
-    let (autotrading_snapshot_tx, autotrading_snapshot_rx) =
-        watch::channel(AutoTradingSnapshot::from_state(&state));
+    let (autotrading_snapshot_tx, autotrading_snapshot_rx) = watch::channel(
+        AutoTradingSnapshot::from_state(&state, cfg.autotrading_signal_min),
+    );
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);
@@ -2766,7 +2790,7 @@ mod tests {
     #[test]
     fn autotrading_snapshot_resolves_buy_from_current_tui_size() {
         let state = test_autotrading_state();
-        let snap = AutoTradingSnapshot::from_state(&state);
+        let snap = AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
         let resolved =
             resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", None).unwrap();
 
@@ -2775,9 +2799,29 @@ mod tests {
     }
 
     #[test]
+    fn autotrading_snapshot_can_use_watch_signal_when_configured() {
+        let mut state = test_autotrading_state();
+        state.spot_price = Some(100.13);
+
+        let strong_only =
+            AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
+        assert!(
+            resolve_autotrading_limit_buy_at_signal(&strong_only, Outcome::Up, "111", None)
+                .is_none()
+        );
+
+        let watch_allowed =
+            AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Watch);
+        let resolved =
+            resolve_autotrading_limit_buy_at_signal(&watch_allowed, Outcome::Up, "111", Some(0.95))
+                .unwrap();
+        assert!((resolved.price - 0.50).abs() < 1e-9);
+    }
+
+    #[test]
     fn autotrading_snapshot_rejects_buy_above_max_entry_price() {
         let state = test_autotrading_state();
-        let snap = AutoTradingSnapshot::from_state(&state);
+        let snap = AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
 
         assert!(
             resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", Some(0.49))
@@ -2792,18 +2836,18 @@ mod tests {
     #[test]
     fn autotrading_snapshot_rejects_when_signal_flips_or_market_rolls() {
         let mut state = test_autotrading_state();
-        let snap = AutoTradingSnapshot::from_state(&state);
+        let snap = AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
         assert!(resolve_autotrading_limit_buy_at_signal(&snap, Outcome::Up, "111", None).is_some());
 
         state.spot_price = Some(99.70);
-        let flipped = AutoTradingSnapshot::from_state(&state);
+        let flipped = AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
         assert!(
             resolve_autotrading_limit_buy_at_signal(&flipped, Outcome::Up, "111", None).is_none()
         );
 
         state.spot_price = Some(100.30);
         state.market.as_mut().unwrap().up_token_id = "333".into();
-        let rolled = AutoTradingSnapshot::from_state(&state);
+        let rolled = AutoTradingSnapshot::from_state(&state, config::AutotradingSignalMin::Strong);
         assert!(
             resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111", None).is_none()
         );
