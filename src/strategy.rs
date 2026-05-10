@@ -57,11 +57,6 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
     let Some(target) = finite_positive(input.price_to_beat) else {
         return ManualSignalLabel::NoTrade;
     };
-    let max_spread = adaptive_max_spread(input.seconds_to_close, input.window_secs);
-    if !input.up.is_usable(max_spread) || !input.down.is_usable(max_spread) {
-        return ManualSignalLabel::NoTrade;
-    }
-
     let diff = spot - target;
     let gap = (diff / target).abs();
     let direction = if diff > 0.0 {
@@ -72,18 +67,23 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
         return ManualSignalLabel::NoTrade;
     };
 
-    let candidate_price = match direction {
-        Direction::Up => input.up.best_ask.unwrap_or(1.0),
-        Direction::Down => input.down.best_ask.unwrap_or(1.0),
+    let max_spread = adaptive_max_spread(input.seconds_to_close, input.window_secs);
+    let candidate_book = match direction {
+        Direction::Up => input.up,
+        Direction::Down => input.down,
     };
-    let strong_gap = required_strong_gap(candidate_price, direction, input);
+    if !candidate_book.is_usable(max_spread) {
+        return ManualSignalLabel::NoTrade;
+    }
+
+    let strong_gap = required_strong_gap(direction, input);
     if gap >= strong_gap {
         return match direction {
             Direction::Up => ManualSignalLabel::StrongUp,
             Direction::Down => ManualSignalLabel::StrongDown,
         };
     }
-    if gap >= strong_gap * 0.30 {
+    if gap >= strong_gap * 0.60 {
         ManualSignalLabel::Watch
     } else {
         ManualSignalLabel::NoTrade
@@ -134,18 +134,8 @@ fn adaptive_max_spread(seconds_to_close: Option<i64>, window_secs: Option<i64>) 
     }
 }
 
-fn required_strong_gap(price: f64, direction: Direction, input: &ManualSignalInput) -> f64 {
-    let base = if price >= 0.70 {
-        0.0008
-    } else if price >= 0.55 {
-        0.0015
-    } else if price >= 0.40 {
-        0.0030
-    } else if price >= 0.20 {
-        0.0060
-    } else {
-        0.0100
-    };
+fn required_strong_gap(direction: Direction, input: &ManualSignalInput) -> f64 {
+    let base = time_weighted_strong_gap(input.seconds_to_close, input.window_secs);
 
     let sentiment_mult = match (direction, input.sentiment) {
         (Direction::Up, ManualSignalSentiment::Down)
@@ -163,6 +153,36 @@ fn required_strong_gap(price: f64, direction: Direction, input: &ManualSignalInp
     };
 
     base * sentiment_mult * activity_mult
+}
+
+fn time_weighted_strong_gap(seconds_to_close: Option<i64>, window_secs: Option<i64>) -> f64 {
+    let Some(secs) = seconds_to_close else {
+        return 0.0020;
+    };
+    let Some(window) = window_secs.filter(|w| *w > 0) else {
+        return if secs <= 30 { 0.0008 } else { 0.0020 };
+    };
+
+    let elapsed_ratio = 1.0 - (secs.max(0) as f64 / window as f64);
+    if window >= 900 {
+        if secs <= 60 || elapsed_ratio >= 0.90 {
+            0.0008
+        } else if elapsed_ratio >= 0.66 {
+            0.0018
+        } else if elapsed_ratio >= 0.33 {
+            0.0035
+        } else {
+            0.0060
+        }
+    } else if secs <= 30 || elapsed_ratio >= 0.90 {
+        0.0008
+    } else if elapsed_ratio >= 0.66 {
+        0.0012
+    } else if elapsed_ratio >= 0.33 {
+        0.0020
+    } else {
+        0.0045
+    }
 }
 
 #[cfg(test)]
@@ -213,13 +233,13 @@ mod tests {
     }
 
     #[test]
-    fn cheap_entries_need_more_spot_edge_than_moderate_entries() {
+    fn mid_round_moderate_edge_can_be_strong_at_any_candidate_price() {
         let mut input = base_input();
         input.spot_price = Some(100.20);
         input.up = side(0.34, 0.35, 80.0);
         input.down = side(0.65, 0.66, 80.0);
 
-        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::Watch);
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
     }
 
     #[test]
@@ -296,9 +316,9 @@ mod tests {
     }
 
     #[test]
-    fn high_priced_favorite_needs_less_spot_edge_than_cheap_contrarian() {
+    fn candidate_price_does_not_change_required_edge() {
         let mut input = base_input();
-        input.spot_price = Some(100.10);
+        input.spot_price = Some(100.20);
         input.up = side(0.74, 0.75, 80.0);
         input.down = side(0.24, 0.25, 80.0);
 
@@ -307,13 +327,64 @@ mod tests {
         input.up = side(0.24, 0.25, 80.0);
         input.down = side(0.74, 0.75, 80.0);
 
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
+    }
+
+    #[test]
+    fn late_round_small_edge_can_be_strong_because_close_price_decides() {
+        let mut input = base_input();
+        input.spot_price = Some(100.09);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.49, 0.50, 80.0);
+        input.down = side(0.49, 0.50, 80.0);
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
+    }
+
+    #[test]
+    fn early_round_same_edge_is_no_trade_due_to_mean_reversion_risk() {
+        let mut input = base_input();
+        input.spot_price = Some(100.20);
+        input.seconds_to_close = Some(240);
+        input.window_secs = Some(300);
+        input.up = side(0.49, 0.50, 80.0);
+        input.down = side(0.49, 0.50, 80.0);
+
         assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn fifteen_minute_early_round_requires_more_edge_than_five_minute() {
+        let mut input = base_input();
+        input.spot_price = Some(100.45);
+        input.seconds_to_close = Some(240);
+        input.window_secs = Some(300);
+        input.up = side(0.49, 0.50, 80.0);
+        input.down = side(0.49, 0.50, 80.0);
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
+
+        input.seconds_to_close = Some(720);
+        input.window_secs = Some(900);
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::Watch);
+    }
+
+    #[test]
+    fn only_candidate_side_needs_usable_book() {
+        let mut input = base_input();
+        input.spot_price = Some(100.20);
+        input.up = side(0.49, 0.50, 80.0);
+        input.down = side(0.30, 0.36, 80.0);
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
     }
 
     #[test]
     fn aligned_sentiment_can_lift_borderline_signal_to_strong() {
         let mut input = base_input();
-        input.spot_price = Some(100.28);
+        input.spot_price = Some(100.19);
         input.up = side(0.44, 0.45, 80.0);
         input.down = side(0.54, 0.55, 80.0);
 
@@ -327,7 +398,7 @@ mod tests {
     #[test]
     fn opposing_sentiment_can_downgrade_borderline_signal_to_watch() {
         let mut input = base_input();
-        input.spot_price = Some(100.31);
+        input.spot_price = Some(100.21);
         input.up = side(0.44, 0.45, 80.0);
         input.down = side(0.54, 0.55, 80.0);
 
@@ -341,7 +412,7 @@ mod tests {
     #[test]
     fn low_activity_requires_more_edge_than_high_activity() {
         let mut input = base_input();
-        input.spot_price = Some(100.28);
+        input.spot_price = Some(100.21);
         input.up = side(0.44, 0.45, 80.0);
         input.down = side(0.54, 0.55, 80.0);
         input.activity_notional_60s = 50.0;
