@@ -132,6 +132,10 @@ Optional but useful:
 | `AUTOTRADING` | `true` enables automatic **GTD limit BUY** entries at the **best ask seen when the `STRONG UP` / `STRONG DOWN` signal fires** (`false` by default) |
 | `AUTOTRADING_MAX_POSITIONS` | Maximum currently open auto-trading positions; sold/closed auto inventory frees capacity (`1` by default) |
 | `AUTOTRADING_ORDER_EXPIRES_AFTER` | Optional. Positive **seconds**: autotrading GTD BUY expires about that long after the order is built (Polymarket uses a +60s signing offset; unset = same as manual limits — expire near **window end**) |
+| `STRATEGY_STRONG_GAP_MULT` | **Safest first knob** for more `STRONG` signals: multiply the required spot-vs-Price-to-Beat gap (default `1.0`, clamped ~`0.55`–`1.15`). Try `0.85`–`0.92` before loosening spreads |
+| `STRATEGY_MAX_SPREAD_MULT` | Scale max allowed bid–ask spread for strategy book checks (default `1.0`, up to ~`1.35`). **Higher → more signals, worse fill risk** |
+| `STRATEGY_MIN_TOP_ASK_SHARES` | Minimum best-ask size to treat a book as tradable (default `5`, clamped `2`–`50`). **Lower → more signals, thinner book risk** |
+| `STRATEGY_WATCH_RATIO` | `WATCH` when gap ≥ this fraction of the strong threshold (default `0.60`, clamped ~`0.40`–`0.85`). **Lower → more `WATCH`** (does not change autotrading; only `STRONG` auto-buys) |
 | `BUY_TRAIL_BPS` | Trailing stop width in bps from peak best bid (`0` = off). Applies after **market or limit** buys that arm the trail. Legacy: `MARKET_BUY_TRAIL_BPS` is used if `BUY_TRAIL_BPS` is unset |
 | `TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). With `BUY_TRAIL_BPS` at `0`, also places an auto **GTD take-profit sell** after a **market or limit** buy fills (POST fill or maker fill on user WebSocket). Legacy: `MARKET_BUY_TAKE_PROFIT_BPS` is used if `TAKE_PROFIT_BPS` is unset |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
@@ -219,6 +223,19 @@ GTD orders expire one second before the active window closes. The app enforces a
 - **Market SELL** (`a`/`d`) — size is **outcome shares**
 - **Limit BUY** — type the notional in USDC; the app converts to shares before submitting
 - **Limit SELL** — type shares directly
+
+### Strategy signal tuning
+
+The TUI strategy compares **live spot** to **Price to Beat** and requires a minimum **relative gap**, a **tight enough** spread on the candidate outcome’s book, and **enough** size on the best ask. Defaults are conservative, so `STRONG UP` / `STRONG DOWN` (and autotrading) may be rare.
+
+**Safer ways to get more triggers (in order):**
+
+1. **`STRATEGY_STRONG_GAP_MULT`** below `1.0` (e.g. `0.88`) — lowers the bar for `STRONG` without changing liquidity rules. Values are clamped (~`0.55`–`1.15`); going very low fires often but is less selective.
+2. **`STRATEGY_WATCH_RATIO`** below `0.60` (e.g. `0.50`) — you will see **`WATCH`** more often for feedback; autotrading still only follows **`STRONG`**.
+3. **`STRATEGY_MAX_SPREAD_MULT`** above `1.0` — allows wider spreads through the gate; **increases bad-price / poor-fill risk**.
+4. **`STRATEGY_MIN_TOP_ASK_SHARES`** below `5` (e.g. `3`) — allows thinner books; **partial fill / resting risk** rises.
+
+Restart the app after changing `.env`. Watch logs for loaded `strategy_*` values.
 
 ### Autotrading
 

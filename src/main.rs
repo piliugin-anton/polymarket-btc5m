@@ -1671,6 +1671,10 @@ async fn main() -> Result<()> {
         autotrading = cfg.autotrading,
         autotrading_max_positions = cfg.autotrading_max_positions,
         autotrading_order_expires_after_secs = ?cfg.autotrading_order_expires_after_secs,
+        strategy_strong_gap_mult = cfg.strategy_strong_gap_mult,
+        strategy_max_spread_mult = cfg.strategy_max_spread_mult,
+        strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares,
+        strategy_watch_ratio = cfg.strategy_watch_ratio,
         "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
@@ -2274,6 +2278,10 @@ async fn main() -> Result<()> {
     );
     state.autotrading_enabled = cfg.autotrading;
     state.autotrading_max_positions = cfg.autotrading_max_positions;
+    state.strategy_strong_gap_mult = cfg.strategy_strong_gap_mult;
+    state.strategy_max_spread_mult = cfg.strategy_max_spread_mult;
+    state.strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares;
+    state.strategy_watch_ratio = cfg.strategy_watch_ratio;
     let (autotrading_snapshot_tx, autotrading_snapshot_rx) =
         watch::channel(AutoTradingSnapshot::from_state(&state));
     let mut discovery_spawned = false;

@@ -92,6 +92,17 @@ pub struct Config {
     /// +60s signing offset — see [`crate::gamma::clob_gtd_expiration_secs_after_duration_from_now`]).
     /// When unset, expiration matches manual limits: end of the current market window.
     pub autotrading_order_expires_after_secs: Option<u64>,
+    /// Multiplier on the required spot-vs-Price-to-Beat gap for a `STRONG` signal (default `1.0`).
+    /// Clamped to roughly `[0.55, 1.15]` — values below `1.0` fire more often but are less selective.
+    pub strategy_strong_gap_mult: f64,
+    /// Multiplier on the max bid–ask spread allowed for strategy book checks (default `1.0`, max ~`1.35`).
+    /// Above `1.0` admits wider books → more signals, worse execution risk.
+    pub strategy_max_spread_mult: f64,
+    /// Minimum best-ask size (shares) for the strategy to treat a book as usable (default `5.0`).
+    /// Lower values (e.g. `3.0`) admit thinner liquidity.
+    pub strategy_min_top_ask_shares: f64,
+    /// `WATCH` when `gap >= strong_gap * ratio` (default `0.60`). Lower → more `WATCH` labels.
+    pub strategy_watch_ratio: f64,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -189,6 +200,18 @@ impl Config {
                 .as_deref(),
         );
 
+        let strategy_strong_gap_mult = parse_strategy_strong_gap_mult(
+            std::env::var("STRATEGY_STRONG_GAP_MULT").ok().as_deref(),
+        );
+        let strategy_max_spread_mult = parse_strategy_max_spread_mult(
+            std::env::var("STRATEGY_MAX_SPREAD_MULT").ok().as_deref(),
+        );
+        let strategy_min_top_ask_shares = parse_strategy_min_top_ask_shares(
+            std::env::var("STRATEGY_MIN_TOP_ASK_SHARES").ok().as_deref(),
+        );
+        let strategy_watch_ratio =
+            parse_strategy_watch_ratio(std::env::var("STRATEGY_WATCH_RATIO").ok().as_deref());
+
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -243,6 +266,10 @@ impl Config {
             autotrading,
             autotrading_max_positions,
             autotrading_order_expires_after_secs,
+            strategy_strong_gap_mult,
+            strategy_max_spread_mult,
+            strategy_min_top_ask_shares,
+            strategy_watch_ratio,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
@@ -271,10 +298,56 @@ fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64
         .filter(|n| *n > 0)
 }
 
+fn parse_strategy_strong_gap_mult(value: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 1.0;
+    let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
+        return DEFAULT;
+    };
+    if !raw.is_finite() {
+        return DEFAULT;
+    }
+    raw.clamp(0.55, 1.15)
+}
+
+fn parse_strategy_max_spread_mult(value: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 1.0;
+    let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
+        return DEFAULT;
+    };
+    if !raw.is_finite() {
+        return DEFAULT;
+    }
+    raw.clamp(1.0, 1.35)
+}
+
+fn parse_strategy_min_top_ask_shares(value: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 5.0;
+    let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
+        return DEFAULT;
+    };
+    if !raw.is_finite() {
+        return DEFAULT;
+    }
+    raw.clamp(2.0, 50.0)
+}
+
+fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
+    const DEFAULT: f64 = 0.60;
+    let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
+        return DEFAULT;
+    };
+    if !raw.is_finite() {
+        return DEFAULT;
+    }
+    raw.clamp(0.40, 0.85)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         parse_autotrading_max_positions, parse_autotrading_order_expires_after_secs, parse_env_bool,
+        parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
+        parse_strategy_strong_gap_mult, parse_strategy_watch_ratio,
     };
 
     #[test]
@@ -305,5 +378,24 @@ mod tests {
             None
         );
         assert_eq!(parse_autotrading_order_expires_after_secs(Some("120")), Some(120));
+    }
+
+    #[test]
+    fn parse_strategy_tuners_clamp_and_default() {
+        assert_eq!(parse_strategy_strong_gap_mult(None), 1.0);
+        assert_eq!(parse_strategy_strong_gap_mult(Some("0.8")), 0.8);
+        assert_eq!(parse_strategy_strong_gap_mult(Some("0.2")), 0.55);
+        assert_eq!(parse_strategy_strong_gap_mult(Some("2")), 1.15);
+
+        assert_eq!(parse_strategy_max_spread_mult(None), 1.0);
+        assert_eq!(parse_strategy_max_spread_mult(Some("1.2")), 1.2);
+        assert_eq!(parse_strategy_max_spread_mult(Some("0.5")), 1.0);
+
+        assert_eq!(parse_strategy_min_top_ask_shares(None), 5.0);
+        assert_eq!(parse_strategy_min_top_ask_shares(Some("3")), 3.0);
+        assert_eq!(parse_strategy_min_top_ask_shares(Some("1")), 2.0);
+
+        assert!((parse_strategy_watch_ratio(Some("0.5")) - 0.5).abs() < 1e-9);
+        assert!((parse_strategy_watch_ratio(Some("0.2")) - 0.40).abs() < 1e-9);
     }
 }

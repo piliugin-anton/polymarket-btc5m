@@ -563,6 +563,14 @@ pub struct AppState {
     pub autotrading_max_positions: usize,
     pub autotrading_open: HashMap<String, f64>,
     pub autotrading_in_flight: HashSet<String>,
+    /// Scales required spot gap for manual `STRONG` signal (from `STRATEGY_STRONG_GAP_MULT`).
+    pub strategy_strong_gap_mult: f64,
+    /// Scales max spread gate for strategy book usability (`STRATEGY_MAX_SPREAD_MULT`).
+    pub strategy_max_spread_mult: f64,
+    /// Minimum top-of-book ask size for strategy (`STRATEGY_MIN_TOP_ASK_SHARES`).
+    pub strategy_min_top_ask_shares: f64,
+    /// Watch threshold as fraction of strong gap (`STRATEGY_WATCH_RATIO`).
+    pub strategy_watch_ratio: f64,
 
     traded_activity: RollingTradedNotional,
 }
@@ -627,6 +635,10 @@ impl AppState {
             autotrading_max_positions: 1,
             autotrading_open: HashMap::new(),
             autotrading_in_flight: HashSet::new(),
+            strategy_strong_gap_mult: 1.0,
+            strategy_max_spread_mult: 1.0,
+            strategy_min_top_ask_shares: 5.0,
+            strategy_watch_ratio: 0.60,
             traded_activity: RollingTradedNotional::new(),
         }
     }
@@ -821,6 +833,10 @@ impl AppState {
                 SentimentDir::Unknown => ManualSignalSentiment::Unknown,
             },
             activity_notional_60s: self.cached_market_activity_notional,
+            strong_gap_mult: self.strategy_strong_gap_mult,
+            max_spread_mult: self.strategy_max_spread_mult,
+            min_top_ask_shares: self.strategy_min_top_ask_shares,
+            watch_ratio: self.strategy_watch_ratio,
         })
     }
 

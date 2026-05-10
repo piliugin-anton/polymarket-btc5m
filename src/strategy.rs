@@ -4,6 +4,10 @@
 //! **higher** than **Price to Beat**; **DOWN** pays off if the final price is **lower**. This module
 //! only compares **live spot** vs Price to Beat to suggest which *side* to consider — it does not
 //! implement resolution.
+//!
+//! Tunables (`ManualSignalInput`): `strong_gap_mult`, `max_spread_mult`, `min_top_ask_shares`, and
+//! `watch_ratio` are loaded from `.env` via [`crate::app::AppState`] (defaults preserve the original
+//! rubric). See project README — **Strategy signal tuning**.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualSignalLabel {
@@ -49,6 +53,14 @@ pub struct ManualSignalInput {
     pub window_secs: Option<i64>,
     pub sentiment: ManualSignalSentiment,
     pub activity_notional_60s: f64,
+    /// Scales the required spot-vs-target gap for `STRONG` (`1.0` = default; lower → more signals).
+    pub strong_gap_mult: f64,
+    /// Scales the max bid–ask spread allowed for a usable book (`1.0` = default; higher → more signals, worse execution risk).
+    pub max_spread_mult: f64,
+    /// Minimum best-ask size (shares) for a usable book (`5.0` = default; lower → more signals, thinner book risk).
+    pub min_top_ask_shares: f64,
+    /// `WATCH` when `gap >= strong_gap * watch_ratio` (`0.60` = default; lower → more `WATCH`, same `STRONG` threshold).
+    pub watch_ratio: f64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,23 +88,30 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
         return ManualSignalLabel::NoTrade;
     };
 
-    let max_spread = adaptive_max_spread(input.seconds_to_close, input.window_secs);
+    let max_spread_raw =
+        adaptive_max_spread(input.seconds_to_close, input.window_secs) * input.max_spread_mult;
+    let max_spread = if max_spread_raw.is_finite() {
+        max_spread_raw.clamp(0.005, 0.12)
+    } else {
+        0.02
+    };
     let candidate_book = match direction {
         Direction::Up => input.up,
         Direction::Down => input.down,
     };
-    if !candidate_book.is_usable(max_spread) {
+    if !candidate_book.is_usable(max_spread, input.min_top_ask_shares) {
         return ManualSignalLabel::NoTrade;
     }
 
-    let strong_gap = required_strong_gap(direction, input);
+    let strong_gap = (required_strong_gap(direction, input) * input.strong_gap_mult).max(1e-9);
     if gap >= strong_gap {
         return match direction {
             Direction::Up => ManualSignalLabel::StrongUp,
             Direction::Down => ManualSignalLabel::StrongDown,
         };
     }
-    if gap >= strong_gap * 0.60 {
+    let watch_ratio = input.watch_ratio.clamp(0.25, 0.90);
+    if gap >= strong_gap * watch_ratio {
         ManualSignalLabel::Watch
     } else {
         ManualSignalLabel::NoTrade
@@ -100,7 +119,7 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
 }
 
 impl ManualSignalBookSide {
-    fn is_usable(self, max_spread: f64) -> bool {
+    fn is_usable(self, max_spread: f64, min_top_ask_shares: f64) -> bool {
         let Some(bid) = finite_non_negative(self.best_bid) else {
             return false;
         };
@@ -110,10 +129,15 @@ impl ManualSignalBookSide {
         let Some(ask_size) = finite_positive(self.best_ask_size) else {
             return false;
         };
+        let min_ask = if min_top_ask_shares.is_finite() && min_top_ask_shares > 0.0 {
+            min_top_ask_shares
+        } else {
+            5.0
+        };
         (0.01..=0.99).contains(&bid)
             && (0.01..=0.99).contains(&ask)
             && ask > bid
-            && ask_size >= 5.0
+            && ask_size >= min_ask
             && (ask - bid) <= max_spread
     }
 }
@@ -216,7 +240,26 @@ mod tests {
             window_secs: Some(300),
             sentiment: ManualSignalSentiment::Neutral,
             activity_notional_60s: 500.0,
+            strong_gap_mult: 1.0,
+            max_spread_mult: 1.0,
+            min_top_ask_shares: 5.0,
+            watch_ratio: 0.60,
         }
+    }
+
+    #[test]
+    fn strong_gap_mult_below_one_can_promote_to_strong() {
+        let mut input = base_input();
+        // Early 5m window: base strong gap is high; this spot move is only a WATCH at default mult.
+        input.spot_price = Some(100.40);
+        input.seconds_to_close = Some(240);
+        input.window_secs = Some(300);
+        input.up = side(0.49, 0.50, 80.0);
+        input.down = side(0.49, 0.50, 80.0);
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::Watch);
+
+        input.strong_gap_mult = 0.80;
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
     }
 
     #[test]
