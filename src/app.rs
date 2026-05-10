@@ -39,6 +39,9 @@ pub const MIN_LIMIT_ORDER_SHARES: f64 = 5.0;
 /// like `tokio::sync::Semaphore(N)` to limit API / exchange load; see `try_dispatch_trailing_sell` in
 /// `main.rs`).
 pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
+/// After a trailing FAK partially fills, user-channel fills for the same CLOB order can arrive a few
+/// seconds later. During this window, keep the residual trail from firing a duplicate SELL.
+pub const TRAILING_PARTIAL_FILL_GRACE: Duration = Duration::from_secs(3);
 
 /// Map key in [`AppState::trailing`] for this CLOB asset.
 /// Two hash lookups: direct, then canonical form. Keys are always canonical, so this covers all cases.
@@ -523,6 +526,9 @@ pub struct AppState {
     /// `token_id`s with a `run_trailing_exit_fak_sell` task in progress; capped by
     /// [`TRAILING_SELL_MAX_PARALLEL`].
     pub trailing_sell_in_flight: HashSet<String>,
+    /// Residual trails re-armed after a partial trailing SELL; blocks duplicate triggers while
+    /// delayed fills for the same CLOB order can still arrive.
+    pub trailing_sell_partial_fill_grace_until: HashMap<String, Instant>,
     /// Cached result of `collect_book_watch_token_ids` — updated on every `apply()` call so
     /// `send_book_watch_if_changed` in `main.rs` can read it without recomputing.
     pub cached_book_watch_tokens: Vec<String>,
@@ -586,6 +592,7 @@ impl AppState {
             watched_books: HashMap::new(),
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
+            trailing_sell_partial_fill_grace_until: HashMap::new(),
             cached_book_watch_tokens: Vec::new(),
             book_watch_tokens_dirty: false,
             buy_trail_bps: 0,
@@ -705,6 +712,10 @@ impl AppState {
             .iter()
             .any(|e| e.token_id == token_id)
             || self.trailing_sell_in_flight.contains(token_id)
+            || self
+                .trailing_sell_partial_fill_grace_until
+                .get(token_id)
+                .is_some_and(|until| Instant::now() < *until)
             || self
                 .outcome_for_active_token(token_id)
                 .is_some_and(|outcome| {
@@ -1009,6 +1020,7 @@ impl AppState {
         self.watched_books.retain(|k, _| k != tid);
         self.pending_trailing_sells.retain(|e| e.token_id != tid);
         self.trailing_sell_in_flight.retain(|k| k != tid);
+        self.trailing_sell_partial_fill_grace_until.remove(tid);
         self.book_watch_tokens_dirty = true;
     }
 
@@ -1024,6 +1036,7 @@ impl AppState {
             self.pending_trail_arms.remove(&k);
             self.book_watch_tokens_dirty = true;
         }
+        self.trailing_sell_partial_fill_grace_until.remove(t);
     }
 
     /// After a BUY fill on the **active** UI market, unregister any trail/pending for that token and
@@ -1105,6 +1118,7 @@ impl AppState {
             sess.stop.entry_price()
         };
 
+        let token_id_for_grace = sess.token_id.clone();
         self.install_trailing_session(
             sess.market,
             sess.outcome,
@@ -1113,6 +1127,10 @@ impl AppState {
             sess.token_id,
             sess.trail_bps,
             live_shares.max(0.0),
+        );
+        self.trailing_sell_partial_fill_grace_until.insert(
+            token_id_for_grace,
+            Instant::now() + TRAILING_PARTIAL_FILL_GRACE,
         );
         true
     }
@@ -1259,6 +1277,9 @@ impl AppState {
             else {
                 return;
             };
+            if self.trailing_sell_queued_or_in_flight(sess.token_id.as_str()) {
+                return;
+            }
             sess.stop.on_price(bid)
         };
         let TickOutcome::Triggered { .. } = tick else {
@@ -1949,6 +1970,10 @@ impl AppState {
                             re_armed = true;
                         }
                     }
+                    if !re_armed {
+                        self.trailing_sell_partial_fill_grace_until
+                            .remove(tid.as_str());
+                    }
                     if let Some(e) = error {
                         let oc = session_outcome.unwrap_or(Outcome::Up);
                         self.status_line = if re_armed {
@@ -1975,6 +2000,8 @@ impl AppState {
                     };
                     if remove {
                         self.trailing.remove(&k);
+                        self.trailing_sell_partial_fill_grace_until
+                            .remove(tid.as_str());
                     }
                 }
             }
@@ -3974,6 +4001,108 @@ mod tests {
         assert!(
             s.trailing.contains_key("UP_PART_SELL"),
             "dispatch success must not clear a re-armed residual trail"
+        );
+    }
+
+    /// Delayed partial fills can arrive seconds apart. After the first partial fill re-arms the
+    /// residual, a book tick before the later fill must not trigger a duplicate trailing SELL.
+    #[tokio::test]
+    async fn trailing_delayed_partial_fill_gap_does_not_duplicate_sell() {
+        let mut s = test_state();
+        let m = test_market("UP_DELAY_PART", "DOWN_DELAY_PART", "0xdelaypart");
+        s.market = Some(m.clone());
+        s.buy_trail_bps = 100;
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_DELAY_PART".into(),
+            bids: vec![BookLevel {
+                price: 0.55,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.57,
+                size: 100.0,
+            }],
+        }));
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_DELAY_PART".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.trailing_sell_in_flight.insert("UP_DELAY_PART".into());
+
+        s.apply(AppEvent::OrderAck {
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            qty: 6.0,
+            price: 0.54,
+            clob_order_id: Some("delayed-partial-trailing-sell".into()),
+            token_id: "UP_DELAY_PART".into(),
+        })
+        .await;
+        s.apply(AppEvent::TrailingExitDispatchDone {
+            token_id: "UP_DELAY_PART".into(),
+            success: true,
+            error: None,
+        })
+        .await;
+
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DELAY_PART".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }))
+        .await;
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_DELAY_PART".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+        assert!(
+            s.pending_trailing_sells.is_empty(),
+            "partial-fill grace should block duplicate trailing sell during delayed fill gap"
+        );
+
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        s.apply(AppEvent::UserChannelFill {
+            clob_trade_id: "delayed-partial-fill-2".into(),
+            order_leg_id: "delayed-partial-trailing-sell".into(),
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            qty: 4.0,
+            price: 0.54,
+            token_id: "UP_DELAY_PART".into(),
+            ts: Utc::now(),
+            from_maker_leg: false,
+        })
+        .await;
+
+        assert!(s.pending_trailing_sells.is_empty());
+        assert!(
+            !s.trailing.contains_key("UP_DELAY_PART"),
+            "later fill should clear the re-armed residual trail"
         );
     }
 
