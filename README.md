@@ -11,7 +11,12 @@ A terminal trading interface for Polymarket's rolling **Up or Down** crypto pred
 
 ## What it does
 
-Polymarket runs short-window crypto prediction markets: every 5 or 15 minutes a new "Up or Down?" market opens for BTC, ETH, SOL, or XRP. You bet on whether the price will be higher or lower than the opening price when the window closes.
+Polymarket runs short-window crypto prediction markets: every 5 or 15 minutes a new "Up or Down?" market opens for BTC, ETH, SOL, or XRP. Each round has a **Price to Beat** (the reference level for that window). **Settlement** compares the **price at the end of the round** to that level:
+
+- You win on **UP** if the final price is **above** Price to Beat.
+- You win on **DOWN** if the final price is **below** Price to Beat.
+
+(How an exact tie is handled is defined by the market; check Polymarket’s rules for the product you trade.)
 
 This terminal app lets you:
 

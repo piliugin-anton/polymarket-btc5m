@@ -1,3 +1,10 @@
+//! Entry-signal rubric for Up/Down crypto windows.
+//!
+//! **Settlement (what actually wins):** at round close, **UP** pays off if the final reference price is
+//! **higher** than **Price to Beat**; **DOWN** pays off if the final price is **lower**. This module
+//! only compares **live spot** vs Price to Beat to suggest which *side* to consider — it does not
+//! implement resolution.
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualSignalLabel {
     NoTrade,
@@ -59,6 +66,8 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
     };
     let diff = spot - target;
     let gap = (diff / target).abs();
+    // Align with settlement: UP wins if *close* > Price to Beat, DOWN wins if *close* < Price to Beat.
+    // We only observe live `spot`; favor UP when spot is already above target, DOWN when below.
     let direction = if diff > 0.0 {
         Direction::Up
     } else if diff < 0.0 {
