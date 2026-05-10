@@ -129,18 +129,18 @@ impl TrailingStop {
         }
     }
 
-    /// Stop tick for a given best tick. Quantizes continuous trail math to the tick grid.
+    /// Stop tick for a given best tick. Quantizes trail distance to at least one full tick.
     #[inline]
     pub(crate) fn stop_tick_for_best(side: Side, spec: &TrailSpec, best: i64) -> i64 {
-        let b = from_tick(best);
-        let dist = match *spec {
-            TrailSpec::Percent(p) => b * p,
-            TrailSpec::Absolute(d) => d,
+        let dist_ticks = match *spec {
+            TrailSpec::Percent(p) if p > 0.0 => (((best as f64).abs() * p).ceil() as i64).max(1),
+            TrailSpec::Absolute(d) if d > 0.0 => (((d / TICK) - 1e-12).ceil() as i64).max(1),
+            _ => 0,
         };
-        to_tick(match side {
-            Side::Long => b - dist,
-            Side::Short => b + dist,
-        })
+        match side {
+            Side::Long => best - dist_ticks,
+            Side::Short => best + dist_ticks,
+        }
     }
 
     #[inline]
@@ -485,14 +485,13 @@ mod tests {
             want_stop_at(Side::Long, TrailSpec::Percent(pct), peak)
         ));
 
-        // Pullback above the quantized stop but still below the peak; on a 0.01 grid
-        // there is no print strictly between 0.65 and 0.66—use 0.656 (tick 66) which
-        // is not a new best vs 0.66 but above stop tick 0.65.
+        // Pullback above the quantized stop but still below the peak; 0.656
+        // quantizes to the same best tick as 0.66 without improving the best.
         let mid = 0.656;
         assert!(mid > new_stop && mid < peak);
         assert_eq!(ts.on_price(mid), TickOutcome::NoOp);
 
-        let breach = 0.64;
+        let breach = 0.63;
         assert!(breach < new_stop);
         match ts.on_price(breach) {
             TickOutcome::Triggered {
@@ -732,6 +731,110 @@ mod tests {
             o => panic!("expected Trailed, got {:?}", o),
         }
         assert!(ts.best_price().unwrap() <= 0.99);
+    }
+
+    #[test]
+    fn frac_long_percent_trail_uses_full_tick_distance_sweep() {
+        for pct in [0.01, 0.02, 0.05, 0.10] {
+            for best_tick in 1..=99 {
+                let price = from_tick(best_tick);
+                let spec = TrailSpec::Percent(pct);
+                let stop_tick = TrailingStop::stop_tick_for_best(Side::Long, &spec, best_tick);
+                let want_distance_ticks = ((best_tick as f64 * pct).ceil() as i64).max(1);
+
+                assert_eq!(
+                    best_tick - stop_tick,
+                    want_distance_ticks,
+                    "long pct={pct} price={price:.2} stop={:.2}",
+                    from_tick(stop_tick)
+                );
+
+                let ts = TrailingStop::new(Side::Long, price, spec, Activation::Immediate);
+                assert_eq!(
+                    ts.on_price(price),
+                    TickOutcome::NoOp,
+                    "long pct={pct} should not trigger on unchanged price {price:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frac_short_percent_trail_uses_full_tick_distance_sweep() {
+        for pct in [0.01, 0.02, 0.05, 0.10] {
+            for best_tick in 1..=99 {
+                let price = from_tick(best_tick);
+                let spec = TrailSpec::Percent(pct);
+                let stop_tick = TrailingStop::stop_tick_for_best(Side::Short, &spec, best_tick);
+                let want_distance_ticks = ((best_tick as f64 * pct).ceil() as i64).max(1);
+
+                assert_eq!(
+                    stop_tick - best_tick,
+                    want_distance_ticks,
+                    "short pct={pct} price={price:.2} stop={:.2}",
+                    from_tick(stop_tick)
+                );
+
+                let ts = TrailingStop::new(Side::Short, price, spec, Activation::Immediate);
+                assert_eq!(
+                    ts.on_price(price),
+                    TickOutcome::NoOp,
+                    "short pct={pct} should not trigger on unchanged price {price:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frac_long_absolute_trail_uses_full_tick_distance_sweep() {
+        for offset in [0.005, 0.01, 0.015, 0.02] {
+            for best_tick in 1..=99 {
+                let price = from_tick(best_tick);
+                let spec = TrailSpec::Absolute(offset);
+                let stop_tick = TrailingStop::stop_tick_for_best(Side::Long, &spec, best_tick);
+                let want_distance_ticks = ((offset / TICK).ceil() as i64).max(1);
+
+                assert_eq!(
+                    best_tick - stop_tick,
+                    want_distance_ticks,
+                    "long offset={offset} price={price:.2} stop={:.2}",
+                    from_tick(stop_tick)
+                );
+
+                let ts = TrailingStop::new(Side::Long, price, spec, Activation::Immediate);
+                assert_eq!(
+                    ts.on_price(price),
+                    TickOutcome::NoOp,
+                    "long offset={offset} should not trigger on unchanged price {price:.2}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frac_short_absolute_trail_uses_full_tick_distance_sweep() {
+        for offset in [0.005, 0.01, 0.015, 0.02] {
+            for best_tick in 1..=99 {
+                let price = from_tick(best_tick);
+                let spec = TrailSpec::Absolute(offset);
+                let stop_tick = TrailingStop::stop_tick_for_best(Side::Short, &spec, best_tick);
+                let want_distance_ticks = ((offset / TICK).ceil() as i64).max(1);
+
+                assert_eq!(
+                    stop_tick - best_tick,
+                    want_distance_ticks,
+                    "short offset={offset} price={price:.2} stop={:.2}",
+                    from_tick(stop_tick)
+                );
+
+                let ts = TrailingStop::new(Side::Short, price, spec, Activation::Immediate);
+                assert_eq!(
+                    ts.on_price(price),
+                    TickOutcome::NoOp,
+                    "short offset={offset} should not trigger on unchanged price {price:.2}"
+                );
+            }
+        }
     }
 
     #[test]
