@@ -83,6 +83,10 @@ pub struct Config {
     /// **gross** basis points above cost basis (`avg_entry` or trail install entry) before `place_order`.
     /// `0` = no gate (legacy). If unset entry cannot be resolved, the sell is not blocked.
     pub trailing_exit_min_profit_bps: u32,
+    /// When true, STRONG strategy signals can submit automatic market FAK BUY orders.
+    pub autotrading: bool,
+    /// Maximum currently open auto-trading positions. Closed auto inventory frees capacity.
+    pub autotrading_max_positions: usize,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -166,6 +170,15 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        let autotrading = std::env::var("AUTOTRADING")
+            .ok()
+            .as_deref()
+            .and_then(parse_env_bool)
+            .unwrap_or(false);
+        let autotrading_max_positions = parse_autotrading_max_positions(
+            std::env::var("AUTOTRADING_MAX_POSITIONS").ok().as_deref(),
+        );
+
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
             .filter(|s| !s.trim().is_empty());
@@ -217,6 +230,8 @@ impl Config {
             take_profit_bps,
             buy_trail_bps,
             trailing_exit_min_profit_bps,
+            autotrading,
+            autotrading_max_positions,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
@@ -224,7 +239,6 @@ impl Config {
     }
 }
 
-#[cfg(test)]
 fn parse_env_bool(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
         "1" | "true" | "yes" | "on" => Some(true),
@@ -233,9 +247,16 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
+fn parse_autotrading_max_positions(value: Option<&str>) -> usize {
+    value
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(1)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::parse_env_bool;
+    use super::{parse_autotrading_max_positions, parse_env_bool};
 
     #[test]
     fn parse_env_bool_accepts_common_values() {
@@ -244,5 +265,14 @@ mod tests {
         assert_eq!(parse_env_bool("off"), Some(false));
         assert_eq!(parse_env_bool("FALSE"), Some(false));
         assert_eq!(parse_env_bool("maybe"), None);
+    }
+
+    #[test]
+    fn parse_autotrading_max_positions_defaults_invalid_values_to_one() {
+        assert_eq!(parse_autotrading_max_positions(None), 1);
+        assert_eq!(parse_autotrading_max_positions(Some("")), 1);
+        assert_eq!(parse_autotrading_max_positions(Some("0")), 1);
+        assert_eq!(parse_autotrading_max_positions(Some("not-a-number")), 1);
+        assert_eq!(parse_autotrading_max_positions(Some("3")), 3);
     }
 }

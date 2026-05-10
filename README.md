@@ -124,6 +124,8 @@ Optional but useful:
 | Variable | What it is |
 |---|---|
 | `POLYMARKET_PROXY` | Proxy for geo-blocked regions — see [Geo-restrictions](#geo-restricted) |
+| `AUTOTRADING` | `true` enables automatic **market FAK BUY** entries from `STRONG UP` / `STRONG DOWN` strategy signals only (`false` by default) |
+| `AUTOTRADING_MAX_POSITIONS` | Maximum currently open auto-trading positions; sold/closed auto inventory frees capacity (`1` by default) |
 | `BUY_TRAIL_BPS` | Trailing stop width in bps from peak best bid (`0` = off). Applies after **market or limit** buys that arm the trail. Legacy: `MARKET_BUY_TRAIL_BPS` is used if `BUY_TRAIL_BPS` is unset |
 | `TAKE_PROFIT_BPS` | **Activation**: trail arms when `best_bid ≥ entry × (1 + bps/10_000)` (`0` ≈ arm as soon as bid reaches entry). With `BUY_TRAIL_BPS` at `0`, also places an auto **GTD take-profit sell** after a **market or limit** buy fills (POST fill or maker fill on user WebSocket). Legacy: `MARKET_BUY_TAKE_PROFIT_BPS` is used if `TAKE_PROFIT_BPS` is unset |
 | `MARKET_BUY_SLIPPAGE_BPS` | Slippage cushion for market buys. Default `50` (0.5%) |
@@ -212,12 +214,21 @@ GTD orders expire one second before the active window closes. The app enforces a
 - **Limit BUY** — type the notional in USDC; the app converts to shares before submitting
 - **Limit SELL** — type shares directly
 
+### Autotrading
+
+Set `AUTOTRADING=true` to let the app automatically submit **market FAK BUY** orders when the strategy signal is `STRONG UP` or `STRONG DOWN`. `WATCH` and `NO TRADE` never place automatic orders.
+
+Autotrading uses the same size shown in the TUI as manual market buys: `DEFAULT_SIZE_USDC` at startup, then whatever you edit with **`e`** while the app is running. Before each retry, the bot re-checks that the same strong signal is still present and recomputes the FAK buy from the current book. `AUTOTRADING_MAX_POSITIONS` limits currently open auto-trading positions; when matching sell fills reduce the tracked auto inventory, capacity opens again.
+
+Autotrading only buys. Exits are still handled by your existing `TAKE_PROFIT_BPS` / `BUY_TRAIL_BPS` settings or by manual sells.
+
 ## Safety tips
 
 1. Start with a small `DEFAULT_SIZE_USDC` (e.g. `1.0` or `5.0`) until you trust the setup.
 2. Run `debug-auth` before your first trade to verify credentials are correct (see [Troubleshooting](#troubleshooting-clob-credentials)).
 3. If you enable `BUY_TRAIL_BPS`, a trip fires a real **FAK SELL** (market or limit buy). Test with minimum size first. For **resting limit buys**, the trail is registered when the fill hits the user WebSocket as a **maker** leg; an immediate limit match in the POST response uses the same path as a market buy.
-4. Never commit `.env` with real keys. The example ships with zero-filled keys so a copy without editing will fail loudly.
+4. If you enable `AUTOTRADING`, start with `AUTOTRADING_MAX_POSITIONS=1` and a very small `DEFAULT_SIZE_USDC`; each `STRONG` signal can place a real market FAK BUY.
+5. Never commit `.env` with real keys. The example ships with zero-filled keys so a copy without editing will fail loudly.
 
 ## Geo-restricted?
 

@@ -46,6 +46,7 @@ pub const TRAILING_SELL_MAX_PARALLEL: usize = 8;
 /// After a trailing FAK partially fills, user-channel fills for the same CLOB order can arrive a few
 /// seconds later. During this window, keep the residual trail from firing a duplicate SELL.
 pub const TRAILING_PARTIAL_FILL_GRACE: Duration = Duration::from_secs(3);
+const AUTOTRADING_POSITION_DUST: f64 = 1e-9;
 
 /// Map key in [`AppState::trailing`] for this CLOB asset.
 /// Two hash lookups: direct, then canonical form. Keys are always canonical, so this covers all cases.
@@ -210,6 +211,13 @@ pub enum AppEvent {
     TrailingExitDispatchDone {
         token_id: String,
         success: bool,
+        error: Option<String>,
+    },
+    /// Auto-trading FAK BUY task finished; clears the per-token in-flight guard and, on fill,
+    /// opens one tracked auto position for the live-position cap.
+    AutoTradingBuyDone {
+        token_id: String,
+        filled_qty: Option<f64>,
         error: Option<String>,
     },
 }
@@ -417,6 +425,14 @@ pub fn book_mid(b: &BookSnapshot) -> Option<f64> {
     }
 }
 
+pub fn manual_signal_label_to_buy_outcome(label: ManualSignalLabel) -> Option<Outcome> {
+    match label {
+        ManualSignalLabel::StrongUp => Some(Outcome::Up),
+        ManualSignalLabel::StrongDown => Some(Outcome::Down),
+        ManualSignalLabel::NoTrade | ManualSignalLabel::Watch => None,
+    }
+}
+
 /// Token IDs to subscribe on the public CLOB book WebSocket (active pair + trailing tails).
 pub fn collect_book_watch_token_ids(state: &AppState) -> Vec<String> {
     use std::collections::HashSet;
@@ -542,6 +558,10 @@ pub struct AppState {
     pub buy_trail_activation_bps: u32,
     /// Maker BUY fill on user WS (resting limit) should run fixed take-profit in `main` after `apply`.
     pub pending_ws_take_profit: Option<(Outcome, f64)>,
+    pub autotrading_enabled: bool,
+    pub autotrading_max_positions: usize,
+    pub autotrading_open: HashMap<String, f64>,
+    pub autotrading_in_flight: HashSet<String>,
 
     traded_activity: RollingTradedNotional,
 }
@@ -602,6 +622,10 @@ impl AppState {
             buy_trail_bps: 0,
             buy_trail_activation_bps: 0,
             pending_ws_take_profit: None,
+            autotrading_enabled: false,
+            autotrading_max_positions: 1,
+            autotrading_open: HashMap::new(),
+            autotrading_in_flight: HashSet::new(),
             traded_activity: RollingTradedNotional::new(),
         }
     }
@@ -797,6 +821,59 @@ impl AppState {
             },
             activity_notional_60s: self.cached_market_activity_notional,
         })
+    }
+
+    pub fn manual_signal_buy_outcome(&self) -> Option<Outcome> {
+        manual_signal_label_to_buy_outcome(self.manual_signal_label())
+    }
+
+    pub fn autotrading_open_count(&self) -> usize {
+        self.autotrading_open
+            .values()
+            .filter(|qty| qty.is_finite() && **qty > AUTOTRADING_POSITION_DUST)
+            .count()
+    }
+
+    pub fn autotrading_can_buy(&self, token_id: &str) -> bool {
+        !self.autotrading_in_flight.contains(token_id)
+            && !self
+                .autotrading_open
+                .get(token_id)
+                .is_some_and(|qty| qty.is_finite() && *qty > AUTOTRADING_POSITION_DUST)
+            && self.autotrading_open_count() < self.autotrading_max_positions.max(1)
+    }
+
+    pub fn autotrading_mark_in_flight(&mut self, token_id: String) -> bool {
+        if !self.autotrading_can_buy(&token_id) {
+            return false;
+        }
+        self.autotrading_in_flight.insert(token_id)
+    }
+
+    pub fn autotrading_clear_in_flight(&mut self, token_id: &str) {
+        self.autotrading_in_flight.remove(token_id);
+    }
+
+    pub fn autotrading_apply_fill(&mut self, token_id: &str, side: Side, qty: f64) {
+        if !qty.is_finite() || qty <= AUTOTRADING_POSITION_DUST {
+            return;
+        }
+        let token_id = canonical_clob_token_id(token_id).into_owned();
+        match side {
+            Side::Buy => {
+                *self.autotrading_open.entry(token_id).or_insert(0.0) += qty;
+            }
+            Side::Sell => {
+                if let Entry::Occupied(mut e) = self.autotrading_open.entry(token_id) {
+                    let remaining = (*e.get() - qty).max(0.0);
+                    if remaining <= AUTOTRADING_POSITION_DUST {
+                        e.remove();
+                    } else {
+                        *e.get_mut() = remaining;
+                    }
+                }
+            }
+        }
     }
 
     fn manual_signal_book_side(&self, outcome: Outcome) -> ManualSignalBookSide {
@@ -1558,6 +1635,8 @@ impl AppState {
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
                 self.watched_books.clear();
+                self.autotrading_open.clear();
+                self.autotrading_in_flight.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.cached_countdown_secs = None;
                 self.traded_activity.clear();
@@ -1690,6 +1769,9 @@ impl AppState {
                     return;
                 }
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
+                if side == Side::Sell {
+                    self.autotrading_apply_fill(&token_id, side, qty);
+                }
                 if let Some(ui_oc) = self.outcome_for_active_token(&token_id) {
                     let realized = self.position_mut(ui_oc).apply_fill(side, qty, price);
                     self.realized_pnl += realized;
@@ -1779,6 +1861,9 @@ impl AppState {
                 token_id,
             } => {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
+                if side == Side::Sell {
+                    self.autotrading_apply_fill(&token_id, side, qty);
+                }
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
                     if !self
@@ -1876,6 +1961,23 @@ impl AppState {
                 }
             }
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
+            AppEvent::AutoTradingBuyDone {
+                token_id,
+                filled_qty,
+                error,
+            } => {
+                let token_id = canonical_clob_token_id(&token_id).into_owned();
+                self.autotrading_clear_in_flight(&token_id);
+                if let Some(qty) = filled_qty {
+                    self.autotrading_apply_fill(&token_id, Side::Buy, qty);
+                    self.status_line =
+                        format!("autotrading: BUY filled {qty:.2} shares; position tracked");
+                } else if let Some(e) = error {
+                    self.status_line = format!("autotrading: stopped — {e}");
+                } else {
+                    self.status_line = "autotrading: stopped".into();
+                }
+            }
             AppEvent::OrderErrModal(e) => {
                 self.status_line = format!("✗ {e}");
                 self.order_error_toast = Some(OrderErrorToast {
@@ -2854,6 +2956,7 @@ mod tests {
     use crate::feeds::user_trade_sync::UserTradeSync;
     use crate::fees::polymarket_crypto_taker_fee_usdc;
     use crate::gamma::ActiveMarket;
+    use crate::strategy::ManualSignalLabel;
     use crate::trading::{ClobMakerOrder, ClobOpenOrder, ClobTrade};
     use chrono::Utc;
 
@@ -2921,6 +3024,59 @@ mod tests {
             s.manual_signal_label(),
             crate::strategy::ManualSignalLabel::StrongUp
         );
+    }
+
+    #[test]
+    fn manual_signal_labels_map_to_auto_buy_outcomes_only_when_strong() {
+        assert_eq!(
+            manual_signal_label_to_buy_outcome(ManualSignalLabel::StrongUp),
+            Some(Outcome::Up)
+        );
+        assert_eq!(
+            manual_signal_label_to_buy_outcome(ManualSignalLabel::StrongDown),
+            Some(Outcome::Down)
+        );
+        assert_eq!(
+            manual_signal_label_to_buy_outcome(ManualSignalLabel::Watch),
+            None
+        );
+        assert_eq!(
+            manual_signal_label_to_buy_outcome(ManualSignalLabel::NoTrade),
+            None
+        );
+    }
+
+    #[test]
+    fn autotrading_ledger_counts_open_token_positions_and_respects_cap() {
+        let mut s = test_state();
+        s.autotrading_max_positions = 1;
+
+        assert!(s.autotrading_can_buy("111"));
+
+        s.autotrading_apply_fill("111", Side::Buy, 4.0);
+
+        assert_eq!(s.autotrading_open_count(), 1);
+        assert!(!s.autotrading_can_buy("111"));
+        assert!(!s.autotrading_can_buy("222"));
+
+        s.autotrading_apply_fill("111", Side::Sell, 4.0);
+
+        assert_eq!(s.autotrading_open_count(), 0);
+        assert!(s.autotrading_can_buy("222"));
+    }
+
+    #[test]
+    fn autotrading_in_flight_blocks_duplicate_token_until_cleared() {
+        let mut s = test_state();
+        s.autotrading_max_positions = 2;
+
+        assert!(s.autotrading_mark_in_flight("111".to_string()));
+        assert!(!s.autotrading_mark_in_flight("111".to_string()));
+        assert!(!s.autotrading_can_buy("111"));
+
+        s.autotrading_clear_in_flight("111");
+
+        assert!(s.autotrading_can_buy("111"));
     }
 
     fn trade(

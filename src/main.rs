@@ -114,6 +114,8 @@ const USER_WS_TP_FILL_WAIT: Duration = Duration::from_millis(40);
 
 /// Retries (no added sleep here; each attempt awaits the full `place_order` future).
 const TRAILING_EXIT_FAK_ATTEMPTS: u32 = 3;
+const AUTOTRADING_FAK_BUY_ATTEMPTS: u32 = 3;
+const AUTOTRADING_FAK_BUY_RETRY_MS: u64 = 250;
 
 /// GTD limit orders: 1 initial attempt + 3 retries on network error or CLOB soft rejection.
 const LIMIT_ORDER_MAX_ATTEMPTS: u32 = 4;
@@ -142,6 +144,78 @@ impl EventDrainBudget {
     fn can_continue(self, processed: usize, started: Instant) -> bool {
         processed < self.max_events && started.elapsed() < self.max_elapsed
     }
+}
+
+#[derive(Debug, Clone)]
+struct AutoTradingSnapshot {
+    market: Option<gamma::ActiveMarket>,
+    signal_outcome: Option<Outcome>,
+    size_usdc: f64,
+    best_ask_up: Option<f64>,
+    best_ask_down: Option<f64>,
+}
+
+impl AutoTradingSnapshot {
+    fn from_state(state: &AppState) -> Self {
+        Self {
+            market: state.market.clone(),
+            signal_outcome: state.manual_signal_buy_outcome(),
+            size_usdc: state.current_size(),
+            best_ask_up: state.best_ask(Outcome::Up),
+            best_ask_down: state.best_ask(Outcome::Down),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedAutoTradingBuy {
+    market: gamma::ActiveMarket,
+    shares: f64,
+    price: f64,
+}
+
+fn resolve_market_buy_from_ask(
+    ask: f64,
+    size_usdc: f64,
+    buy_slippage_bps: u32,
+) -> Option<(f64, f64, OrderType)> {
+    if !ask.is_finite() || ask <= 0.0 || !size_usdc.is_finite() || size_usdc <= 0.0 {
+        return None;
+    }
+    let slip = buy_slippage_bps as f64 / 10_000.0;
+    let price = clamp_prob(ask * (1.0 + slip));
+    let shares = (size_usdc / ask).max(0.01);
+    Some((shares, price, OrderType::Fak))
+}
+
+fn resolve_autotrading_snapshot_buy(
+    snapshot: &AutoTradingSnapshot,
+    outcome: Outcome,
+    token_id: &str,
+    buy_slippage_bps: u32,
+) -> Option<ResolvedAutoTradingBuy> {
+    if snapshot.signal_outcome != Some(outcome) {
+        return None;
+    }
+    let market = snapshot.market.clone()?;
+    let expected_token = match outcome {
+        Outcome::Up => market.up_token_id.as_str(),
+        Outcome::Down => market.down_token_id.as_str(),
+    };
+    if !clob_asset_ids_match(expected_token, token_id) {
+        return None;
+    }
+    let ask = match outcome {
+        Outcome::Up => snapshot.best_ask_up,
+        Outcome::Down => snapshot.best_ask_down,
+    }?;
+    let (shares, price, _) =
+        resolve_market_buy_from_ask(ask, snapshot.size_usdc, buy_slippage_bps)?;
+    Some(ResolvedAutoTradingBuy {
+        market,
+        shares,
+        price,
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -255,6 +329,18 @@ fn send_user_bundle_if_changed(state: &AppState, tx: &watch::Sender<UserWsBundle
     let _ = tx.send(next);
 }
 
+fn update_autotrading_snapshot_and_maybe_spawn(
+    state: &mut AppState,
+    trading: &Arc<TradingClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    cfg: &Config,
+    autotrading_snapshot_tx: &watch::Sender<AutoTradingSnapshot>,
+    autotrading_snapshot_rx: &watch::Receiver<AutoTradingSnapshot>,
+) {
+    let _ = autotrading_snapshot_tx.send(AutoTradingSnapshot::from_state(state));
+    try_spawn_autotrading_buy(state, trading, tx, cfg, autotrading_snapshot_rx);
+}
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 #[allow(clippy::too_many_arguments)]
 async fn apply_app_event(
@@ -271,6 +357,8 @@ async fn apply_app_event(
     discovery_spawned: &mut bool,
     user_bundle_tx: &watch::Sender<UserWsBundle>,
     book_token_tx: &watch::Sender<Vec<String>>,
+    autotrading_snapshot_tx: &watch::Sender<AutoTradingSnapshot>,
+    autotrading_snapshot_rx: &watch::Receiver<AutoTradingSnapshot>,
 ) -> bool {
     match ev {
         AppEvent::Key(k) => {
@@ -286,10 +374,26 @@ async fn apply_app_event(
                 );
             }
             dispatch_action(action, state, trading, tx, cfg, user_open_ledger);
+            update_autotrading_snapshot_and_maybe_spawn(
+                state,
+                trading,
+                tx,
+                cfg,
+                autotrading_snapshot_tx,
+                autotrading_snapshot_rx,
+            );
             false
         }
         AppEvent::Tick => {
             state.apply(AppEvent::Tick).await;
+            update_autotrading_snapshot_and_maybe_spawn(
+                state,
+                trading,
+                tx,
+                cfg,
+                autotrading_snapshot_tx,
+                autotrading_snapshot_rx,
+            );
             false
         }
         e => {
@@ -418,6 +522,14 @@ async fn apply_app_event(
                     }
                     send_user_bundle_if_changed(state, user_bundle_tx);
                     send_book_watch_if_changed(state, book_token_tx);
+                    update_autotrading_snapshot_and_maybe_spawn(
+                        state,
+                        trading,
+                        tx,
+                        cfg,
+                        autotrading_snapshot_tx,
+                        autotrading_snapshot_rx,
+                    );
                 }
             }
             false
@@ -501,6 +613,225 @@ fn try_dispatch_trailing_sell(
         });
     }
     state.pending_trailing_sells = newq;
+}
+
+fn clob_response_accepted(resp: &trading::PostOrderResponse) -> bool {
+    resp.success
+        || resp.status.as_ref().is_some_and(|s| {
+            s.eq_ignore_ascii_case("matched")
+                || s.eq_ignore_ascii_case("delayed")
+                || s.eq_ignore_ascii_case("live")
+                || s.eq_ignore_ascii_case("open")
+        })
+}
+
+fn try_spawn_autotrading_buy(
+    state: &mut AppState,
+    trading: &Arc<TradingClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    cfg: &Config,
+    snapshot_rx: &watch::Receiver<AutoTradingSnapshot>,
+) {
+    if !state.autotrading_enabled {
+        return;
+    }
+    let Some(outcome) = state.manual_signal_buy_outcome() else {
+        return;
+    };
+    let Some(market) = state.market.as_ref() else {
+        return;
+    };
+    let token_id = match outcome {
+        Outcome::Up => market.up_token_id.clone(),
+        Outcome::Down => market.down_token_id.clone(),
+    };
+    let snapshot = AutoTradingSnapshot::from_state(state);
+    if resolve_autotrading_snapshot_buy(&snapshot, outcome, &token_id, cfg.market_buy_slippage_bps)
+        .is_none()
+    {
+        return;
+    }
+    if !state.autotrading_mark_in_flight(token_id.clone()) {
+        return;
+    }
+
+    let runner_rx = snapshot_rx.clone();
+    let trading = Arc::clone(trading);
+    let tx = tx.clone();
+    let buy_slippage_bps = cfg.market_buy_slippage_bps;
+    let take_profit_bps = cfg.take_profit_bps;
+    let trail_bps = cfg.buy_trail_bps;
+    tokio::spawn(async move {
+        run_autotrading_fak_buy_with_retries(
+            trading,
+            tx,
+            runner_rx,
+            outcome,
+            token_id,
+            buy_slippage_bps,
+            take_profit_bps,
+            trail_bps,
+        )
+        .await;
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_autotrading_fak_buy_with_retries(
+    trading: Arc<TradingClient>,
+    tx: mpsc::Sender<AppEvent>,
+    snapshot_rx: watch::Receiver<AutoTradingSnapshot>,
+    outcome: Outcome,
+    token_id: String,
+    buy_slippage_bps: u32,
+    take_profit_bps: u32,
+    trail_bps: u32,
+) {
+    let mut last_error = "no fill".to_string();
+    for attempt in 1..=AUTOTRADING_FAK_BUY_ATTEMPTS {
+        let snapshot = snapshot_rx.borrow().clone();
+        let Some(resolved) =
+            resolve_autotrading_snapshot_buy(&snapshot, outcome, &token_id, buy_slippage_bps)
+        else {
+            let _ = tx
+                .send(AppEvent::AutoTradingBuyDone {
+                    token_id,
+                    filled_qty: None,
+                    error: Some(format!(
+                        "signal no longer {}",
+                        match outcome {
+                            Outcome::Up => "STRONG UP",
+                            Outcome::Down => "STRONG DOWN",
+                        }
+                    )),
+                })
+                .await;
+            return;
+        };
+
+        let _ = tx
+            .send(AppEvent::StatusInfo(format!(
+                "autotrading: BUY {} attempt {attempt}/{AUTOTRADING_FAK_BUY_ATTEMPTS}",
+                outcome.as_str()
+            )))
+            .await;
+        let args = OrderArgs {
+            token_id: token_id.clone(),
+            side: Side::Buy,
+            price: resolved.price,
+            size: resolved.shares,
+            neg_risk: resolved.market.neg_risk,
+            tick_size: resolved.market.tick_size.clone(),
+            buy_notional_usdc: Some(snapshot.size_usdc),
+            expiration_unix_secs: 0,
+            sell_skip_pre_post_settle: false,
+        };
+
+        match trading.place_order(args, OrderType::Fak).await {
+            Ok(resp) => {
+                debug!(
+                    outcome = ?outcome,
+                    attempt,
+                    req_shares = resolved.shares,
+                    limit_price = resolved.price,
+                    success = resp.success,
+                    status = ?resp.status,
+                    order_id = ?resp.order_id,
+                    making_amount = ?resp.making_amount,
+                    taking_amount = ?resp.taking_amount,
+                    error_msg = ?resp.error,
+                    "autotrading FAK BUY response"
+                );
+                if clob_response_accepted(&resp) {
+                    if let Some((ack_qty, ack_price)) =
+                        resp.fak_fill_for_position_ack(Side::Buy, resolved.shares, resolved.price)
+                    {
+                        let _ = tx
+                            .send(AppEvent::OrderAck {
+                                side: Side::Buy,
+                                outcome,
+                                qty: ack_qty,
+                                price: ack_price,
+                                clob_order_id: resp.order_id.clone(),
+                                token_id: token_id.clone(),
+                            })
+                            .await;
+                        if take_profit_bps > 0 && trail_bps == 0 && resolved.price < 0.99 {
+                            let _ = tx
+                                .send(AppEvent::RunTakeProfitAfterBuy {
+                                    market: resolved.market.clone(),
+                                    outcome,
+                                    take_profit_bps,
+                                    buy_ack_qty: ack_qty,
+                                })
+                                .await;
+                        }
+                        if trail_bps > 0 && resolved.price < 0.99 {
+                            let _ = tx
+                                .send(AppEvent::RequestTrailingArm {
+                                    outcome,
+                                    entry_price: ack_price,
+                                    plan_sell_shares: ack_qty,
+                                    token_id: token_id.clone(),
+                                    trail_bps,
+                                    activation_bps: take_profit_bps,
+                                    market: resolved.market.clone(),
+                                })
+                                .await;
+                        }
+                        let cli = Arc::clone(&trading);
+                        let refresh_token = token_id.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = cli
+                                .refresh_conditional_balance_allowance_cache(&refresh_token)
+                                .await
+                            {
+                                debug!(
+                                    error = %e,
+                                    token_id = %refresh_token,
+                                    "autotrading post-BUY delayed balance-allowance cache refresh failed"
+                                );
+                            }
+                        });
+                        let _ = tx
+                            .send(AppEvent::AutoTradingBuyDone {
+                                token_id,
+                                filled_qty: Some(ack_qty),
+                                error: None,
+                            })
+                            .await;
+                        return;
+                    }
+                    last_error = "accepted without fill amounts".to_string();
+                } else {
+                    last_error = resp
+                        .error
+                        .unwrap_or_else(|| format!("status={:?}", resp.status));
+                }
+            }
+            Err(e) => {
+                last_error = e.to_string();
+                debug!(
+                    error = %last_error,
+                    outcome = ?outcome,
+                    attempt,
+                    "autotrading FAK BUY request failed"
+                );
+            }
+        }
+
+        if attempt < AUTOTRADING_FAK_BUY_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(AUTOTRADING_FAK_BUY_RETRY_MS)).await;
+        }
+    }
+
+    let _ = tx
+        .send(AppEvent::AutoTradingBuyDone {
+            token_id,
+            filled_qty: None,
+            error: Some(last_error),
+        })
+        .await;
 }
 
 async fn run_trailing_exit_fak_sell(
@@ -1243,6 +1574,8 @@ async fn main() -> Result<()> {
         take_profit_bps = cfg.take_profit_bps,
         buy_trail_bps = cfg.buy_trail_bps,
         trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
+        autotrading = cfg.autotrading,
+        autotrading_max_positions = cfg.autotrading_max_positions,
         "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
@@ -1844,6 +2177,10 @@ async fn main() -> Result<()> {
         cfg.default_price,
         user_trade_sync.clone(),
     );
+    state.autotrading_enabled = cfg.autotrading;
+    state.autotrading_max_positions = cfg.autotrading_max_positions;
+    let (autotrading_snapshot_tx, autotrading_snapshot_rx) =
+        watch::channel(AutoTradingSnapshot::from_state(&state));
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);
@@ -1887,6 +2224,8 @@ async fn main() -> Result<()> {
                 &mut discovery_spawned,
                 &user_bundle_tx,
                 &book_token_tx,
+                &autotrading_snapshot_tx,
+                &autotrading_snapshot_rx,
             )
             .await
             {
@@ -1937,6 +2276,8 @@ async fn main() -> Result<()> {
                                 &mut discovery_spawned,
                                 &user_bundle_tx,
                                 &book_token_tx,
+                                &autotrading_snapshot_tx,
+                                &autotrading_snapshot_rx,
                             )
                             .await
                             {
@@ -1976,6 +2317,8 @@ async fn main() -> Result<()> {
                                 &mut discovery_spawned,
                                 &user_bundle_tx,
                                 &book_token_tx,
+                                &autotrading_snapshot_tx,
+                                &autotrading_snapshot_rx,
                             )
                             .await
                             {
@@ -2026,6 +2369,8 @@ async fn main() -> Result<()> {
                     &mut discovery_spawned,
                     &user_bundle_tx,
                     &book_token_tx,
+                    &autotrading_snapshot_tx,
+                    &autotrading_snapshot_rx,
                 )
                 .await
                 {
@@ -2200,6 +2545,81 @@ mod tests {
 
         assert_eq!(out.len(), 8);
         assert!(peak.load(Ordering::SeqCst) <= 3);
+    }
+
+    fn test_autotrading_state() -> AppState {
+        let mut state = AppState::new(
+            5.0,
+            0.50,
+            Arc::new(crate::feeds::user_trade_sync::UserTradeSync::new()),
+        );
+        let now = Utc::now();
+        state.market = Some(gamma::ActiveMarket {
+            condition_id: "cond".into(),
+            question: "test".into(),
+            slug: "test".into(),
+            up_token_id: "111".into(),
+            down_token_id: "222".into(),
+            tick_size: "0.01".into(),
+            neg_risk: false,
+            price_to_beat: Some(100.0),
+            opens_at: now - chrono::Duration::seconds(180),
+            closes_at: now + chrono::Duration::seconds(120),
+            crypto_price_query_start_utc: String::new(),
+            crypto_price_query_end_utc: String::new(),
+        });
+        state.spot_price = Some(100.30);
+        state.book_up = Some(Arc::new(feeds::clob_ws::BookSnapshot {
+            asset_id: "111".into(),
+            bids: vec![feeds::clob_ws::BookLevel {
+                price: 0.49,
+                size: 50.0,
+            }],
+            asks: vec![feeds::clob_ws::BookLevel {
+                price: 0.50,
+                size: 50.0,
+            }],
+        }));
+        state.book_down = Some(Arc::new(feeds::clob_ws::BookSnapshot {
+            asset_id: "222".into(),
+            bids: vec![feeds::clob_ws::BookLevel {
+                price: 0.49,
+                size: 50.0,
+            }],
+            asks: vec![feeds::clob_ws::BookLevel {
+                price: 0.50,
+                size: 50.0,
+            }],
+        }));
+        state.cached_countdown_secs = Some(120);
+        state.size_input = "12.50".into();
+        state
+    }
+
+    #[test]
+    fn autotrading_snapshot_resolves_buy_from_current_tui_size() {
+        let state = test_autotrading_state();
+        let snap = AutoTradingSnapshot::from_state(&state);
+        let resolved = resolve_autotrading_snapshot_buy(&snap, Outcome::Up, "111", 50).unwrap();
+
+        assert!((resolved.shares - 25.0).abs() < 1e-9);
+        assert!((resolved.price - 0.5025).abs() < 1e-9);
+    }
+
+    #[test]
+    fn autotrading_snapshot_rejects_when_signal_flips_or_market_rolls() {
+        let mut state = test_autotrading_state();
+        let snap = AutoTradingSnapshot::from_state(&state);
+        assert!(resolve_autotrading_snapshot_buy(&snap, Outcome::Up, "111", 50).is_some());
+
+        state.spot_price = Some(99.70);
+        let flipped = AutoTradingSnapshot::from_state(&state);
+        assert!(resolve_autotrading_snapshot_buy(&flipped, Outcome::Up, "111", 50).is_none());
+
+        state.spot_price = Some(100.30);
+        state.market.as_mut().unwrap().up_token_id = "333".into();
+        let rolled = AutoTradingSnapshot::from_state(&state);
+        assert!(resolve_autotrading_snapshot_buy(&rolled, Outcome::Up, "111", 50).is_none());
     }
 }
 
