@@ -2893,6 +2893,7 @@ pub fn hydrate_positions_from_trades(
     let mut up = Position::default();
     let mut down = Position::default();
     let mut fills_chrono: Vec<Fill> = Vec::new();
+    let mut seen_trade_ids: HashSet<String> = HashSet::new();
 
     for (_, _, t) in indexed {
         let Some((side, qty, price, fill_asset)) =
@@ -2920,6 +2921,10 @@ pub fn hydrate_positions_from_trades(
         } else {
             Outcome::Down
         };
+        let tid = t.id.trim();
+        if !tid.is_empty() && !seen_trade_ids.insert(tid.to_string()) {
+            continue;
+        }
         let ts = parse_trade_timestamp(&t.match_time);
         let (realized, fill_price) = match outcome {
             Outcome::Up => hydrate_apply_position_fill(&mut up, t, side, qty, price),
@@ -3771,6 +3776,42 @@ mod tests {
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert_eq!(fills.len(), 1);
         assert_eq!(fills[0].clob_trade_id, Some("ok".into()));
+    }
+
+    #[test]
+    fn hydrate_dedupes_mined_to_confirmed_status_update_by_trade_id() {
+        let up = "111";
+        let down = "222";
+        let trades = vec![
+            trade_with_status("same-fill", up, "BUY", "10", "0.5", "1000", Some("MINED")),
+            trade_with_status(
+                "same-fill",
+                up,
+                "BUY",
+                "10",
+                "0.5",
+                "1000",
+                Some("CONFIRMED"),
+            ),
+        ];
+
+        let (pu, _, fills) = hydrate_positions_from_trades(
+            &trades,
+            up,
+            down,
+            0.0,
+            0.0,
+            0.0,
+            0.0,
+            None,
+            None,
+            &[],
+            None,
+        );
+
+        assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
+        assert_eq!(fills.len(), 1, "fills={:?}", fills);
+        assert_eq!(fills[0].clob_trade_id, Some("same-fill".into()));
     }
 
     #[test]
