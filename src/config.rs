@@ -3,6 +3,7 @@
 //! All trading-sensitive values come from environment variables. See `.env.example`.
 //! Trailing width: prefer `BUY_TRAIL_BPS`; `MARKET_BUY_TRAIL_BPS` is a legacy alias when unset.
 //! Take-profit / trail-activation bps: prefer `TAKE_PROFIT_BPS`; `MARKET_BUY_TAKE_PROFIT_BPS` is a legacy alias when unset.
+//! Stop-loss: `STOP_LOSS_BPS=0` disables best-bid stop-loss GTD sells.
 
 use alloy_primitives::Address;
 use anyhow::{bail, Context, Result};
@@ -89,6 +90,9 @@ pub struct Config {
     /// **gross** basis points above cost basis (`avg_entry` or trail install entry) before `place_order`.
     /// `0` = no gate (legacy). If unset entry cannot be resolved, the sell is not blocked.
     pub trailing_exit_min_profit_bps: u32,
+    /// If positive, place a stop-loss GTD SELL when CLOB best bid drops this many bps from the
+    /// highest known BUY fill price for the same outcome (`Position.avg_entry` fallback).
+    pub stop_loss_bps: u32,
     /// When true, STRONG strategy signals can submit automatic **GTD limit BUY** orders at the
     /// snapshot best ask (same sizing as manual limit buys).
     pub autotrading: bool,
@@ -210,6 +214,8 @@ impl Config {
             .and_then(|s| s.parse::<u32>().ok())
             .unwrap_or(0);
 
+        let stop_loss_bps = parse_stop_loss_bps(std::env::var("STOP_LOSS_BPS").ok().as_deref());
+
         let autotrading = std::env::var("AUTOTRADING")
             .ok()
             .as_deref()
@@ -316,6 +322,7 @@ impl Config {
             take_profit_bps,
             buy_trail_bps,
             trailing_exit_min_profit_bps,
+            stop_loss_bps,
             autotrading,
             autotrading_max_positions,
             autotrading_buy_last_secs,
@@ -370,6 +377,12 @@ fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64
     value
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
+}
+
+fn parse_stop_loss_bps(value: Option<&str>) -> u32 {
+    value
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 fn parse_autotrading_max_entry_price(value: Option<&str>) -> Option<f64> {
@@ -435,7 +448,7 @@ mod tests {
         parse_autotrading_buy_last_secs, parse_autotrading_max_entry_price,
         parse_autotrading_max_positions, parse_autotrading_order_expires_after_secs,
         parse_autotrading_signal_min, parse_env_bool, parse_round_log_snap_interval_secs,
-        parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
+        parse_stop_loss_bps, parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
         parse_strategy_strong_gap_mult, parse_strategy_watch_ratio, AutotradingSignalMin,
     };
 
@@ -479,6 +492,15 @@ mod tests {
         assert_eq!(parse_autotrading_buy_last_secs(Some("0")), None);
         assert_eq!(parse_autotrading_buy_last_secs(Some("not-a-number")), None);
         assert_eq!(parse_autotrading_buy_last_secs(Some("60")), Some(60));
+    }
+
+    #[test]
+    fn parse_stop_loss_bps_defaults_invalid_values_to_zero() {
+        assert_eq!(parse_stop_loss_bps(None), 0);
+        assert_eq!(parse_stop_loss_bps(Some("")), 0);
+        assert_eq!(parse_stop_loss_bps(Some("not-a-number")), 0);
+        assert_eq!(parse_stop_loss_bps(Some("0")), 0);
+        assert_eq!(parse_stop_loss_bps(Some("750")), 750);
     }
 
     #[test]

@@ -35,6 +35,7 @@ mod redeem;
 mod round_log;
 mod signal_eval;
 mod strategy;
+mod stop_loss;
 mod take_profit;
 
 use market_profile::{MarketProfile, Timeframe, CRYPTO_ASSETS};
@@ -47,7 +48,8 @@ use anyhow::{Context, Result};
 use app::{
     clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
     resolve_market_order, resolve_trailing_sell, trailing_exit_sell_meets_min_gross_profit_bps,
-    AppEvent, AppState, Outcome, TrailingExit, MIN_LIMIT_ORDER_SHARES, TRAILING_SELL_MAX_PARALLEL,
+    AppEvent, AppState, Outcome, StopLossSell, TrailingExit, MIN_LIMIT_ORDER_SHARES,
+    TRAILING_SELL_MAX_PARALLEL,
 };
 use chrono::Utc;
 use config::Config;
@@ -660,7 +662,11 @@ async fn apply_app_event(
                         }
                     }
                     if is_book_ev {
-                        try_dispatch_trailing_sell(state, trading, tx, cfg);
+                        let stop_loss_started =
+                            try_dispatch_stop_loss_sell(state, trading, tx, cfg, user_open_ledger);
+                        if !stop_loss_started {
+                            try_dispatch_trailing_sell(state, trading, tx, cfg);
+                        }
                     }
                     send_user_bundle_if_changed(state, user_bundle_tx);
                     send_book_watch_if_changed(state, book_token_tx);
@@ -755,6 +761,27 @@ fn try_dispatch_trailing_sell(
         });
     }
     state.pending_trailing_sells = newq;
+}
+
+fn try_dispatch_stop_loss_sell(
+    state: &mut AppState,
+    trading: &Arc<TradingClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    cfg: &Config,
+    user_open_ledger: &Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+) -> bool {
+    let Some(ticket) = state.stop_loss_sell_candidate(cfg.stop_loss_bps) else {
+        return false;
+    };
+    state.mark_stop_loss_sell_in_flight(ticket.token_id.as_str());
+
+    let trading2 = trading.clone();
+    let ledger2 = user_open_ledger.clone();
+    let tx2 = tx.clone();
+    tokio::spawn(async move {
+        run_stop_loss_gtd_sell(trading2, ledger2, tx2, ticket).await;
+    });
+    true
 }
 
 fn clob_response_accepted(resp: &trading::PostOrderResponse) -> bool {
@@ -1066,6 +1093,201 @@ async fn run_autotrading_limit_buy_with_retries(
             error: Some(last_error),
         })
         .await;
+}
+
+async fn run_stop_loss_gtd_sell(
+    trading: Arc<TradingClient>,
+    user_open_ledger: Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    tx: mpsc::Sender<AppEvent>,
+    ticket: StopLossSell,
+) {
+    let _lock = tp_lock_for(ticket.outcome);
+    let _op = _lock.lock().await;
+
+    let sells: Vec<ClobOpenOrder> = user_open_ledger
+        .snapshot_clob_orders()
+        .await
+        .into_iter()
+        .filter(|o| {
+            trading::parse_clob_side_str(&o.side) == Some(Side::Sell)
+                && clob_asset_ids_match(&o.asset_id, ticket.token_id.as_str())
+        })
+        .collect();
+
+    let cancel_futs: Vec<_> = sells
+        .iter()
+        .map(|o| {
+            let t = Arc::clone(&trading);
+            let id = o.id.clone();
+            async move { t.cancel_order(&id).await.map_err(|e| (id, e)) }
+        })
+        .collect();
+    for res in bounded_join(cancel_futs, TP_CANCEL_MAX_CONCURRENT).await {
+        if let Err((order_id, e)) = res {
+            warn!(order_id = %order_id, error = %e, "stop-loss: cancel resting SELL failed");
+            let msg = format!("stop-loss: cancel {e:#}");
+            let _ = tx.send(AppEvent::OrderErrModal(msg.clone())).await;
+            let _ = tx
+                .send(AppEvent::StopLossSellDone {
+                    token_id: ticket.token_id,
+                    success: false,
+                    error: Some(msg),
+                })
+                .await;
+            return;
+        }
+    }
+    if !sells.is_empty() {
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+
+    let exp_secs = match gamma::clob_gtd_expiration_secs_at_window_end(ticket.market.closes_at) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(error = %e, "stop-loss: GTD expiration failed");
+            let msg = format!("stop-loss limit: {e}");
+            let _ = tx.send(AppEvent::OrderErrModal(msg.clone())).await;
+            let _ = tx
+                .send(AppEvent::StopLossSellDone {
+                    token_id: ticket.token_id,
+                    success: false,
+                    error: Some(msg),
+                })
+                .await;
+            return;
+        }
+    };
+
+    let args = OrderArgs {
+        token_id: ticket.token_id.clone(),
+        side: Side::Sell,
+        price: ticket.limit_price,
+        size: ticket.shares,
+        neg_risk: ticket.market.neg_risk,
+        tick_size: ticket.market.tick_size.clone(),
+        buy_notional_usdc: None,
+        expiration_unix_secs: exp_secs,
+        sell_skip_pre_post_settle: true,
+    };
+
+    info!(
+        outcome = ?ticket.outcome,
+        shares = ticket.shares,
+        reference_price = ticket.reference_price,
+        current_price = ticket.current_price,
+        limit_price = ticket.limit_price,
+        gtd_expiration_unix_secs = exp_secs,
+        canceled_resting_sells = sells.len(),
+        "stop-loss: placing GTD limit SELL",
+    );
+
+    let resp_result = place_limit_with_retries(&trading, args, ticket.outcome).await;
+    match resp_result {
+        Ok(resp) if clob_response_accepted(&resp) => {
+            let ack = resp.fill_for_position_ack(
+                Side::Sell,
+                ticket.shares,
+                ticket.limit_price,
+                OrderType::Gtd,
+            );
+            if let Some((ack_qty, ack_price)) = ack {
+                let _ = tx
+                    .send(AppEvent::OrderAck {
+                        side: Side::Sell,
+                        outcome: ticket.outcome,
+                        qty: ack_qty,
+                        price: ack_price,
+                        clob_order_id: resp.order_id.clone(),
+                        token_id: ticket.token_id.clone(),
+                    })
+                    .await;
+            } else {
+                if let Some(oid) = resp.order_id.as_deref().filter(|s| !s.is_empty()) {
+                    user_open_ledger
+                        .insert_resting_order(ClobOpenOrder {
+                            id: oid.to_string(),
+                            asset_id: ticket.token_id.clone(),
+                            side: "SELL".to_string(),
+                            price: format!("{}", ticket.limit_price),
+                            original_size: format!("{}", ticket.shares),
+                            size_matched: "0".to_string(),
+                        })
+                        .await;
+                    if let Some(rows) = user_open_ledger.open_orders_ui_snapshot().await {
+                        let _ = tx.send(AppEvent::OpenOrdersLoaded { orders: rows }).await;
+                    }
+                }
+                let _ = tx
+                    .send(AppEvent::StatusInfo(format!(
+                        "stop-loss SELL {} resting @ {:.2}",
+                        ticket.outcome.as_str(),
+                        ticket.limit_price
+                    )))
+                    .await;
+            }
+
+            let tid = ticket.token_id.clone();
+            let cli = trading.clone();
+            tokio::spawn(async move {
+                if let Err(e) = cli.refresh_conditional_balance_allowance_cache(&tid).await {
+                    debug!(
+                        error = %e,
+                        token_id = %tid,
+                        "post-stop-loss delayed balance-allowance cache refresh failed"
+                    );
+                }
+            });
+
+            let _ = tx
+                .send(AppEvent::StopLossSellDone {
+                    token_id: ticket.token_id,
+                    success: true,
+                    error: None,
+                })
+                .await;
+        }
+        Ok(resp) => {
+            let msg = resp
+                .error
+                .unwrap_or_else(|| format!("status={:?}", resp.status));
+            warn!(
+                outcome = ?ticket.outcome,
+                shares = ticket.shares,
+                limit_price = ticket.limit_price,
+                success = resp.success,
+                status = ?resp.status,
+                order_id = ?resp.order_id,
+                error_msg = %msg,
+                "stop-loss GTD order rejected",
+            );
+            let _ = tx.send(AppEvent::OrderErrModal(msg.clone())).await;
+            let _ = tx
+                .send(AppEvent::StopLossSellDone {
+                    token_id: ticket.token_id,
+                    success: false,
+                    error: Some(msg),
+                })
+                .await;
+        }
+        Err(e) => {
+            warn!(
+                error = %e,
+                outcome = ?ticket.outcome,
+                shares = ticket.shares,
+                limit_price = ticket.limit_price,
+                "stop-loss GTD order request failed",
+            );
+            let msg = format!("stop-loss GTD: {e:#}");
+            let _ = tx.send(AppEvent::OrderErrModal(msg.clone())).await;
+            let _ = tx
+                .send(AppEvent::StopLossSellDone {
+                    token_id: ticket.token_id,
+                    success: false,
+                    error: Some(msg),
+                })
+                .await;
+        }
+    }
 }
 
 async fn run_trailing_exit_fak_sell(

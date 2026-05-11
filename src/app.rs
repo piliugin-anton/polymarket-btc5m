@@ -25,6 +25,7 @@ use crate::strategy::{
     evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
     ManualSignalSentiment,
 };
+use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::take_profit::{
     clob_order_has_open_size, clob_order_remaining_size, CLOB_ORDER_REMAINING_DUST,
 };
@@ -214,6 +215,12 @@ pub enum AppEvent {
         success: bool,
         error: Option<String>,
     },
+    /// Stop-loss GTD SELL task finished; clears the duplicate-submit in-flight marker.
+    StopLossSellDone {
+        token_id: String,
+        success: bool,
+        error: Option<String>,
+    },
     /// Auto-trading GTD limit BUY task finished. Errors free the reserved capacity immediately;
     /// accepted resting orders keep it reserved until a fill arrives from the user channel or the
     /// order is cancelled/expired.
@@ -280,6 +287,18 @@ pub struct TrailingExit {
     pub market: ActiveMarket,
     pub outcome: Outcome,
     pub sell_shares: f64,
+}
+
+/// Stop-loss GTD sell to dispatch from `main` after a book tick crosses the configured drawdown.
+#[derive(Debug, Clone)]
+pub struct StopLossSell {
+    pub token_id: String,
+    pub market: ActiveMarket,
+    pub outcome: Outcome,
+    pub shares: f64,
+    pub reference_price: f64,
+    pub current_price: f64,
+    pub limit_price: f64,
 }
 
 /// Trailing is registered after the buy, but the [`TrailingSession`] is created only when
@@ -561,6 +580,9 @@ pub struct AppState {
     /// `token_id`s with a `run_trailing_exit_fak_sell` task in progress; capped by
     /// [`TRAILING_SELL_MAX_PARALLEL`].
     pub trailing_sell_in_flight: HashSet<String>,
+    /// `token_id`s with a stop-loss GTD SELL task in progress; prevents duplicate submits on
+    /// repeated book ticks while the CLOB order is being placed.
+    pub stop_loss_sell_in_flight: HashSet<String>,
     /// Residual trails re-armed after a partial trailing SELL; blocks duplicate triggers while
     /// delayed fills for the same CLOB order can still arrive.
     pub trailing_sell_partial_fill_grace_until: HashMap<String, Instant>,
@@ -648,6 +670,7 @@ impl AppState {
             watched_books: HashMap::new(),
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
+            stop_loss_sell_in_flight: HashSet::new(),
             trailing_sell_partial_fill_grace_until: HashMap::new(),
             cached_book_watch_tokens: Vec::new(),
             book_watch_tokens_dirty: false,
@@ -780,6 +803,7 @@ impl AppState {
             .iter()
             .any(|e| e.token_id == token_id)
             || self.trailing_sell_in_flight.contains(token_id)
+            || self.stop_loss_sell_in_flight.contains(token_id)
             || self
                 .trailing_sell_partial_fill_grace_until
                 .get(token_id)
@@ -833,6 +857,100 @@ impl AppState {
     /// Best bid on the outcome side we'd hit when selling YES(outcome).
     pub fn best_bid(&self, outcome: Outcome) -> Option<f64> {
         self.book_for(outcome)?.bids.first().map(|l| l.price)
+    }
+
+    pub fn stop_loss_sell_candidate(&self, stop_loss_bps: u32) -> Option<StopLossSell> {
+        if stop_loss_bps == 0 {
+            return None;
+        }
+        let market = self.market.as_ref()?;
+        self.stop_loss_sell_candidate_for_outcome(
+            market,
+            Outcome::Up,
+            market.up_token_id.as_str(),
+            stop_loss_bps,
+        )
+        .or_else(|| {
+            self.stop_loss_sell_candidate_for_outcome(
+                market,
+                Outcome::Down,
+                market.down_token_id.as_str(),
+                stop_loss_bps,
+            )
+        })
+    }
+
+    pub fn mark_stop_loss_sell_in_flight(&mut self, token_id: &str) {
+        self.stop_loss_sell_in_flight
+            .insert(canonical_clob_token_id(token_id).into_owned());
+    }
+
+    pub fn clear_stop_loss_sell_in_flight(&mut self, token_id: &str) {
+        if !self.stop_loss_sell_in_flight.remove(token_id) {
+            let canonical = canonical_clob_token_id(token_id);
+            self.stop_loss_sell_in_flight.remove(canonical.as_ref());
+        }
+    }
+
+    fn stop_loss_sell_candidate_for_outcome(
+        &self,
+        market: &ActiveMarket,
+        outcome: Outcome,
+        token_id: &str,
+        stop_loss_bps: u32,
+    ) -> Option<StopLossSell> {
+        if self
+            .stop_loss_sell_in_flight
+            .iter()
+            .any(|id| clob_asset_ids_match(id, token_id))
+        {
+            return None;
+        }
+
+        let current_price = self.best_bid(outcome)?;
+        let reference_price = self.stop_loss_reference_price(outcome)?;
+        if !stop_loss_triggered(reference_price, current_price, stop_loss_bps) {
+            return None;
+        }
+
+        let shares = self.stop_loss_inventory_shares(outcome);
+        if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+            return None;
+        }
+
+        Some(StopLossSell {
+            token_id: token_id.to_string(),
+            market: market.clone(),
+            outcome,
+            shares,
+            reference_price,
+            current_price,
+            limit_price: stop_loss_sell_limit_price(current_price),
+        })
+    }
+
+    fn stop_loss_reference_price(&self, outcome: Outcome) -> Option<f64> {
+        self.fills
+            .iter()
+            .filter(|f| f.side == Side::Buy && f.outcome == outcome)
+            .map(|f| f.price)
+            .filter(|p| p.is_finite() && *p > 0.0)
+            .max_by(|a, b| a.total_cmp(b))
+            .or_else(|| {
+                let avg = self.position(outcome).avg_entry;
+                (avg.is_finite() && avg > 0.0).then_some(avg)
+            })
+    }
+
+    fn stop_loss_inventory_shares(&self, outcome: Outcome) -> f64 {
+        let held = self.position(outcome).shares.max(0.0);
+        let fill_net = net_shares_from_fills(&self.fills, outcome).max(0.0);
+        let fak_net = match outcome {
+            Outcome::Up => self.fak_net_up,
+            Outcome::Down => self.fak_net_down,
+        }
+        .max(0.0);
+        held.max(fill_net).max(fak_net)
     }
 
     /// Current mark (mid) price for an outcome, for unrealized PnL.
@@ -1775,6 +1893,7 @@ impl AppState {
                 self.pending_trail_arms.clear();
                 self.pending_trailing_sells.clear();
                 self.trailing_sell_in_flight.clear();
+                self.stop_loss_sell_in_flight.clear();
                 self.trailing_sell_partial_fill_grace_until.clear();
                 self.watched_books.clear();
                 self.autotrading_open.clear();
@@ -1911,6 +2030,7 @@ impl AppState {
                 match side {
                     Side::Sell => {
                         self.autotrading_apply_fill(&token_id, side, qty);
+                        self.clear_stop_loss_sell_in_flight(&token_id);
                     }
                     Side::Buy if from_maker_leg => {
                         // Resting auto-trading GTD: POST may be `live` with no fill ack — track
@@ -2013,6 +2133,7 @@ impl AppState {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
                 if side == Side::Sell {
                     self.autotrading_apply_fill(&token_id, side, qty);
+                    self.clear_stop_loss_sell_in_flight(&token_id);
                 }
                 let mut do_pnl = true;
                 if let Some(ref oid) = clob_order_id {
@@ -2245,6 +2366,24 @@ impl AppState {
             }
             AppEvent::MergeTakeProfitRestingSells { .. } => {
                 // Dispatched from `main::apply_app_event` (user WS merge path).
+            }
+            AppEvent::StopLossSellDone {
+                token_id,
+                success,
+                error,
+            } => {
+                if !success {
+                    self.clear_stop_loss_sell_in_flight(&token_id);
+                }
+                if let Some(e) = error {
+                    self.status_line = format!("✗ {e}");
+                    self.order_error_toast = Some(OrderErrorToast {
+                        message: e,
+                        until: Instant::now() + ORDER_ERROR_TOAST_TTL,
+                    });
+                } else if success {
+                    self.status_line = "stop-loss SELL submitted".into();
+                }
             }
             AppEvent::TrailingExitDispatchDone {
                 token_id,
@@ -3202,6 +3341,135 @@ mod tests {
                 size: ask_size,
             }],
         }
+    }
+
+    fn fill(side: Side, outcome: Outcome, qty: f64, price: f64) -> Fill {
+        Fill {
+            ts: Utc::now(),
+            side,
+            outcome,
+            qty,
+            price,
+            realized: 0.0,
+            clob_trade_id: None,
+        }
+    }
+
+    #[test]
+    fn stop_loss_candidate_uses_highest_buy_fill_as_reference() {
+        let mut s = test_state();
+        let m = test_market("UP_SL", "DOWN_SL", "0xsl");
+        s.market = Some(m);
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.40,
+        };
+        s.book_up = Some(Arc::new(book("UP_SL", 0.62, 0.64, 100.0)));
+        s.fills.push_back(fill(Side::Buy, Outcome::Up, 5.0, 0.52));
+        s.fills.push_back(fill(Side::Buy, Outcome::Up, 5.0, 0.70));
+
+        let candidate = s.stop_loss_sell_candidate(1_000).expect("stop-loss candidate");
+
+        assert_eq!(candidate.outcome, Outcome::Up);
+        assert_eq!(candidate.token_id, "UP_SL");
+        assert!((candidate.reference_price - 0.70).abs() < 1e-12);
+        assert!((candidate.current_price - 0.62).abs() < 1e-12);
+        assert!((candidate.limit_price - 0.61).abs() < 1e-12);
+        assert!((candidate.shares - 10.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stop_loss_candidate_falls_back_to_avg_entry() {
+        let mut s = test_state();
+        let m = test_market("UP_SL_AVG", "DOWN_SL_AVG", "0xslavg");
+        s.market = Some(m);
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(book("UP_SL_AVG", 0.44, 0.46, 100.0)));
+
+        let candidate = s.stop_loss_sell_candidate(1_000).expect("stop-loss candidate");
+
+        assert_eq!(candidate.outcome, Outcome::Up);
+        assert!((candidate.reference_price - 0.50).abs() < 1e-12);
+        assert!((candidate.limit_price - 0.43).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stop_loss_candidate_ignores_opposite_outcome_buy_fills() {
+        let mut s = test_state();
+        let m = test_market("UP_SL_SIDE", "DOWN_SL_SIDE", "0xslside");
+        s.market = Some(m);
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(book("UP_SL_SIDE", 0.44, 0.46, 100.0)));
+        s.fills.push_back(fill(Side::Buy, Outcome::Down, 5.0, 0.90));
+
+        let candidate = s.stop_loss_sell_candidate(1_000).expect("stop-loss candidate");
+
+        assert_eq!(candidate.outcome, Outcome::Up);
+        assert!((candidate.reference_price - 0.50).abs() < 1e-12);
+    }
+
+    #[test]
+    fn stop_loss_candidate_replaces_existing_resting_sell_but_skips_in_flight() {
+        let mut s = test_state();
+        let m = test_market("UP_SL_DUP", "DOWN_SL_DUP", "0xsldup");
+        s.market = Some(m);
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(book("UP_SL_DUP", 0.44, 0.46, 100.0)));
+        s.open_orders.push(OpenOrderRow {
+            side: Side::Sell,
+            outcome: Outcome::Up,
+            price: 0.43,
+            remaining: 10.0,
+        });
+
+        assert!(
+            s.stop_loss_sell_candidate(1_000).is_some(),
+            "existing TP/resting sell should be replaced by stop-loss"
+        );
+
+        s.open_orders.clear();
+        s.stop_loss_sell_in_flight.insert("UP_SL_DUP".into());
+
+        assert!(s.stop_loss_sell_candidate(1_000).is_none());
+    }
+
+    #[tokio::test]
+    async fn stop_loss_done_success_keeps_protection_marker() {
+        let mut s = test_state();
+        s.stop_loss_sell_in_flight.insert("UP_SL_DONE".into());
+
+        s.apply(AppEvent::StopLossSellDone {
+            token_id: "UP_SL_DONE".into(),
+            success: true,
+            error: None,
+        })
+        .await;
+
+        assert!(s.stop_loss_sell_in_flight.contains("UP_SL_DONE"));
+    }
+
+    #[tokio::test]
+    async fn stop_loss_done_failure_clears_in_flight_marker() {
+        let mut s = test_state();
+        s.stop_loss_sell_in_flight.insert("UP_SL_FAIL".into());
+
+        s.apply(AppEvent::StopLossSellDone {
+            token_id: "UP_SL_FAIL".into(),
+            success: false,
+            error: Some("failed".into()),
+        })
+        .await;
+
+        assert!(s.stop_loss_sell_in_flight.is_empty());
     }
 
     #[test]
@@ -4965,6 +5233,59 @@ mod tests {
             s.pending_trailing_sells.is_empty(),
             "open SELL should block duplicate trailing FAK; pending={:?}",
             s.pending_trailing_sells
+        );
+    }
+
+    /// A stop-loss GTD SELL in flight/protecting the token already owns the exit path; trailing
+    /// must not submit a second FAK SELL for the same shares.
+    #[tokio::test]
+    async fn trailing_does_not_enqueue_when_stop_loss_sell_in_flight() {
+        let mut s = test_state();
+        let m = test_market("UP_SL_TRAIL", "DOWN_SL_TRAIL", "0xsltrail");
+        s.market = Some(m.clone());
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_SL_TRAIL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_SL_TRAIL".into(),
+            trail_bps: 500,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.stop_loss_sell_in_flight.insert("UP_SL_TRAIL".into());
+
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_SL_TRAIL".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+
+        assert!(
+            s.pending_trailing_sells.is_empty(),
+            "stop-loss in-flight/protected marker should block duplicate trailing FAK"
         );
     }
 
