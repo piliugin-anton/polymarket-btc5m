@@ -73,7 +73,7 @@ use round_log::{RoundLogHandle, RoundLogWriterConfig};
 use std::{
     collections::{HashSet, VecDeque},
     future::Future,
-    io::stdout,
+    io::{stdout, IsTerminal},
     mem,
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -2773,6 +2773,30 @@ async fn main() -> Result<()> {
         }
         _ => None,
     };
+
+    // Must run before `bootstrap_trading_stack`: TUI mode spawns `EventStream` immediately, which
+    // panics ("reader source not set") when stdin is not a TTY — common with nohup/systemd/docker.
+    if headless_profile.is_none()
+        && (!std::io::stdin().is_terminal() || !stdout().is_terminal())
+    {
+        let exe = args
+            .first()
+            .map(|s| s.as_str())
+            .unwrap_or("polymarket-crypto");
+        eprintln!(
+            "error: interactive TUI requires a terminal (stdin and stdout must be TTYs).\n\
+             \n\
+             Common cases: nohup without `run`, systemd without a tty, Docker without `-it`, or stdin/stdout redirected.\n\
+             For headless trading:\n\
+             \n\
+               {exe} run --market btc-5m\n\
+             \n\
+             Use `{exe} run --help` for profiles.",
+        );
+        return Err(anyhow::anyhow!(
+            "interactive mode requires a TTY; use `polymarket-crypto run --market <PROFILE>` for headless operation"
+        ));
+    }
 
     let stack = bootstrap_trading_stack(
         &cfg,

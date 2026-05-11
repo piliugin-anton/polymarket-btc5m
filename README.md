@@ -90,6 +90,14 @@ Everything happens in the terminal. No browser required once you have your walle
    ```
    If Windows Defender SmartScreen blocks the binary, click **More info → Run anyway**.
 
+   **Headless** (servers, `nohup`, systemd, Docker without `-it`): the interactive TUI needs a real terminal; otherwise use the `run` subcommand:
+
+   ```sh
+   ./polymarket-crypto-linux-x86_64 run --market btc-5m
+   ```
+
+   Replace `btc-5m` with your profile (`run --help`). Same pattern on macOS / Windows with the matching binary name.
+
 ---
 
 ### Option B — build from source
