@@ -1712,6 +1712,11 @@ impl AppState {
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
+                self.trailing.clear();
+                self.pending_trail_arms.clear();
+                self.pending_trailing_sells.clear();
+                self.trailing_sell_in_flight.clear();
+                self.trailing_sell_partial_fill_grace_until.clear();
                 self.watched_books.clear();
                 self.autotrading_open.clear();
                 self.autotrading_in_flight.clear();
@@ -4130,6 +4135,77 @@ mod tests {
             "OLD_UP trail should not be dropped when NEW_UP book updates"
         );
         assert!(s.best_bid_for_token("OLD_UP").is_some());
+    }
+
+    #[tokio::test]
+    async fn market_roll_unregisters_previous_trailing_state() {
+        let mut s = test_state();
+        let m_old = test_market("OLD_UP_ROLL", "OLD_DOWN_ROLL", "0xc0roll");
+        let m_new = test_market("NEW_UP_ROLL", "NEW_DOWN_ROLL", "0xc1roll");
+        s.market = Some(m_old.clone());
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "OLD_UP_ROLL".into(),
+            bids: vec![BookLevel {
+                price: 0.55,
+                size: 10.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.57,
+                size: 10.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "OLD_UP_ROLL".into(),
+            trail_bps: 100,
+            activation_bps: 0,
+            market: m_old.clone(),
+        })
+        .await;
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Down,
+            entry_price: 0.50,
+            plan_sell_shares: 5.0,
+            token_id: "OLD_DOWN_ROLL".into(),
+            trail_bps: 100,
+            activation_bps: 500,
+            market: m_old.clone(),
+        })
+        .await;
+        s.pending_trailing_sells.push_back(TrailingExit {
+            token_id: "OLD_UP_ROLL".into(),
+            market: m_old,
+            outcome: Outcome::Up,
+            sell_shares: 3.0,
+        });
+        s.trailing_sell_in_flight.insert("OLD_UP_ROLL".into());
+        s.trailing_sell_partial_fill_grace_until.insert(
+            "OLD_UP_ROLL".into(),
+            Instant::now() + Duration::from_secs(1),
+        );
+        assert!(!s.trailing.is_empty());
+        assert!(!s.pending_trail_arms.is_empty());
+        assert!(!s.pending_trailing_sells.is_empty());
+
+        s.apply(AppEvent::MarketRoll {
+            market: m_new,
+            buy_trail_bps: 0,
+            buy_trail_activation_bps: 0,
+        })
+        .await;
+
+        assert!(s.trailing.is_empty());
+        assert!(s.pending_trail_arms.is_empty());
+        assert!(s.pending_trailing_sells.is_empty());
+        assert!(s.trailing_sell_in_flight.is_empty());
+        assert!(s.trailing_sell_partial_fill_grace_until.is_empty());
+        assert_eq!(s.background_trail_count(), 0);
+        assert_eq!(
+            s.cached_book_watch_tokens,
+            vec!["NEW_DOWN_ROLL".to_string(), "NEW_UP_ROLL".to_string()]
+        );
     }
 
     /// Two FAK buys on the same outcome token before arming: pending plans must add, not overwrite.
