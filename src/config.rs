@@ -94,6 +94,9 @@ pub struct Config {
     pub autotrading: bool,
     /// Maximum currently open auto-trading positions. Closed auto inventory frees capacity.
     pub autotrading_max_positions: usize,
+    /// Optional gate that allows new automatic BUY starts only in the final N seconds before the
+    /// active market closes.
+    pub autotrading_buy_last_secs: Option<u64>,
     /// When set, autotrading GTD BUY `expiration` is `now + this many seconds` (plus Polymarket’s
     /// +60s signing offset — see [`crate::gamma::clob_gtd_expiration_secs_after_duration_from_now`]).
     /// When unset, expiration matches manual limits: end of the current market window.
@@ -215,6 +218,9 @@ impl Config {
         let autotrading_max_positions = parse_autotrading_max_positions(
             std::env::var("AUTOTRADING_MAX_POSITIONS").ok().as_deref(),
         );
+        let autotrading_buy_last_secs = parse_autotrading_buy_last_secs(
+            std::env::var("AUTOTRADING_BUY_LAST_SECS").ok().as_deref(),
+        );
         let autotrading_order_expires_after_secs = parse_autotrading_order_expires_after_secs(
             std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
                 .ok()
@@ -312,6 +318,7 @@ impl Config {
             trailing_exit_min_profit_bps,
             autotrading,
             autotrading_max_positions,
+            autotrading_buy_last_secs,
             autotrading_order_expires_after_secs,
             autotrading_max_entry_price,
             autotrading_signal_min,
@@ -351,6 +358,12 @@ fn parse_autotrading_max_positions(value: Option<&str>) -> usize {
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(1)
+}
+
+fn parse_autotrading_buy_last_secs(value: Option<&str>) -> Option<u64> {
+    value
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|n| *n > 0)
 }
 
 fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64> {
@@ -419,11 +432,11 @@ fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        parse_autotrading_max_entry_price, parse_autotrading_max_positions,
-        parse_autotrading_order_expires_after_secs, parse_autotrading_signal_min, parse_env_bool,
-        parse_round_log_snap_interval_secs, parse_strategy_max_spread_mult,
-        parse_strategy_min_top_ask_shares, parse_strategy_strong_gap_mult,
-        parse_strategy_watch_ratio, AutotradingSignalMin,
+        parse_autotrading_buy_last_secs, parse_autotrading_max_entry_price,
+        parse_autotrading_max_positions, parse_autotrading_order_expires_after_secs,
+        parse_autotrading_signal_min, parse_env_bool, parse_round_log_snap_interval_secs,
+        parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
+        parse_strategy_strong_gap_mult, parse_strategy_watch_ratio, AutotradingSignalMin,
     };
 
     #[test]
@@ -457,6 +470,15 @@ mod tests {
             parse_autotrading_order_expires_after_secs(Some("120")),
             Some(120)
         );
+    }
+
+    #[test]
+    fn parse_autotrading_buy_last_secs_accepts_positive_only() {
+        assert_eq!(parse_autotrading_buy_last_secs(None), None);
+        assert_eq!(parse_autotrading_buy_last_secs(Some("")), None);
+        assert_eq!(parse_autotrading_buy_last_secs(Some("0")), None);
+        assert_eq!(parse_autotrading_buy_last_secs(Some("not-a-number")), None);
+        assert_eq!(parse_autotrading_buy_last_secs(Some("60")), Some(60));
     }
 
     #[test]

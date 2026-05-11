@@ -767,6 +767,24 @@ fn clob_response_accepted(resp: &trading::PostOrderResponse) -> bool {
         })
 }
 
+fn autotrading_buy_time_window_allows(
+    market: &gamma::ActiveMarket,
+    buy_last_secs: Option<u64>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let Some(secs) = buy_last_secs else {
+        return true;
+    };
+    let until_close = market.closes_at.signed_duration_since(now);
+    if until_close <= chrono::Duration::seconds(0) {
+        return false;
+    }
+    let Ok(secs) = i64::try_from(secs) else {
+        return true;
+    };
+    until_close <= chrono::Duration::seconds(secs)
+}
+
 fn try_spawn_autotrading_buy(
     state: &mut AppState,
     trading: &Arc<TradingClient>,
@@ -783,6 +801,9 @@ fn try_spawn_autotrading_buy(
     let Some(market) = state.market.as_ref() else {
         return;
     };
+    if !autotrading_buy_time_window_allows(market, cfg.autotrading_buy_last_secs, Utc::now()) {
+        return;
+    }
     let token_id = match outcome {
         Outcome::Up => market.up_token_id.clone(),
         Outcome::Down => market.down_token_id.clone(),
@@ -2915,6 +2936,41 @@ mod tests {
         assert!(
             resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111", None).is_none()
         );
+    }
+
+    #[test]
+    fn autotrading_buy_time_window_allows_only_last_configured_seconds() {
+        let mut state = test_autotrading_state();
+        let now = Utc::now();
+        let market = state.market.as_mut().unwrap();
+        market.closes_at = now + chrono::Duration::seconds(60);
+
+        assert!(autotrading_buy_time_window_allows(
+            market,
+            None,
+            now - chrono::Duration::seconds(1)
+        ));
+        assert!(!autotrading_buy_time_window_allows(
+            market,
+            Some(60),
+            now - chrono::Duration::seconds(1)
+        ));
+        assert!(autotrading_buy_time_window_allows(market, Some(60), now));
+        assert!(autotrading_buy_time_window_allows(
+            market,
+            Some(60),
+            now + chrono::Duration::seconds(59)
+        ));
+        assert!(!autotrading_buy_time_window_allows(
+            market,
+            Some(60),
+            now + chrono::Duration::seconds(60)
+        ));
+        assert!(!autotrading_buy_time_window_allows(
+            market,
+            Some(60),
+            now + chrono::Duration::seconds(61)
+        ));
     }
 
     #[test]
