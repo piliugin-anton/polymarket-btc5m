@@ -2975,7 +2975,7 @@ mod tests {
             &mut state,
             AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC + 1.0,
             true,
-            now + Duration::from_secs(29)
+            now + AUTO_REDEEM_MIN_INTERVAL.saturating_sub(Duration::from_secs(1))
         ));
         assert!(try_mark_auto_redeem_from_claimable(
             &mut state,

@@ -495,6 +495,9 @@ pub struct AppState {
     pub fak_net_down: f64,
 
     pub fills: VecDeque<Fill>,
+    /// Trade IDs already represented in positions / fills. This is the final in-state guard for
+    /// user-channel MINED -> CONFIRMED replays; `UserTradeSync` is a cross-task prefilter.
+    seen_fill_trade_ids: HashSet<String>,
     /// Resting limit orders on the active market (from CLOB).
     pub open_orders: Vec<OpenOrderRow>,
     pub status_line: String,
@@ -612,6 +615,7 @@ impl AppState {
             fak_net_up: 0.0,
             fak_net_down: 0.0,
             fills: VecDeque::with_capacity(64),
+            seen_fill_trade_ids: HashSet::new(),
             open_orders: Vec::new(),
             status_line: "Loading Polymarket markets…".into(),
             collateral_cash_usdc: None,
@@ -952,6 +956,13 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn claim_fill_trade_id(&mut self, clob_trade_id: Option<&str>) -> bool {
+        let Some(key) = fill_trade_id_key(clob_trade_id) else {
+            return true;
+        };
+        self.seen_fill_trade_ids.insert(key)
     }
 
     fn manual_signal_book_side(&self, outcome: Outcome) -> ManualSignalBookSide {
@@ -1709,6 +1720,7 @@ impl AppState {
                 self.fak_net_up = 0.0;
                 self.fak_net_down = 0.0;
                 self.fills.clear();
+                self.seen_fill_trade_ids.clear();
                 self.open_orders.clear();
                 self.top_holders_up_sum = None;
                 self.top_holders_down_sum = None;
@@ -1751,17 +1763,9 @@ impl AppState {
                         .filter_map(|f| f.clob_trade_id.clone())
                         .filter(|s| !s.is_empty());
                     self.user_trade_sync.seed_seen_trades_from_rest(ids).await;
-                    let mut have_id: HashSet<String> = self
-                        .fills
-                        .iter()
-                        .filter_map(|f| f.clob_trade_id.clone())
-                        .collect();
                     for f in fills_bootstrap {
-                        if let Some(ref id) = f.clob_trade_id {
-                            if have_id.contains(id) {
-                                continue;
-                            }
-                            have_id.insert(id.clone());
+                        if !self.claim_fill_trade_id(f.clob_trade_id.as_deref()) {
+                            continue;
                         }
                         self.fills.push_back(f);
                     }
@@ -1841,6 +1845,9 @@ impl AppState {
                 // 2. `OrderAck` for the same fill is queued ahead of `UserChannelFill` and is
                 //    processed first; `ack_wait` now holds the entry but the WS pre-check already
                 //    returned `true` before that happened.
+                if !self.claim_fill_trade_id(Some(&clob_trade_id)) {
+                    return;
+                }
                 if self
                     .user_trade_sync
                     .fill_already_committed(&clob_trade_id)
@@ -2304,6 +2311,15 @@ fn trim_fills_to_cap(fills: &mut VecDeque<Fill>, cap: usize) {
     sort_fills_by_ts_desc(fills);
     while fills.len() > cap {
         fills.pop_back();
+    }
+}
+
+fn fill_trade_id_key(clob_trade_id: Option<&str>) -> Option<String> {
+    let id = clob_trade_id?.trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_ascii_lowercase())
     }
 }
 
@@ -2921,9 +2937,11 @@ pub fn hydrate_positions_from_trades(
         } else {
             Outcome::Down
         };
-        let tid = t.id.trim();
-        if !tid.is_empty() && !seen_trade_ids.insert(tid.to_string()) {
-            continue;
+        let trade_id = t.id.trim();
+        if let Some(key) = fill_trade_id_key(Some(trade_id)) {
+            if !seen_trade_ids.insert(key) {
+                continue;
+            }
         }
         let ts = parse_trade_timestamp(&t.match_time);
         let (realized, fill_price) = match outcome {
@@ -2937,10 +2955,10 @@ pub fn hydrate_positions_from_trades(
             qty,
             price: fill_price,
             realized,
-            clob_trade_id: if t.id.is_empty() {
+            clob_trade_id: if trade_id.is_empty() {
                 None
             } else {
-                Some(t.id.clone())
+                Some(trade_id.to_string())
             },
         });
     }
@@ -3812,6 +3830,49 @@ mod tests {
         assert!((pu.shares - 10.0).abs() < 1e-6, "shares={}", pu.shares);
         assert_eq!(fills.len(), 1, "fills={:?}", fills);
         assert_eq!(fills[0].clob_trade_id, Some("same-fill".into()));
+    }
+
+    #[tokio::test]
+    async fn user_channel_fill_dedupes_by_trade_id_inside_app_state() {
+        let mut s = test_state();
+        s.market = Some(test_market("111", "222", "cond"));
+
+        let first_ts = Utc::now();
+        s.apply(AppEvent::UserChannelFill {
+            clob_trade_id: "same-fill".into(),
+            order_leg_id: "0xorder1".into(),
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            token_id: "111".into(),
+            qty: 10.0,
+            price: 0.5,
+            ts: first_ts,
+            from_maker_leg: false,
+        })
+        .await;
+
+        // The app state must remain the last de-dupe boundary even if the external sync guard
+        // has been reset between a MINED delivery and the later CONFIRMED delivery.
+        s.user_trade_sync.on_market_roll().await;
+        s.apply(AppEvent::UserChannelFill {
+            clob_trade_id: "same-fill".into(),
+            order_leg_id: "0xorder1".into(),
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            token_id: "111".into(),
+            qty: 10.0,
+            price: 0.5,
+            ts: first_ts + chrono::Duration::seconds(1),
+            from_maker_leg: false,
+        })
+        .await;
+
+        assert!((s.position_up.shares - 10.0).abs() < 1e-6);
+        assert_eq!(s.fills.len(), 1, "fills={:?}", s.fills);
+        assert_eq!(
+            s.fills.front().and_then(|f| f.clob_trade_id.as_deref()),
+            Some("same-fill")
+        );
     }
 
     #[test]
