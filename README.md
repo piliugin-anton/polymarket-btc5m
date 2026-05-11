@@ -241,7 +241,7 @@ Restart the app after changing `.env`. Watch logs for loaded `strategy_*` values
 
 ### Session logging (JSONL) and offline `signal-eval`
 
-For **calibrating** strategy tunables against saved sessions, enable optional append-only logs (one file per UTC day, e.g. `data/rounds/2026-05-10.jsonl`):
+For **calibrating** strategy tunables against saved sessions, enable optional append-only logs. Files are split by UTC day, selected asset, and selected timeframe, for example `data/rounds/2026-05-11-eth-5m.jsonl`:
 
 | Variable | Meaning |
 |----------|---------|
@@ -261,6 +261,8 @@ polymarket-crypto signal-eval --dir ./data/rounds [--day YYYY-MM-DD] [--mode str
 ```
 
 `signal-eval` rebuilds [`ManualSignalInput`](src/strategy.rs) from each `snap` and compares replayed labels to `close.win` where it is `up` or `down`. A small example log lives at [`tests/fixtures/round_log_small.jsonl`](tests/fixtures/round_log_small.jsonl).
+
+When `--day YYYY-MM-DD` is provided, both CLIs read all logs for that date, including per-market files such as `YYYY-MM-DD-btc-5m.jsonl` and `YYYY-MM-DD-eth-15m.jsonl`. Older unsuffixed files like `YYYY-MM-DD.jsonl` are still included.
 
 ### Autotrading
 
