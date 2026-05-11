@@ -78,7 +78,7 @@ fn list_jsonl_files(dir: &std::path::Path, day: Option<&str>) -> Result<Vec<Path
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             if let Some(d) = day {
                 if p.file_stem()
-                    .map(|s| s.to_string_lossy() == d)
+                    .map(|s| jsonl_stem_matches_day(&s.to_string_lossy(), d))
                     .unwrap_or(false)
                 {
                     out.push(p);
@@ -90,6 +90,13 @@ fn list_jsonl_files(dir: &std::path::Path, day: Option<&str>) -> Result<Vec<Path
     }
     out.sort();
     Ok(out)
+}
+
+fn jsonl_stem_matches_day(stem: &str, day: &str) -> bool {
+    stem == day
+        || stem
+            .strip_prefix(day)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 fn ingest_jsonl(path: &std::path::Path, rounds: &mut HashMap<String, RoundAccum>) -> Result<()> {
@@ -441,8 +448,26 @@ mod signal_eval_tests {
     use std::collections::HashMap;
     use std::io::Write;
 
-    use super::{ingest_jsonl, snap_to_input, RoundAccum, TunableOverrides};
+    use super::{ingest_jsonl, list_jsonl_files, snap_to_input, RoundAccum, TunableOverrides};
     use crate::strategy::{evaluate_manual_signal, ManualSignalLabel};
+
+    #[test]
+    fn day_filter_includes_profile_suffixed_jsonl_files() {
+        let dir =
+            std::env::temp_dir().join(format!("signal_eval_day_filter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-05-11.jsonl"), "").unwrap();
+        std::fs::write(dir.join("2026-05-11-btc-5m.jsonl"), "").unwrap();
+        std::fs::write(dir.join("2026-05-12-btc-5m.jsonl"), "").unwrap();
+
+        let paths = list_jsonl_files(&dir, Some("2026-05-11")).unwrap();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|p| p.ends_with("2026-05-11.jsonl")));
+        assert!(paths.iter().any(|p| p.ends_with("2026-05-11-btc-5m.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn strong_gap_mult_monotonic_on_fixture() {

@@ -560,6 +560,9 @@ async fn apply_app_event(
                 }
                 ev => {
                     if let AppEvent::StartTrading(p) = &ev {
+                        if let Some(ref rl) = state.round_log {
+                            rl.set_market_profile(p);
+                        }
                         let _ = rtds_sym_tx.send(p.asset.rtds_symbol.to_string());
                         let _ = market_profile_tx.send(p.clone());
                         if !*discovery_spawned {

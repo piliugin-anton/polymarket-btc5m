@@ -156,6 +156,41 @@ pub fn approx_win_from_spot(spot: f64, ptb: f64) -> Option<&'static str> {
     }
 }
 
+fn round_log_path_for_date(dir: &Path, day: NaiveDate, profile: Option<(&str, &str)>) -> PathBuf {
+    match profile {
+        Some((asset, timeframe)) => dir.join(format!(
+            "{}-{}-{}.jsonl",
+            day,
+            sanitize_round_log_path_component(asset),
+            sanitize_round_log_path_component(timeframe)
+        )),
+        None => dir.join(format!("{}.jsonl", day)),
+    }
+}
+
+fn sanitize_round_log_path_component(value: &str) -> String {
+    let s: String = value
+        .trim()
+        .chars()
+        .filter_map(|c| {
+            if c.is_ascii_alphanumeric() {
+                Some(c.to_ascii_lowercase())
+            } else if c == '-' || c == '_' {
+                Some(c)
+            } else if c.is_ascii_whitespace() {
+                Some('-')
+            } else {
+                None
+            }
+        })
+        .collect();
+    if s.is_empty() {
+        "unknown".to_string()
+    } else {
+        s
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RoundLogWriterConfig {
     pub dir: PathBuf,
@@ -163,8 +198,15 @@ pub struct RoundLogWriterConfig {
     pub log_fills: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RoundLogFileContext {
+    asset: String,
+    timeframe: String,
+}
+
 enum WriterMsg {
     Line(String),
+    SetFileContext(RoundLogFileContext),
     Shutdown,
 }
 
@@ -191,16 +233,29 @@ impl RoundLogHandle {
         let (tx, mut rx) = mpsc::channel::<WriterMsg>(4096);
         let dir = cfg.dir.clone();
         tokio::spawn(async move {
-            let mut current_date: Option<NaiveDate> = None;
+            let mut current_path: Option<PathBuf> = None;
+            let mut file_context: Option<RoundLogFileContext> = None;
             let mut file: Option<tokio::fs::File> = None;
             while let Some(msg) = rx.recv().await {
                 match msg {
                     WriterMsg::Shutdown => break,
+                    WriterMsg::SetFileContext(ctx) => {
+                        if file_context.as_ref() != Some(&ctx) {
+                            file_context = Some(ctx);
+                            current_path = None;
+                            file = None;
+                        }
+                    }
                     WriterMsg::Line(s) => {
                         let today = Utc::now().date_naive();
-                        if current_date != Some(today) {
-                            current_date = Some(today);
-                            let path = dir.join(format!("{}.jsonl", today));
+                        let path = round_log_path_for_date(
+                            &dir,
+                            today,
+                            file_context
+                                .as_ref()
+                                .map(|ctx| (ctx.asset.as_str(), ctx.timeframe.as_str())),
+                        );
+                        if current_path.as_ref() != Some(&path) {
                             if let Some(parent) = path.parent() {
                                 let _ = tokio::fs::create_dir_all(parent).await;
                             }
@@ -212,10 +267,12 @@ impl RoundLogHandle {
                             {
                                 Ok(f) => {
                                     tracing::debug!(path = %path.display(), "round log opened");
+                                    current_path = Some(path);
                                     file = Some(f);
                                 }
                                 Err(e) => {
                                     tracing::warn!(error = %e, path = %path.display(), "round log open failed");
+                                    current_path = None;
                                     file = None;
                                 }
                             }
@@ -237,6 +294,20 @@ impl RoundLogHandle {
             snap_interval: cfg.snap_interval,
             log_fills: cfg.log_fills,
             last_snap_at: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn set_market_profile(&self, profile: &MarketProfile) {
+        let ctx = RoundLogFileContext {
+            asset: profile.asset.label.to_string(),
+            timeframe: profile.timeframe.label().to_string(),
+        };
+        match self.tx.try_send(WriterMsg::SetFileContext(ctx)) {
+            Ok(()) => {}
+            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                tracing::warn!("round log channel full — dropping file context update");
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
         }
     }
 
@@ -552,7 +623,7 @@ fn list_jsonl_files(dir: &Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
         if p.extension().map(|e| e == "jsonl").unwrap_or(false) {
             if let Some(d) = day {
                 if p.file_stem()
-                    .map(|s| s.to_string_lossy() == d)
+                    .map(|s| jsonl_stem_matches_day(&s.to_string_lossy(), d))
                     .unwrap_or(false)
                 {
                     out.push(p);
@@ -564,6 +635,13 @@ fn list_jsonl_files(dir: &Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
     }
     out.sort();
     Ok(out)
+}
+
+fn jsonl_stem_matches_day(stem: &str, day: &str) -> bool {
+    stem == day
+        || stem
+            .strip_prefix(day)
+            .is_some_and(|rest| rest.starts_with('-'))
 }
 
 #[cfg(test)]
@@ -600,5 +678,32 @@ mod tests {
         let s = serde_json::to_string(&o).unwrap();
         assert!(s.contains("\"t\":\"open\""));
         assert!(s.contains("\"v\":1"));
+    }
+
+    #[test]
+    fn round_log_path_includes_selected_asset_and_timeframe() {
+        let dir = PathBuf::from("./data/rounds");
+        let day = NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
+
+        let path = round_log_path_for_date(&dir, day, Some(("BTC", "5m")));
+
+        assert_eq!(path, dir.join("2026-05-11-btc-5m.jsonl"));
+    }
+
+    #[test]
+    fn day_filter_includes_profile_suffixed_jsonl_files() {
+        let dir = std::env::temp_dir().join(format!("round_log_day_filter_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-05-11.jsonl"), "").unwrap();
+        std::fs::write(dir.join("2026-05-11-btc-5m.jsonl"), "").unwrap();
+        std::fs::write(dir.join("2026-05-12-btc-5m.jsonl"), "").unwrap();
+
+        let paths = list_jsonl_files(&dir, Some("2026-05-11")).unwrap();
+
+        assert_eq!(paths.len(), 2);
+        assert!(paths.iter().any(|p| p.ends_with("2026-05-11.jsonl")));
+        assert!(paths.iter().any(|p| p.ends_with("2026-05-11-btc-5m.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

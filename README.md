@@ -246,7 +246,7 @@ For **calibrating** strategy tunables against saved sessions, enable optional ap
 | Variable | Meaning |
 |----------|---------|
 | `ROUND_LOG_ENABLED` | `true` / `1` to record `open` / `snap` / `close` lines |
-| `ROUND_LOG_DIR` | Directory for `YYYY-MM-DD.jsonl` (default `./data/rounds`) |
+| `ROUND_LOG_DIR` | Directory for `YYYY-MM-DD-{asset}-{timeframe}.jsonl`, e.g. `2026-05-11-btc-5m.jsonl` (default `./data/rounds`) |
 | `ROUND_LOG_SNAP_INTERVAL_SECS` | Min seconds between `snap` rows while a round is active (default `10`, clamped `2`–`120`) |
 | `ROUND_LOG_FILLS` | When `true`, also append `fill` lines (diagnostics only; default `false`) |
 

@@ -124,7 +124,7 @@ pub struct Config {
 
     /// When true, append JSONL round logs under [`Self::round_log_dir`].
     pub round_log_enabled: bool,
-    /// Directory for daily `YYYY-MM-DD.jsonl` session files.
+    /// Directory for UTC-day session files, e.g. `YYYY-MM-DD-btc-5m.jsonl`.
     pub round_log_dir: std::path::PathBuf,
     /// Minimum seconds between `snap` lines while a round is active (clamped 2–120).
     pub round_log_snap_interval_secs: u64,
