@@ -129,7 +129,9 @@ const MARKET_DATA_FLUSH_MS: u64 = 10;
 const MAX_EVENTS_PER_FRAME: usize = 512;
 const EVENT_DRAIN_BUDGET: Duration = Duration::from_millis(4);
 const BALANCE_CASH_POLL_SECS: u64 = 5;
-const BALANCE_CLAIMABLE_POLL_SECS: u64 = 60;
+const BALANCE_CLAIMABLE_POLL_SECS: u64 = 15;
+const AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC: f64 = 0.01;
+const AUTO_REDEEM_MIN_INTERVAL: Duration = Duration::from_secs(15);
 const TP_CANCEL_MAX_CONCURRENT: usize = 4;
 
 #[derive(Debug, Clone, Copy)]
@@ -399,6 +401,44 @@ fn update_autotrading_snapshot_and_maybe_spawn(
     try_spawn_autotrading_buy(state, trading, tx, cfg, autotrading_snapshot_rx);
 }
 
+fn try_mark_auto_redeem_from_claimable(
+    state: &mut AppState,
+    claimable_usdc: f64,
+    claimable_refreshed: bool,
+    now: Instant,
+) -> bool {
+    if !claimable_refreshed
+        || !state.autotrading_enabled
+        || !claimable_usdc.is_finite()
+        || claimable_usdc < AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC
+    {
+        return false;
+    }
+    state.redeem_mark_in_flight(now, AUTO_REDEEM_MIN_INTERVAL)
+}
+
+fn maybe_spawn_auto_redeem(
+    state: &mut AppState,
+    tx: &mpsc::Sender<AppEvent>,
+    cfg: &Config,
+    claimable_usdc: f64,
+    claimable_refreshed: bool,
+) {
+    if try_mark_auto_redeem_from_claimable(
+        state,
+        claimable_usdc,
+        claimable_refreshed,
+        Instant::now(),
+    ) {
+        info!(
+            claimable_usdc,
+            threshold_usdc = AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC,
+            "auto CTF redeem: threshold reached"
+        );
+        spawn_claim(tx.clone(), cfg.clone(), true);
+    }
+}
+
 /// Applies one [`AppEvent`]. Returns `true` if the user requested [`Action::Quit`].
 #[allow(clippy::too_many_arguments)]
 async fn apply_app_event(
@@ -543,8 +583,27 @@ async fn apply_app_event(
                     } else {
                         None
                     };
+                    let auto_redeem_claimable = if let AppEvent::BalancePanelLoaded {
+                        claimable_usdc,
+                        claimable_refreshed,
+                        ..
+                    } = &ev
+                    {
+                        Some((*claimable_usdc, *claimable_refreshed))
+                    } else {
+                        None
+                    };
                     let do_snap = matches!(&ev, AppEvent::Price(_) | AppEvent::Tick);
                     state.apply(ev).await;
+                    if let Some((claimable_usdc, claimable_refreshed)) = auto_redeem_claimable {
+                        maybe_spawn_auto_redeem(
+                            state,
+                            tx,
+                            cfg,
+                            claimable_usdc,
+                            claimable_refreshed,
+                        );
+                    }
                     if let Some((prev, spot_last, new_market)) = market_roll_data {
                         if let Some(ref rl) = state.round_log {
                             rl.on_market_roll(
@@ -1848,7 +1907,8 @@ async fn main() -> Result<()> {
                 loop {
                     interval.tick().await;
                     let refresh_claimable = Instant::now() >= next_claimable_refresh;
-                    let panel_result = if refresh_claimable || last_claimable.is_none() {
+                    let claimable_refreshed = refresh_claimable || last_claimable.is_none();
+                    let panel_result = if claimable_refreshed {
                         crate::balances::fetch_balance_panel_usdc(
                             &data_http, &rpc_http, &rpc_url, funder,
                         )
@@ -1860,7 +1920,7 @@ async fn main() -> Result<()> {
                     };
                     match panel_result {
                         Ok((cash, claimable)) => {
-                            if refresh_claimable || last_claimable.is_none() {
+                            if claimable_refreshed {
                                 last_claimable = Some(claimable);
                                 next_claimable_refresh = Instant::now()
                                     + Duration::from_secs(BALANCE_CLAIMABLE_POLL_SECS);
@@ -1875,6 +1935,7 @@ async fn main() -> Result<()> {
                                 .send(AppEvent::BalancePanelLoaded {
                                     cash_usdc: cash,
                                     claimable_usdc: claimable,
+                                    claimable_refreshed,
                                 })
                                 .await;
                         }
@@ -2852,6 +2913,74 @@ mod tests {
             resolve_autotrading_limit_buy_at_signal(&rolled, Outcome::Up, "111", None).is_none()
         );
     }
+
+    #[test]
+    fn auto_redeem_skips_when_autotrading_disabled_or_claimable_below_threshold() {
+        let mut state = test_autotrading_state();
+        let now = Instant::now();
+
+        state.autotrading_enabled = false;
+        assert!(!try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC,
+            true,
+            now
+        ));
+        assert!(!state.redeem_in_flight);
+
+        state.autotrading_enabled = true;
+        assert!(!try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC - 0.001,
+            true,
+            now
+        ));
+        assert!(!state.redeem_in_flight);
+
+        assert!(!try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC,
+            false,
+            now
+        ));
+        assert!(!state.redeem_in_flight);
+    }
+
+    #[test]
+    fn auto_redeem_marks_gate_at_threshold_and_throttles_repeated_checks() {
+        let mut state = test_autotrading_state();
+        let now = Instant::now();
+        state.autotrading_enabled = true;
+
+        assert!(try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC,
+            true,
+            now
+        ));
+        assert!(state.redeem_in_flight);
+
+        assert!(!try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC + 1.0,
+            true,
+            now + Duration::from_secs(1)
+        ));
+
+        state.redeem_clear_in_flight();
+        assert!(!try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC + 1.0,
+            true,
+            now + Duration::from_secs(29)
+        ));
+        assert!(try_mark_auto_redeem_from_claimable(
+            &mut state,
+            AUTO_REDEEM_CLAIMABLE_THRESHOLD_USDC + 1.0,
+            true,
+            now + AUTO_REDEEM_MIN_INTERVAL
+        ));
+    }
 }
 
 fn spawn_ticker(tx: mpsc::Sender<AppEvent>) {
@@ -3000,51 +3129,30 @@ fn spawn_deposit_wallet_approvals(
     });
 }
 
-fn spawn_claim(tx: mpsc::Sender<AppEvent>, cfg: Config) {
+async fn run_claim(cfg: Config) -> Result<String> {
+    let http = crate::net::reqwest_client().context("http client")?;
+    let positions = crate::data_api::fetch_redeemable_positions(&http, cfg.funder)
+        .await
+        .context("data-api positions")?;
+    if !positions.iter().any(|p| p.redeemable) {
+        anyhow::bail!("нет redeemable-позиций (Data API) — нечего выкупать");
+    }
+    crate::redeem::redeem_resolved_positions(&cfg, &http, &positions)
+        .await
+        .context("redeem")
+}
+
+fn spawn_claim(tx: mpsc::Sender<AppEvent>, cfg: Config, auto: bool) {
     tokio::spawn(async move {
-        info!("CTF redeem: task started (key x)");
-        let http = match crate::net::reqwest_client() {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = tx
-                    .send(AppEvent::OrderErr(format!("http client: {e:#}")))
-                    .await;
-                return;
-            }
-        };
-        let positions = match crate::data_api::fetch_redeemable_positions(&http, cfg.funder).await {
-            Ok(p) => p,
-            Err(e) => {
-                let _ = tx
-                    .send(AppEvent::OrderErr(format!("data-api positions: {e:#}")))
-                    .await;
-                return;
-            }
-        };
-        if !positions.iter().any(|p| p.redeemable) {
-            let _ = tx
-                .send(AppEvent::OrderErr(
-                    "нет redeemable-позиций (Data API) — нечего выкупать".into(),
-                ))
-                .await;
-            return;
-        }
-        match crate::redeem::redeem_resolved_positions(&cfg, &http, &positions).await {
-            Ok(summary) => {
-                let _ = tx
-                    .send(AppEvent::StatusInfo(format!("CTF redeem: {summary}")))
-                    .await;
-            }
-            Err(e) => {
-                let _ = tx.send(AppEvent::OrderErr(format!("redeem: {e:#}"))).await;
-            }
-        }
+        info!(auto, "CTF redeem: task started");
+        let result = run_claim(cfg).await.map_err(|e| format!("{e:#}"));
+        let _ = tx.send(AppEvent::RedeemDone { auto, result }).await;
     });
 }
 
 fn dispatch_action(
     action: Action,
-    state: &AppState,
+    state: &mut AppState,
     trading: &Arc<TradingClient>,
     tx: &mpsc::Sender<AppEvent>,
     cfg: &Config,
@@ -3059,7 +3167,13 @@ fn dispatch_action(
         Action::Quit => {}
         Action::ForceMarketRoll => { /* market watcher polls every 10s; r is a no-op for now */ }
         Action::Claim => {
-            spawn_claim(tx.clone(), cfg.clone());
+            if state.redeem_mark_in_flight(Instant::now(), AUTO_REDEEM_MIN_INTERVAL) {
+                spawn_claim(tx.clone(), cfg.clone(), false);
+            } else {
+                let _ = tx.try_send(AppEvent::StatusInfo(
+                    "CTF redeem skipped: redeem already in flight or cooling down".into(),
+                ));
+            }
         }
         Action::DepositWalletApprovals => {
             spawn_deposit_wallet_approvals(

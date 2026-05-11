@@ -142,6 +142,7 @@ pub enum AppEvent {
     BalancePanelLoaded {
         cash_usdc: f64,
         claimable_usdc: f64,
+        claimable_refreshed: bool,
     },
     /// `GET /holders` — per-`proxyWallet` sums: if a wallet holds both outcomes, only the larger leg counts; then summed per side (Sentiment).
     TopHoldersSentiment {
@@ -220,6 +221,11 @@ pub enum AppEvent {
         token_id: String,
         filled_qty: Option<f64>,
         error: Option<String>,
+    },
+    /// Manual or automatic redeem-all task finished; clears the shared redeem in-flight guard.
+    RedeemDone {
+        auto: bool,
+        result: std::result::Result<String, String>,
     },
 }
 
@@ -563,6 +569,10 @@ pub struct AppState {
     pub autotrading_max_positions: usize,
     pub autotrading_open: HashMap<String, f64>,
     pub autotrading_in_flight: HashSet<String>,
+    /// Shared manual/automatic redeem-all gate; prevents overlapping relayer submissions.
+    pub redeem_in_flight: bool,
+    /// Last redeem-all task start time, used to throttle automatic and manual redeems together.
+    pub last_redeem_started_at: Option<Instant>,
     /// Scales required spot gap for manual `STRONG` signal (from `STRATEGY_STRONG_GAP_MULT`).
     pub strategy_strong_gap_mult: f64,
     /// Scales max spread gate for strategy book usability (`STRATEGY_MAX_SPREAD_MULT`).
@@ -638,6 +648,8 @@ impl AppState {
             autotrading_max_positions: 1,
             autotrading_open: HashMap::new(),
             autotrading_in_flight: HashSet::new(),
+            redeem_in_flight: false,
+            last_redeem_started_at: None,
             strategy_strong_gap_mult: 1.0,
             strategy_max_spread_mult: 1.0,
             strategy_min_top_ask_shares: 5.0,
@@ -898,6 +910,26 @@ impl AppState {
 
     pub fn autotrading_clear_in_flight(&mut self, token_id: &str) {
         self.autotrading_in_flight.remove(token_id);
+    }
+
+    pub fn redeem_mark_in_flight(&mut self, now: Instant, min_interval: Duration) -> bool {
+        if self.redeem_in_flight
+            || self.last_redeem_started_at.is_some_and(|started| {
+                match now.checked_duration_since(started) {
+                    Some(elapsed) => elapsed < min_interval,
+                    None => true,
+                }
+            })
+        {
+            return false;
+        }
+        self.redeem_in_flight = true;
+        self.last_redeem_started_at = Some(now);
+        true
+    }
+
+    pub fn redeem_clear_in_flight(&mut self) {
+        self.redeem_in_flight = false;
     }
 
     pub fn autotrading_apply_fill(&mut self, token_id: &str, side: Side, qty: f64) {
@@ -1775,6 +1807,7 @@ impl AppState {
             AppEvent::BalancePanelLoaded {
                 cash_usdc,
                 claimable_usdc,
+                claimable_refreshed: _,
             } => {
                 self.collateral_cash_usdc = Some(cash_usdc);
                 self.collateral_claimable_usdc = Some(claimable_usdc);
@@ -2038,6 +2071,25 @@ impl AppState {
                         "autotrading: GTD BUY accepted (resting or no fill in response); \
                                         maker fills update the auto position via trades"
                             .into();
+                }
+            }
+            AppEvent::RedeemDone { auto, result } => {
+                self.redeem_clear_in_flight();
+                match result {
+                    Ok(summary) => {
+                        self.status_line = if auto {
+                            format!("auto CTF redeem: {summary}")
+                        } else {
+                            format!("CTF redeem: {summary}")
+                        };
+                    }
+                    Err(e) => {
+                        self.status_line = if auto {
+                            format!("✗ auto redeem: {e}")
+                        } else {
+                            format!("✗ redeem: {e}")
+                        };
+                    }
                 }
             }
             AppEvent::OrderErrModal(e) => {
@@ -3139,6 +3191,21 @@ mod tests {
         s.autotrading_clear_in_flight("111");
 
         assert!(s.autotrading_can_buy("111"));
+    }
+
+    #[test]
+    fn redeem_gate_blocks_overlap_and_respects_cooldown() {
+        let mut s = test_state();
+        let t0 = Instant::now();
+        let cooldown = Duration::from_secs(30);
+
+        assert!(s.redeem_mark_in_flight(t0, cooldown));
+        assert!(!s.redeem_mark_in_flight(t0 + Duration::from_secs(1), cooldown));
+
+        s.redeem_clear_in_flight();
+
+        assert!(!s.redeem_mark_in_flight(t0 + Duration::from_secs(29), cooldown));
+        assert!(s.redeem_mark_in_flight(t0 + cooldown, cooldown));
     }
 
     fn trade(
