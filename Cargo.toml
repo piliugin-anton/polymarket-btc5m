@@ -47,6 +47,7 @@ chrono-tz         = "0.10"
 uuid              = { version = "1", features = ["v4"] }
 rand              = "0.9"
 dotenvy           = "0.15"
+clap              = { version = "4", features = ["derive"] }
 tracing           = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 alloy-dyn-abi = { version = "0.8", features = ["eip712", "std"] }

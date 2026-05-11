@@ -38,13 +38,14 @@ mod strategy;
 mod stop_loss;
 mod take_profit;
 
-use market_profile::{MarketProfile, Timeframe, CRYPTO_ASSETS};
+use market_profile::{parse_market_profile, MarketProfile, Timeframe, CRYPTO_ASSETS};
 mod net;
 mod trading;
 mod trailing_stop;
 mod ui;
 
 use anyhow::{Context, Result};
+use clap::{error::ErrorKind, Parser};
 use app::{
     clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
     resolve_market_order, resolve_trailing_sell, trailing_exit_sell_meets_min_gross_profit_bps,
@@ -1973,128 +1974,80 @@ use trading::{
     TradingClient,
 };
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // ── setup ────────────────────────────────────────────────────────
-    // stderr gets hidden once crossterm enters the alternate screen, and
-    // any warn! / error! we emit during the TUI phase vanishes. Write the
-    // log to ./polymarket-crypto.log so it's always inspectable post-mortem.
-    let log_path = std::env::var("POLYMARKET_CRYPTO_LOG_PATH")
-        .unwrap_or_else(|_| "./polymarket-crypto.log".into());
-    let log_file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .context(format!("open log file {log_path}"))?;
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "POLYMARKET_CRYPTO=debug,warn".into()),
-        )
-        .with_writer(std::sync::Mutex::new(log_file))
-        .with_ansi(false)
-        .init();
+#[derive(Parser)]
+#[command(
+    name = "polymarket-crypto run",
+    override_usage = "polymarket-crypto run --market <PROFILE>",
+    about = "Headless trading: same feeds, discovery, and autotrading env as the TUI (no terminal UI)."
+)]
+struct RunCli {
+    #[arg(long, value_name = "PROFILE")]
+    market: String,
+}
 
-    eprintln!("▸ polymarket-crypto — logging to {log_path}");
-    eprintln!("▸ if credentials or data don't appear, run: polymarket-crypto debug-auth");
+struct BootstrapOpts {
+    skip_wizard_series: bool,
+    spawn_key_reader: bool,
+}
 
-    let args: Vec<String> = std::env::args().collect();
-    // `deploy-wallet` must run before `Config::from_env()` (no `POLYMARKET_FUNDER` yet).
-    match args.get(1).map(String::as_str) {
-        Some("deploy-wallet") => {
-            return deploy_wallet_cmd::run().await;
-        }
-        Some("round-log-inspect") => {
-            return round_log::run_inspect_cli(&args[2..]).map_err(Into::into);
-        }
-        Some("signal-eval") => {
-            return signal_eval::run_signal_eval_cli(&args[2..]).map_err(Into::into);
-        }
-        Some("help") | Some("-h") | Some("--help") => {
-            println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
-            println!("Without a subcommand, launches the interactive TUI.\n");
-            println!("Subcommands:");
-            println!("  debug-auth     Run the CLOB L1 auth flow and dump all intermediate");
-            println!("                 values (useful for debugging 401/403 errors).");
-            println!(
-                "  deploy-wallet  Submit WALLET-CREATE; POLYMARKET_PK + POLYMARKET_RELAYER_API_KEY"
-            );
-            println!(
-                "                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default)."
-            );
-            println!("  help           Show this help.");
-            println!("  round-log-inspect  Summarize JSONL session logs (--dir, --day).");
-            println!("  signal-eval    Offline strategy replay vs logged approx wins (--dir, --mode, …).");
-            return Ok(());
-        }
-        _ => {}
-    }
+struct TradingStack {
+    tx: mpsc::Sender<AppEvent>,
+    rx: mpsc::Receiver<AppEvent>,
+    key_rx: Option<mpsc::Receiver<KeyEvent>>,
+    trading: Arc<TradingClient>,
+    user_open_ledger: Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    user_trade_sync: Arc<feeds::user_trade_sync::UserTradeSync>,
+    market_tx: mpsc::Sender<gamma::ActiveMarket>,
+    market_profile_tx: watch::Sender<Arc<MarketProfile>>,
+    market_profile_rx_slot: Option<watch::Receiver<Arc<MarketProfile>>>,
+    user_bundle_tx: watch::Sender<UserWsBundle>,
+    book_token_tx: watch::Sender<Vec<String>>,
+    rtds_sym_tx: watch::Sender<String>,
+}
 
-    let cfg = Config::from_env().context("loading config")?;
-    info!(
-        signer = %cfg.signer_address,
-        funder = %cfg.funder,
-        proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
-        take_profit_bps = cfg.take_profit_bps,
-        buy_trail_bps = cfg.buy_trail_bps,
-        trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
-        autotrading = cfg.autotrading,
-        autotrading_max_positions = cfg.autotrading_max_positions,
-        autotrading_order_expires_after_secs = ?cfg.autotrading_order_expires_after_secs,
-        strategy_strong_gap_mult = cfg.strategy_strong_gap_mult,
-        strategy_max_spread_mult = cfg.strategy_max_spread_mult,
-        strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares,
-        strategy_watch_ratio = cfg.strategy_watch_ratio,
-        round_log_enabled = cfg.round_log_enabled,
-        round_log_dir = %cfg.round_log_dir.display(),
-        round_log_snap_interval_secs = cfg.round_log_snap_interval_secs,
-        round_log_fills = cfg.round_log_fills,
-        "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
-    );
-
-    // ── subcommand dispatch (no TUI) ─────────────────────────────────
-    match args.get(1).map(String::as_str) {
-        Some("debug-auth") => {
-            let t = TradingClient::new(cfg.clone())?;
-            return t.debug_auth_flow().await;
-        }
-        _ => {}
-    }
+fn bootstrap_trading_stack(cfg: &Config, opts: BootstrapOpts) -> Result<TradingStack> {
 
     // Shared event channel — generous buffer so bursts from the book WS don't drop
-    let (tx, mut rx) = mpsc::channel::<AppEvent>(2048);
+    let (tx, rx) = mpsc::channel::<AppEvent>(2048);
 
     let market_data = feeds::market_data_coalescer::MarketDataCoalescer::new(4096);
     spawn_market_data_flusher(market_data.clone(), tx.clone());
 
     let (rtds_sym_tx, rtds_sym_rx) = watch::channel(String::new());
 
-    // Wizard: load Gamma /series (5m) metadata for the asset list.
-    {
-        let txx = tx.clone();
-        tokio::spawn(async move {
-            let client = match net::reqwest_client() {
-                Ok(c) => c,
-                Err(e) => {
-                    let _ = txx
-                        .send(AppEvent::SeriesListReady(Err(e.to_string())))
-                        .await;
-                    return;
-                }
-            };
-            let out = match crate::gamma_series::fetch_crypto_series_for_wizard(&client).await {
-                Ok(rows) => Ok(rows),
-                Err(e) => Err(e.to_string()),
-            };
-            let _ = txx.send(AppEvent::SeriesListReady(out)).await;
-        });
+    if !opts.skip_wizard_series {
+        // Wizard: load Gamma /series (5m) metadata for the asset list.
+        {
+            let txx = tx.clone();
+            tokio::spawn(async move {
+                let client = match net::reqwest_client() {
+                    Ok(c) => c,
+                    Err(e) => {
+                        let _ = txx
+                            .send(AppEvent::SeriesListReady(Err(e.to_string())))
+                            .await;
+                        return;
+                    }
+                };
+                let out = match crate::gamma_series::fetch_crypto_series_for_wizard(&client).await {
+                    Ok(rows) => Ok(rows),
+                    Err(e) => Err(e.to_string()),
+                };
+                let _ = txx.send(AppEvent::SeriesListReady(out)).await;
+            });
+        }
     }
 
     // ── spawn feeds ──────────────────────────────────────────────────
     spawn_price_feed(tx.clone(), rtds_sym_rx);
     spawn_ticker(tx.clone());
-    let (key_tx, mut key_rx) = mpsc::channel::<KeyEvent>(256);
-    spawn_key_reader(key_tx, tx.clone());
+    let key_rx = if opts.spawn_key_reader {
+        let (key_tx, key_rx) = mpsc::channel::<KeyEvent>(256);
+        spawn_key_reader(key_tx, tx.clone());
+        Some(key_rx)
+    } else {
+        None
+    };
 
     // Shared `TradingClient` (interior `RwLock` for caches + `Mutex` for one-shot creds derive).
     let trading = Arc::new(TradingClient::new(cfg.clone())?);
@@ -2205,7 +2158,7 @@ async fn main() -> Result<()> {
         timeframe: Timeframe::M5,
     });
     let (market_profile_tx, market_profile_rx) = watch::channel(profile_watch_seed);
-    let mut market_profile_rx_slot = Some(market_profile_rx);
+    let market_profile_rx_slot = Some(market_profile_rx);
 
     let (user_bundle_tx, user_bundle_rx) = watch::channel(UserWsBundle::default());
     let (book_token_tx, book_token_rx) = watch::channel(Vec::<String>::new());
@@ -2621,31 +2574,227 @@ async fn main() -> Result<()> {
         }
     });
 
-    // ── terminal setup ───────────────────────────────────────────────
-    enable_raw_mode()?;
-    let mut out = stdout();
-    // Do not enable mouse capture: we don't handle mouse events, and SGR mouse mode can make some
-    // terminals (e.g. embedded IDE terminal) deliver keyboard only after the pane is clicked.
-    // Focus events are opt-in (`EnableFocusChange`); without them, `FocusGained` never fires after
-    // hide/show and we cannot re-apply raw mode (see crossterm::event module docs).
-    //
-    // Kitty keyboard protocol (when supported): lock/modifier bits in `KeyEvent.state` and
-    // press/repeat/release kinds — see crossterm `examples/event-read.rs` and
-    // https://sw.kovidgoyal.net/kitty/keyboard-protocol/
-    // Skip on VS Code's terminal: enabling these flags is known to break CapsLock there.
-    let can_kbd_enhance = matches!(
-        crossterm::terminal::supports_keyboard_enhancement(),
-        Ok(true)
-    );
-    let vscode_terminal = std::env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode");
-    let use_keyboard_protocol = can_kbd_enhance && !vscode_terminal;
-    if use_keyboard_protocol {
-        execute!(out, PushKeyboardEnhancementFlags(keyboard_protocol_flags()))?;
-        KEYBOARD_PROTOCOL_ACTIVE.store(true, Ordering::Relaxed);
+
+    Ok(TradingStack {
+        tx,
+        rx,
+        key_rx,
+        trading,
+        user_open_ledger,
+        user_trade_sync,
+        market_tx,
+        market_profile_tx,
+        market_profile_rx_slot,
+        user_bundle_tx,
+        book_token_tx,
+        rtds_sym_tx,
+    })
+}
+
+async fn run_headless_trading_loop(
+    rx: &mut mpsc::Receiver<AppEvent>,
+    state: &mut AppState,
+    trading: &Arc<TradingClient>,
+    tx: &mpsc::Sender<AppEvent>,
+    cfg: &Config,
+    user_open_ledger: &Arc<feeds::clob_user_ws::UserOpenOrdersLedger>,
+    rtds_sym_tx: &watch::Sender<String>,
+    market_tx: &mpsc::Sender<gamma::ActiveMarket>,
+    market_profile_tx: &watch::Sender<Arc<MarketProfile>>,
+    market_profile_rx_slot: &mut Option<watch::Receiver<Arc<MarketProfile>>>,
+    discovery_spawned: &mut bool,
+    user_bundle_tx: &watch::Sender<UserWsBundle>,
+    book_token_tx: &watch::Sender<Vec<String>>,
+    autotrading_snapshot_tx: &watch::Sender<AutoTradingSnapshot>,
+    autotrading_snapshot_rx: &watch::Receiver<AutoTradingSnapshot>,
+) -> Result<()> {
+    let drain_budget = EventDrainBudget::new(MAX_EVENTS_PER_FRAME, EVENT_DRAIN_BUDGET);
+    loop {
+        tokio::select! {
+            biased;
+            _ = tokio::signal::ctrl_c() => {
+                info!("headless: Ctrl+C, exiting");
+                return Ok(());
+            }
+            maybe_ev = rx.recv() => {
+                let Some(mut ev) = maybe_ev else {
+                    return Ok(());
+                };
+                let drain_started_at = Instant::now();
+                let mut processed = 0usize;
+                loop {
+                    if apply_app_event(
+                        ev,
+                        state,
+                        trading,
+                        tx,
+                        cfg,
+                        user_open_ledger,
+                        rtds_sym_tx,
+                        market_tx,
+                        market_profile_tx,
+                        market_profile_rx_slot,
+                        discovery_spawned,
+                        user_bundle_tx,
+                        book_token_tx,
+                        autotrading_snapshot_tx,
+                        autotrading_snapshot_rx,
+                    )
+                    .await
+                    {
+                        return Ok(());
+                    }
+                    processed += 1;
+                    if !drain_budget.can_continue(processed, drain_started_at) {
+                        break;
+                    }
+                    match rx.try_recv() {
+                        Ok(next) => ev = next,
+                        Err(_) => break,
+                    }
+                }
+            }
+        }
     }
-    execute!(out, EnterAlternateScreen, EnableFocusChange)?;
-    let backend = CrosstermBackend::new(out);
-    let mut term = Terminal::new(backend)?;
+}
+
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // ── setup ────────────────────────────────────────────────────────
+    // stderr gets hidden once crossterm enters the alternate screen, and
+    // any warn! / error! we emit during the TUI phase vanishes. Write the
+    // log to ./polymarket-crypto.log so it's always inspectable post-mortem.
+    let log_path = std::env::var("POLYMARKET_CRYPTO_LOG_PATH")
+        .unwrap_or_else(|_| "./polymarket-crypto.log".into());
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .context(format!("open log file {log_path}"))?;
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "POLYMARKET_CRYPTO=debug,warn".into()),
+        )
+        .with_writer(std::sync::Mutex::new(log_file))
+        .with_ansi(false)
+        .init();
+
+    eprintln!("▸ polymarket-crypto — logging to {log_path}");
+    eprintln!("▸ if credentials or data don't appear, run: polymarket-crypto debug-auth");
+
+    let args: Vec<String> = std::env::args().collect();
+    // `deploy-wallet` must run before `Config::from_env()` (no `POLYMARKET_FUNDER` yet).
+    match args.get(1).map(String::as_str) {
+        Some("deploy-wallet") => {
+            return deploy_wallet_cmd::run().await;
+        }
+        Some("round-log-inspect") => {
+            return round_log::run_inspect_cli(&args[2..]).map_err(Into::into);
+        }
+        Some("signal-eval") => {
+            return signal_eval::run_signal_eval_cli(&args[2..]).map_err(Into::into);
+        }
+        Some("help") | Some("-h") | Some("--help") => {
+            println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
+            println!("Without a subcommand, launches the interactive TUI.\n");
+            println!("Subcommands:");
+            println!("  debug-auth     Run the CLOB L1 auth flow and dump all intermediate");
+            println!("                 values (useful for debugging 401/403 errors).");
+            println!(
+                "  deploy-wallet  Submit WALLET-CREATE; POLYMARKET_PK + POLYMARKET_RELAYER_API_KEY"
+            );
+            println!(
+                "                 + ADDRESS (same as redeem). RELAYER_URL optional (prod default)."
+            );
+            println!("  help           Show this help.");
+            println!("  run            Headless trading: `run --market btc-5m` (see `run --help`).");
+            println!("  round-log-inspect  Summarize JSONL session logs (--dir, --day).");
+            println!("  signal-eval    Offline strategy replay vs logged approx wins (--dir, --mode, …).");
+            return Ok(());
+        }
+        _ => {}
+    }
+
+    let cfg = Config::from_env().context("loading config")?;
+    info!(
+        signer = %cfg.signer_address,
+        funder = %cfg.funder,
+        proxy  = %net::proxy_env().as_deref().unwrap_or("<none>"),
+        take_profit_bps = cfg.take_profit_bps,
+        buy_trail_bps = cfg.buy_trail_bps,
+        trailing_exit_min_profit_bps = cfg.trailing_exit_min_profit_bps,
+        autotrading = cfg.autotrading,
+        autotrading_max_positions = cfg.autotrading_max_positions,
+        autotrading_order_expires_after_secs = ?cfg.autotrading_order_expires_after_secs,
+        strategy_strong_gap_mult = cfg.strategy_strong_gap_mult,
+        strategy_max_spread_mult = cfg.strategy_max_spread_mult,
+        strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares,
+        strategy_watch_ratio = cfg.strategy_watch_ratio,
+        round_log_enabled = cfg.round_log_enabled,
+        round_log_dir = %cfg.round_log_dir.display(),
+        round_log_snap_interval_secs = cfg.round_log_snap_interval_secs,
+        round_log_fills = cfg.round_log_fills,
+        "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
+    );
+
+    // ── subcommand dispatch (no TUI) ─────────────────────────────────
+    match args.get(1).map(String::as_str) {
+        Some("debug-auth") => {
+            let t = TradingClient::new(cfg.clone())?;
+            return t.debug_auth_flow().await;
+        }
+        _ => {}
+    }
+
+    let headless_profile: Option<MarketProfile> = match args.get(1).map(|s| s.as_str()) {
+        Some("run") => {
+            let invoke: Vec<String> = std::iter::once(args[0].clone())
+                .chain(args.iter().skip(2).cloned())
+                .collect();
+            match RunCli::try_parse_from(&invoke) {
+                Ok(run) => Some(
+                    parse_market_profile(&run.market).context("invalid --market")?,
+                ),
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        ErrorKind::DisplayHelp
+                            | ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+                            | ErrorKind::DisplayVersion
+                    ) =>
+                {
+                    let _ = e.print();
+                    return Ok(());
+                }
+                Err(e) => return Err(anyhow::Error::from(e).context("polymarket-crypto run")),
+            }
+        }
+        _ => None,
+    };
+
+    let stack = bootstrap_trading_stack(
+        &cfg,
+        BootstrapOpts {
+            skip_wizard_series: headless_profile.is_some(),
+            spawn_key_reader: headless_profile.is_none(),
+        },
+    )?;
+    let TradingStack {
+        tx,
+        mut rx,
+        key_rx,
+        trading,
+        user_open_ledger,
+        user_trade_sync,
+        market_tx,
+        market_profile_tx,
+        mut market_profile_rx_slot,
+        user_bundle_tx,
+        book_token_tx,
+        rtds_sym_tx,
+    } = stack;
 
     let mut state = AppState::new(
         cfg.default_size_usdc,
@@ -2673,6 +2822,66 @@ async fn main() -> Result<()> {
     let mut discovery_spawned = false;
     let _ = user_bundle_tx.send(build_user_ws_bundle(&state));
     send_book_watch_if_changed(&state, &book_token_tx);
+
+    if let Some(profile) = headless_profile {
+        info!(
+            asset = profile.asset.label,
+            timeframe = %profile.timeframe.label(),
+            autotrading = cfg.autotrading,
+            "headless run (no TUI); Ctrl+C to exit"
+        );
+        tx.send(AppEvent::StartTrading(Arc::new(profile)))
+            .await
+            .context("enqueue StartTrading")?;
+        run_headless_trading_loop(
+            &mut rx,
+            &mut state,
+            &trading,
+            &tx,
+            &cfg,
+            &user_open_ledger,
+            &rtds_sym_tx,
+            &market_tx,
+            &market_profile_tx,
+            &mut market_profile_rx_slot,
+            &mut discovery_spawned,
+            &user_bundle_tx,
+            &book_token_tx,
+            &autotrading_snapshot_tx,
+            &autotrading_snapshot_rx,
+        )
+        .await?;
+        round_log_shutdown_best_effort(&state);
+        return Ok(());
+    }
+
+    let mut key_rx = key_rx.context("TUI requires keyboard channel")?;
+
+    // ── terminal setup ───────────────────────────────────────────────
+    enable_raw_mode()?;
+    let mut out = stdout();
+    // Do not enable mouse capture: we don't handle mouse events, and SGR mouse mode can make some
+    // terminals (e.g. embedded IDE terminal) deliver keyboard only after the pane is clicked.
+    // Focus events are opt-in (`EnableFocusChange`); without them, `FocusGained` never fires after
+    // hide/show and we cannot re-apply raw mode (see crossterm::event module docs).
+    //
+    // Kitty keyboard protocol (when supported): lock/modifier bits in `KeyEvent.state` and
+    // press/repeat/release kinds — see crossterm `examples/event-read.rs` and
+    // https://sw.kovidgoyal.net/kitty/keyboard-protocol/
+    // Skip on VS Code's terminal: enabling these flags is known to break CapsLock there.
+    let can_kbd_enhance = matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    );
+    let vscode_terminal = std::env::var("TERM_PROGRAM").ok().as_deref() == Some("vscode");
+    let use_keyboard_protocol = can_kbd_enhance && !vscode_terminal;
+    if use_keyboard_protocol {
+        execute!(out, PushKeyboardEnhancementFlags(keyboard_protocol_flags()))?;
+        KEYBOARD_PROTOCOL_ACTIVE.store(true, Ordering::Relaxed);
+    }
+    execute!(out, EnterAlternateScreen, EnableFocusChange)?;
+    let backend = CrosstermBackend::new(out);
+    let mut term = Terminal::new(backend)?;
 
     // ── main loop ────────────────────────────────────────────────────
     // Drain coalesced feed events in bounded slices so a burst of book updates

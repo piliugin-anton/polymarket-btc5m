@@ -1,0 +1,19 @@
+# Build artifacts (rebuilt inside Docker)
+target/
+**/target/
+
+# Git and IDE
+.git
+.gitignore
+.cursor
+*.md
+!README.md
+
+# Local secrets (use compose `env_file` instead of copying into the image)
+.env
+.env.*
+!.env.example
+
+# Logs and local data
+*.log
+data/

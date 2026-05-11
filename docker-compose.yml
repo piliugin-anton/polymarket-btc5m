@@ -1,0 +1,24 @@
+# Headless trading: loads secrets from a host `.env` file (not baked into the image).
+# Optional: set MARKET in `.env` or under `environment` (default: sol-5m).
+#
+#   docker compose up --build
+#
+# Override market once:
+#   MARKET=btc-5m docker compose run --rm polymarket-crypto
+
+services:
+  polymarket-crypto:
+    build: .
+    image: polymarket-crypto:local
+    restart: unless-stopped
+    env_file:
+      # Required for keys, funder, etc. — keep this file out of git; do not COPY it in Dockerfile.
+      - .env
+    environment:
+      # Polymarket profile: btc-5m | eth-15m | sol-5m | xrp-1d | …
+      MARKET: ${MARKET:-btc-5m}
+    # Logs default to ./polymarket-crypto.log inside the container cwd (/data).
+    # To persist on the host, add e.g.:
+    #   environment: { POLYMARKET_CRYPTO_LOG_PATH: /data/polymarket-crypto.log }
+    #   volumes: [ "./logs:/data" ]
+    working_dir: /data

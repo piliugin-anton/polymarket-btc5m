@@ -3,6 +3,7 @@
 //! **Rolling** (5m / 15m): slugs are `{asset}-updown-{5m|15m}-{window_start_unix}`.
 //! **Daily** (1D): slugs are date-based, e.g. `bitcoin-up-or-down-on-april-22-2026` in America/New_York.
 
+use anyhow::Context;
 use chrono::Datelike;
 
 /// Known spot assets matching Polymarket recurring crypto up/down + RTDS + crypto-price.
@@ -140,6 +141,45 @@ pub struct MarketProfile {
 }
 
 impl MarketProfile {
+    /// CLI preset: `{asset}-{timeframe}` (case-insensitive), e.g. `btc-5m`, `ETH-15m`, `sol-1d`.
+    pub fn parse_cli_token(s: &str) -> anyhow::Result<Self> {
+        let s = s.trim();
+        anyhow::ensure!(
+            !s.is_empty(),
+            "market profile is empty (expected e.g. btc-5m, eth-15m, xrp-1d)"
+        );
+        let lower = s.to_ascii_lowercase();
+        let (asset_part, tf_part) = lower.rsplit_once('-').with_context(|| {
+            format!(
+                "expected {{asset}}-{{timeframe}} (e.g. btc-5m); got {:?}",
+                s
+            )
+        })?;
+        let asset = CRYPTO_ASSETS
+            .iter()
+            .find(|a| a.rolling_slug_prefix == asset_part)
+            .with_context(|| {
+                format!(
+                    "unknown asset {:?} in {:?}; use one of: btc, eth, sol, xrp",
+                    asset_part, s
+                )
+            })?;
+        let timeframe = match tf_part {
+            "5m" => Timeframe::M5,
+            "15m" => Timeframe::M15,
+            "1d" => Timeframe::D1,
+            _ => anyhow::bail!(
+                "unknown timeframe {:?} in {:?}; use 5m, 15m, or 1d",
+                tf_part,
+                s
+            ),
+        };
+        Ok(MarketProfile {
+            asset: asset.clone(),
+            timeframe,
+        })
+    }
+
     pub fn rolling_slug_for_window_start(&self, window_start_ts: i64) -> Option<String> {
         let _ = self.timeframe.window_sec_rolling()?;
         let token = self.timeframe.rolling_slug_token()?;
@@ -155,6 +195,11 @@ impl MarketProfile {
     }
 }
 
+/// Same as [`MarketProfile::parse_cli_token`].
+pub fn parse_market_profile(s: &str) -> anyhow::Result<MarketProfile> {
+    MarketProfile::parse_cli_token(s)
+}
+
 /// Build `bitcoin-up-or-down-on-april-22-2026` (Polymarket calendar-day URL slug, English month, ET calendar).
 pub fn build_daily_event_slug(daily_event_prefix: &str, ny_date: chrono::NaiveDate) -> String {
     let m = month_name_en_lower(ny_date.month());
@@ -165,6 +210,54 @@ pub fn build_daily_event_slug(daily_event_prefix: &str, ny_date: chrono::NaiveDa
         ny_date.day(),
         ny_date.year()
     )
+}
+
+#[cfg(test)]
+mod parse_cli_tests {
+    use super::*;
+
+    #[test]
+    fn parses_btc_5m() {
+        let p = MarketProfile::parse_cli_token("btc-5m").unwrap();
+        assert_eq!(p.asset.rolling_slug_prefix, "btc");
+        assert_eq!(p.timeframe, Timeframe::M5);
+    }
+
+    #[test]
+    fn case_insensitive() {
+        let p = MarketProfile::parse_cli_token("ETH-15M").unwrap();
+        assert_eq!(p.asset.rolling_slug_prefix, "eth");
+        assert_eq!(p.timeframe, Timeframe::M15);
+    }
+
+    #[test]
+    fn parses_daily() {
+        let p = MarketProfile::parse_cli_token("xrp-1d").unwrap();
+        assert_eq!(p.timeframe, Timeframe::D1);
+    }
+
+    #[test]
+    fn rejects_unknown_asset() {
+        assert!(MarketProfile::parse_cli_token("doge-5m").is_err());
+    }
+
+    #[test]
+    fn rejects_bad_timeframe() {
+        assert!(MarketProfile::parse_cli_token("btc-1h").is_err());
+    }
+
+    #[test]
+    fn rejects_missing_separator() {
+        assert!(MarketProfile::parse_cli_token("btc5m").is_err());
+    }
+
+    #[test]
+    fn parse_market_profile_alias_matches() {
+        assert_eq!(
+            parse_market_profile("sol-5m").unwrap().asset.rolling_slug_prefix,
+            "sol"
+        );
+    }
 }
 
 fn month_name_en_lower(m: u32) -> &'static str {
