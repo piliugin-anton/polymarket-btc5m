@@ -275,6 +275,29 @@ fn is_order_event(v: &Value) -> bool {
         .is_some_and(|s| s.eq_ignore_ascii_case("order"))
 }
 
+fn cancelled_or_expired_order_id(v: &Value) -> Option<String> {
+    if !is_order_event(v) {
+        return None;
+    }
+    let kind = v
+        .get("type")
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_ascii_uppercase());
+    if !matches!(
+        kind.as_deref(),
+        Some("CANCELLATION" | "CANCELED" | "CANCELLED" | "EXPIRED")
+    ) {
+        return None;
+    }
+    let raw_id = v
+        .get("id")
+        .and_then(|x| x.as_str())
+        .or_else(|| v.get("order_id").and_then(|x| x.as_str()))
+        .or_else(|| v.get("orderId").and_then(|x| x.as_str()))?;
+    let order_id = norm_order_id_key(raw_id);
+    (!order_id.is_empty()).then_some(order_id)
+}
+
 fn markets_eq(a: &str, b: &str) -> bool {
     fn norm_m(s: &str) -> String {
         s.trim().trim_start_matches("0x").to_ascii_lowercase()
@@ -608,6 +631,13 @@ async fn run_session(
                         }
                     }
                 }
+                for v in &values {
+                    if let Some(order_id) = cancelled_or_expired_order_id(v) {
+                        let _ = app_tx
+                            .send(AppEvent::AutoTradingBuyOrderClosed { order_id })
+                            .await;
+                    }
+                }
             }
         }
     }
@@ -650,6 +680,27 @@ mod tests {
         assert!(o2.is_some());
         let rows = o2.expect("rows");
         assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn cancelled_or_expired_order_id_detects_terminal_unfilled_order_events() {
+        let cancel: Value =
+            serde_json::from_str(r#"{"event_type":"order","orderId":"0xAbC","type":"CANCELLED"}"#)
+                .unwrap();
+        let expired: Value =
+            serde_json::from_str(r#"{"eventType":"order","id":"0xDef","type":"EXPIRED"}"#).unwrap();
+        let filled_update: Value =
+            serde_json::from_str(r#"{"event_type":"order","id":"0x123","type":"UPDATE"}"#).unwrap();
+
+        assert_eq!(
+            cancelled_or_expired_order_id(&cancel).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(
+            cancelled_or_expired_order_id(&expired).as_deref(),
+            Some("def")
+        );
+        assert_eq!(cancelled_or_expired_order_id(&filled_update), None);
     }
 
     #[tokio::test]

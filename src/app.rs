@@ -214,13 +214,18 @@ pub enum AppEvent {
         success: bool,
         error: Option<String>,
     },
-    /// Auto-trading GTD limit BUY task finished; clears the per-token in-flight guard and, on fill
-    /// ack from the POST response, opens one tracked auto position for the live-position cap.
-    /// Maker fills on a resting auto limit are applied from [`AppEvent::UserChannelFill`].
+    /// Auto-trading GTD limit BUY task finished. Errors free the reserved capacity immediately;
+    /// accepted resting orders keep it reserved until a fill arrives from the user channel or the
+    /// order is cancelled/expired.
     AutoTradingBuyDone {
         token_id: String,
+        order_id: Option<String>,
         filled_qty: Option<f64>,
         error: Option<String>,
+    },
+    /// User-channel `order` event says a previously accepted auto BUY was cancelled/expired.
+    AutoTradingBuyOrderClosed {
+        order_id: String,
     },
     /// Manual or automatic redeem-all task finished; clears the shared redeem in-flight guard.
     RedeemDone {
@@ -572,6 +577,7 @@ pub struct AppState {
     pub autotrading_max_positions: usize,
     pub autotrading_open: HashMap<String, f64>,
     pub autotrading_in_flight: HashSet<String>,
+    pub autotrading_resting_buy_orders: HashMap<String, String>,
     /// Shared manual/automatic redeem-all gate; prevents overlapping relayer submissions.
     pub redeem_in_flight: bool,
     /// Last redeem-all task start time, used to throttle automatic and manual redeems together.
@@ -652,6 +658,7 @@ impl AppState {
             autotrading_max_positions: 1,
             autotrading_open: HashMap::new(),
             autotrading_in_flight: HashSet::new(),
+            autotrading_resting_buy_orders: HashMap::new(),
             redeem_in_flight: false,
             last_redeem_started_at: None,
             strategy_strong_gap_mult: 1.0,
@@ -896,13 +903,26 @@ impl AppState {
             .count()
     }
 
+    pub fn autotrading_reserved_count(&self) -> usize {
+        let mut tokens = HashSet::new();
+        for (token_id, qty) in &self.autotrading_open {
+            if qty.is_finite() && *qty > AUTOTRADING_POSITION_DUST {
+                tokens.insert(token_id.as_str());
+            }
+        }
+        for token_id in &self.autotrading_in_flight {
+            tokens.insert(token_id.as_str());
+        }
+        tokens.len()
+    }
+
     pub fn autotrading_can_buy(&self, token_id: &str) -> bool {
         !self.autotrading_in_flight.contains(token_id)
             && !self
                 .autotrading_open
                 .get(token_id)
                 .is_some_and(|qty| qty.is_finite() && *qty > AUTOTRADING_POSITION_DUST)
-            && self.autotrading_open_count() < self.autotrading_max_positions.max(1)
+            && self.autotrading_reserved_count() < self.autotrading_max_positions.max(1)
     }
 
     pub fn autotrading_mark_in_flight(&mut self, token_id: String) -> bool {
@@ -914,6 +934,31 @@ impl AppState {
 
     pub fn autotrading_clear_in_flight(&mut self, token_id: &str) {
         self.autotrading_in_flight.remove(token_id);
+    }
+
+    pub fn autotrading_track_resting_buy_order(&mut self, order_id: &str, token_id: &str) {
+        let order_id = norm_order_id_key(order_id);
+        if order_id.is_empty() {
+            return;
+        }
+        let token_id = canonical_clob_token_id(token_id).into_owned();
+        self.autotrading_resting_buy_orders
+            .insert(order_id, token_id);
+    }
+
+    pub fn autotrading_clear_resting_buy_order(&mut self, order_id: &str) -> bool {
+        let order_id = norm_order_id_key(order_id);
+        let Some(token_id) = self.autotrading_resting_buy_orders.remove(&order_id) else {
+            return false;
+        };
+        self.autotrading_clear_in_flight(&token_id);
+        true
+    }
+
+    fn autotrading_clear_resting_buy_orders_for_token(&mut self, token_id: &str) {
+        let token_id = canonical_clob_token_id(token_id);
+        self.autotrading_resting_buy_orders
+            .retain(|_, tracked_token| tracked_token != token_id.as_ref());
     }
 
     pub fn redeem_mark_in_flight(&mut self, now: Instant, min_interval: Duration) -> bool {
@@ -943,6 +988,8 @@ impl AppState {
         let token_id = canonical_clob_token_id(token_id).into_owned();
         match side {
             Side::Buy => {
+                self.autotrading_clear_in_flight(&token_id);
+                self.autotrading_clear_resting_buy_orders_for_token(&token_id);
                 *self.autotrading_open.entry(token_id).or_insert(0.0) += qty;
             }
             Side::Sell => {
@@ -1732,6 +1779,7 @@ impl AppState {
                 self.watched_books.clear();
                 self.autotrading_open.clear();
                 self.autotrading_in_flight.clear();
+                self.autotrading_resting_buy_orders.clear();
                 self.cached_sentiment = SentimentDir::Unknown;
                 self.cached_countdown_secs = None;
                 self.traded_activity.clear();
@@ -2067,22 +2115,32 @@ impl AppState {
             AppEvent::OrderErr(e) => self.status_line = format!("✗ {e}"),
             AppEvent::AutoTradingBuyDone {
                 token_id,
+                order_id,
                 filled_qty,
                 error,
             } => {
                 let token_id = canonical_clob_token_id(&token_id).into_owned();
-                self.autotrading_clear_in_flight(&token_id);
                 if let Some(qty) = filled_qty {
                     self.autotrading_apply_fill(&token_id, Side::Buy, qty);
                     self.status_line =
                         format!("autotrading: BUY filled {qty:.2} shares; position tracked");
                 } else if let Some(e) = error {
+                    self.autotrading_clear_in_flight(&token_id);
                     self.status_line = format!("autotrading: stopped — {e}");
                 } else {
+                    if let Some(order_id) = order_id.as_deref() {
+                        self.autotrading_track_resting_buy_order(order_id, &token_id);
+                    }
                     self.status_line =
                         "autotrading: GTD BUY accepted (resting or no fill in response); \
-                                        maker fills update the auto position via trades"
+                                        capacity reserved until maker fill or close"
                             .into();
+                }
+            }
+            AppEvent::AutoTradingBuyOrderClosed { order_id } => {
+                if self.autotrading_clear_resting_buy_order(&order_id) {
+                    self.status_line =
+                        "autotrading: GTD BUY closed unfilled; reserved capacity released".into();
                 }
             }
             AppEvent::RedeemDone { auto, result } => {
@@ -3219,6 +3277,73 @@ mod tests {
         s.autotrading_clear_in_flight("111");
 
         assert!(s.autotrading_can_buy("111"));
+    }
+
+    #[test]
+    fn autotrading_in_flight_reserves_position_capacity_across_tokens() {
+        let mut s = test_state();
+        s.autotrading_max_positions = 1;
+
+        assert!(s.autotrading_mark_in_flight("111".to_string()));
+
+        assert!(!s.autotrading_can_buy("222"));
+        assert!(!s.autotrading_mark_in_flight("222".to_string()));
+    }
+
+    #[tokio::test]
+    async fn autotrading_resting_buy_keeps_capacity_reserved_until_fill() {
+        let mut s = test_state();
+        s.autotrading_max_positions = 1;
+
+        assert!(s.autotrading_mark_in_flight("111".to_string()));
+        s.apply(AppEvent::AutoTradingBuyDone {
+            token_id: "111".into(),
+            order_id: Some("0xorder1".into()),
+            filled_qty: None,
+            error: None,
+        })
+        .await;
+
+        assert!(!s.autotrading_can_buy("222"));
+
+        s.apply(AppEvent::UserChannelFill {
+            clob_trade_id: "fill-1".into(),
+            order_leg_id: "order-1".into(),
+            side: Side::Buy,
+            outcome: Outcome::Up,
+            token_id: "111".into(),
+            qty: 5.0,
+            price: 0.5,
+            ts: Utc::now(),
+            from_maker_leg: true,
+        })
+        .await;
+
+        assert!(!s.autotrading_can_buy("222"));
+    }
+
+    #[tokio::test]
+    async fn autotrading_cancelled_resting_buy_releases_reserved_capacity() {
+        let mut s = test_state();
+        s.autotrading_max_positions = 1;
+
+        assert!(s.autotrading_mark_in_flight("111".to_string()));
+        s.apply(AppEvent::AutoTradingBuyDone {
+            token_id: "111".into(),
+            order_id: Some("0xabc".into()),
+            filled_qty: None,
+            error: None,
+        })
+        .await;
+
+        assert!(!s.autotrading_can_buy("222"));
+
+        s.apply(AppEvent::AutoTradingBuyOrderClosed {
+            order_id: "abc".into(),
+        })
+        .await;
+
+        assert!(s.autotrading_can_buy("222"));
     }
 
     #[test]

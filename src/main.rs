@@ -898,6 +898,7 @@ async fn run_autotrading_limit_buy_with_retries(
             let _ = tx
                 .send(AppEvent::AutoTradingBuyDone {
                     token_id,
+                    order_id: None,
                     filled_qty: None,
                     error: Some(format!(
                         "signal no longer {}",
@@ -998,6 +999,7 @@ async fn run_autotrading_limit_buy_with_retries(
                         let _ = tx
                             .send(AppEvent::AutoTradingBuyDone {
                                 token_id,
+                                order_id: resp.order_id.clone(),
                                 filled_qty: Some(ack_qty),
                                 error: None,
                             })
@@ -1028,6 +1030,7 @@ async fn run_autotrading_limit_buy_with_retries(
                     let _ = tx
                         .send(AppEvent::AutoTradingBuyDone {
                             token_id,
+                            order_id: resp.order_id.clone(),
                             filled_qty: None,
                             error: None,
                         })
@@ -1058,6 +1061,7 @@ async fn run_autotrading_limit_buy_with_retries(
     let _ = tx
         .send(AppEvent::AutoTradingBuyDone {
             token_id,
+            order_id: None,
             filled_qty: None,
             error: Some(last_error),
         })

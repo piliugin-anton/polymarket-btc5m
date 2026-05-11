@@ -130,7 +130,7 @@ Optional but useful:
 |---|---|
 | `POLYMARKET_PROXY` | Proxy for geo-blocked regions — see [Geo-restrictions](#geo-restricted) |
 | `AUTOTRADING` | `true` enables automatic **GTD limit BUY** entries at the **best ask seen when the `STRONG UP` / `STRONG DOWN` signal fires** (`false` by default) |
-| `AUTOTRADING_MAX_POSITIONS` | Maximum currently open auto-trading positions; sold/closed auto inventory frees capacity (`1` by default) |
+| `AUTOTRADING_MAX_POSITIONS` | Maximum open or reserved auto-trading positions; sold/closed auto inventory frees capacity, and accepted BUYs reserve capacity until fill/failure/cancel/expiry (`1` by default) |
 | `AUTOTRADING_BUY_LAST_SECS` | Optional. Positive **seconds**: only allow new autotrading BUY starts in the final N seconds before market close, e.g. `60` for the last minute |
 | `AUTOTRADING_ORDER_EXPIRES_AFTER` | Optional. Positive **seconds**: autotrading GTD BUY expires about that long after the order is built (Polymarket uses a +60s signing offset; unset = same as manual limits — expire near **window end**) |
 | `AUTOTRADING_MAX_ENTRY_PRICE` | Optional. Skip automatic GTD BUY entries when the signal-time best ask is above this probability price, e.g. `0.95` to avoid chasing `0.99` entries |
@@ -269,7 +269,7 @@ When `--day YYYY-MM-DD` is provided, both CLIs read all logs for that date, incl
 
 Set `AUTOTRADING=true` to let the app automatically submit **GTD limit BUY** orders when the strategy signal is `STRONG UP` or `STRONG DOWN`. The limit **price** is the outcome token’s **best ask at the instant the signal is detected** (same moment as the UI snapshot); **size** is the same USDC notional as manual orders: `DEFAULT_SIZE_USDC` at startup, then whatever you edit with **`e`**. `WATCH` and `NO TRADE` never place automatic orders.
 
-Before each **outer** retry batch (after inner limit-order retries are exhausted), the bot re-checks that the same strong signal is still present for the same market token. The limit price and share count are **fixed at detection** — they are not recomputed from a later book. `AUTOTRADING_MAX_POSITIONS` limits currently open auto-trading positions; when matching sell fills reduce the tracked auto inventory, capacity opens again. Resting limit fills that arrive later as **maker** legs are applied to that ledger from the user-channel trade stream.
+Before each **outer** retry batch (after inner limit-order retries are exhausted), the bot re-checks that the same strong signal is still present for the same market token. The limit price and share count are **fixed at detection** — they are not recomputed from a later book. `AUTOTRADING_MAX_POSITIONS` limits currently open or reserved auto-trading positions; accepted BUYs reserve capacity until they fail, cancel, expire, or the fill lands in the auto ledger. When matching sell fills reduce the tracked auto inventory, capacity opens again. Resting limit fills that arrive later as **maker** legs are applied to that ledger from the user-channel trade stream.
 
 Set **`AUTOTRADING_BUY_LAST_SECS`** (seconds, positive integer) to allow new autotrading BUY starts only near the end of the active market. For example, `AUTOTRADING_BUY_LAST_SECS=60` means the bot can start an autotrading BUY only during the final minute before market close. Leaving it unset, empty, invalid, or `0` keeps the existing behavior.
 
