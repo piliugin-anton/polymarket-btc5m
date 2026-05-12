@@ -813,6 +813,45 @@ fn autotrading_buy_time_window_allows(
     until_close <= chrono::Duration::seconds(secs)
 }
 
+/// True when `AUTOTRADING_BUY_LAST_SECS` is set, the market is still open (`closes_at` in the
+/// future), and the current time is **before** the final N-second window. In that situation
+/// [`autotrading_buy_time_window_allows`] is false only because it is too early — not because the
+/// market has already closed (past-close must never be bypassed via PTB gap).
+fn autotrading_buy_last_secs_blocked_only_too_early(
+    market: &gamma::ActiveMarket,
+    buy_last_secs: Option<u64>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    let Some(secs) = buy_last_secs else {
+        return false;
+    };
+    let until_close = market.closes_at.signed_duration_since(now);
+    if until_close <= chrono::Duration::seconds(0) {
+        return false;
+    }
+    let Ok(secs_i) = i64::try_from(secs) else {
+        return false;
+    };
+    until_close > chrono::Duration::seconds(secs_i)
+}
+
+fn autotrading_buy_early_ptb_gap_bypasses(state: &AppState, threshold_bps: u32) -> bool {
+    if threshold_bps == 0 {
+        return false;
+    }
+    let Some(spot) = state.spot_price.filter(|p| p.is_finite()) else {
+        return false;
+    };
+    let Some(ptb) = state
+        .price_to_beat()
+        .filter(|p| p.is_finite() && *p > 0.0)
+    else {
+        return false;
+    };
+    let gap_bps = ((spot - ptb).abs() / ptb) * 10_000.0;
+    gap_bps + 1e-12 >= threshold_bps as f64
+}
+
 fn try_spawn_autotrading_buy(
     state: &mut AppState,
     trading: &Arc<TradingClient>,
@@ -829,7 +868,14 @@ fn try_spawn_autotrading_buy(
     let Some(market) = state.market.as_ref() else {
         return;
     };
-    if !autotrading_buy_time_window_allows(market, cfg.autotrading_buy_last_secs, Utc::now()) {
+    let now = Utc::now();
+    let time_ok = autotrading_buy_time_window_allows(market, cfg.autotrading_buy_last_secs, now);
+    let early_ptb_bypass = autotrading_buy_last_secs_blocked_only_too_early(
+        market,
+        cfg.autotrading_buy_last_secs,
+        now,
+    ) && autotrading_buy_early_ptb_gap_bypasses(state, cfg.autotrading_buy_early_ptb_gap_bps);
+    if !time_ok && !early_ptb_bypass {
         return;
     }
     let token_id = match outcome {
@@ -3430,6 +3476,65 @@ mod tests {
             Some(60),
             now + chrono::Duration::seconds(61)
         ));
+    }
+
+    #[test]
+    fn autotrading_buy_last_secs_blocked_only_too_early_when_outside_final_window() {
+        let mut state = test_autotrading_state();
+        let market = state.market.as_mut().unwrap();
+        let base = Utc::now();
+        market.closes_at = base + chrono::Duration::seconds(120);
+        assert!(autotrading_buy_last_secs_blocked_only_too_early(
+            market,
+            Some(60),
+            base
+        ));
+    }
+
+    #[test]
+    fn autotrading_buy_last_secs_blocked_only_too_early_false_inside_final_window() {
+        let mut state = test_autotrading_state();
+        let market = state.market.as_mut().unwrap();
+        let base = Utc::now();
+        market.closes_at = base + chrono::Duration::seconds(120);
+        let t = base + chrono::Duration::seconds(70);
+        assert!(!autotrading_buy_last_secs_blocked_only_too_early(
+            market,
+            Some(60),
+            t
+        ));
+    }
+
+    #[test]
+    fn autotrading_buy_last_secs_blocked_only_too_early_false_past_close() {
+        let mut state = test_autotrading_state();
+        let market = state.market.as_mut().unwrap();
+        let base = Utc::now();
+        market.closes_at = base - chrono::Duration::seconds(1);
+        assert!(!autotrading_buy_last_secs_blocked_only_too_early(
+            market,
+            Some(60),
+            base
+        ));
+    }
+
+    #[test]
+    fn autotrading_buy_early_ptb_gap_bypasses_respects_threshold_and_ptb() {
+        let mut state = test_autotrading_state();
+        // ptb 100, spot 100.30 -> 30 bps
+        assert!(!autotrading_buy_early_ptb_gap_bypasses(&state, 0));
+        assert!(!autotrading_buy_early_ptb_gap_bypasses(&state, 31));
+        assert!(autotrading_buy_early_ptb_gap_bypasses(&state, 30));
+
+        state.market.as_mut().unwrap().price_to_beat = None;
+        assert!(!autotrading_buy_early_ptb_gap_bypasses(&state, 1));
+    }
+
+    #[test]
+    fn autotrading_buy_early_ptb_gap_bypasses_false_without_spot() {
+        let mut state = test_autotrading_state();
+        state.spot_price = None;
+        assert!(!autotrading_buy_early_ptb_gap_bypasses(&state, 1));
     }
 
     #[test]

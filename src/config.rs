@@ -101,6 +101,10 @@ pub struct Config {
     /// Optional gate that allows new automatic BUY starts only in the final N seconds before the
     /// active market closes.
     pub autotrading_buy_last_secs: Option<u64>,
+    /// When `AUTOTRADING_BUY_LAST_SECS` is set and the time gate would block only because it is too
+    /// early (not past close), allow the BUY if `|spot - ptb| / ptb * 10_000` meets this threshold.
+    /// `0` = disabled.
+    pub autotrading_buy_early_ptb_gap_bps: u32,
     /// When set, autotrading GTD BUY `expiration` is `now + this many seconds` (plus Polymarket’s
     /// +60s signing offset — see [`crate::gamma::clob_gtd_expiration_secs_after_duration_from_now`]).
     /// When unset, expiration matches manual limits: end of the current market window.
@@ -227,6 +231,10 @@ impl Config {
         let autotrading_buy_last_secs = parse_autotrading_buy_last_secs(
             std::env::var("AUTOTRADING_BUY_LAST_SECS").ok().as_deref(),
         );
+        let autotrading_buy_early_ptb_gap_bps = std::env::var("AUTOTRADING_BUY_EARLY_PTB_GAP_BPS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(0);
         let autotrading_order_expires_after_secs = parse_autotrading_order_expires_after_secs(
             std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
                 .ok()
@@ -326,6 +334,7 @@ impl Config {
             autotrading,
             autotrading_max_positions,
             autotrading_buy_last_secs,
+            autotrading_buy_early_ptb_gap_bps,
             autotrading_order_expires_after_secs,
             autotrading_max_entry_price,
             autotrading_signal_min,
