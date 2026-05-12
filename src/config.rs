@@ -213,10 +213,11 @@ impl Config {
             })
             .unwrap_or(0);
 
-        let trailing_exit_min_profit_bps = std::env::var("TRAILING_EXIT_MIN_PROFIT_BPS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
+        let trailing_exit_min_profit_bps = parse_trailing_exit_min_profit_bps(
+            std::env::var("TRAILING_EXIT_MIN_PROFIT_BPS")
+                .ok()
+                .as_deref(),
+        );
 
         let stop_loss_bps = parse_stop_loss_bps(std::env::var("STOP_LOSS_BPS").ok().as_deref());
 
@@ -231,10 +232,11 @@ impl Config {
         let autotrading_buy_last_secs = parse_autotrading_buy_last_secs(
             std::env::var("AUTOTRADING_BUY_LAST_SECS").ok().as_deref(),
         );
-        let autotrading_buy_early_ptb_gap_bps = std::env::var("AUTOTRADING_BUY_EARLY_PTB_GAP_BPS")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(0);
+        let autotrading_buy_early_ptb_gap_bps = parse_autotrading_buy_early_ptb_gap_bps(
+            std::env::var("AUTOTRADING_BUY_EARLY_PTB_GAP_BPS")
+                .ok()
+                .as_deref(),
+        );
         let autotrading_order_expires_after_secs = parse_autotrading_order_expires_after_secs(
             std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
                 .ok()
@@ -369,32 +371,44 @@ fn parse_env_bool(value: &str) -> Option<bool> {
     }
 }
 
-fn parse_autotrading_max_positions(value: Option<&str>) -> usize {
+pub(crate) fn parse_autotrading_max_positions(value: Option<&str>) -> usize {
     value
         .and_then(|s| s.trim().parse::<usize>().ok())
         .filter(|n| *n > 0)
         .unwrap_or(1)
 }
 
-fn parse_autotrading_buy_last_secs(value: Option<&str>) -> Option<u64> {
+pub(crate) fn parse_autotrading_buy_last_secs(value: Option<&str>) -> Option<u64> {
     value
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
-fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64> {
+pub(crate) fn parse_autotrading_order_expires_after_secs(value: Option<&str>) -> Option<u64> {
     value
         .and_then(|s| s.trim().parse::<u64>().ok())
         .filter(|n| *n > 0)
 }
 
-fn parse_stop_loss_bps(value: Option<&str>) -> u32 {
+pub(crate) fn parse_stop_loss_bps(value: Option<&str>) -> u32 {
     value
         .and_then(|s| s.trim().parse::<u32>().ok())
         .unwrap_or(0)
 }
 
-fn parse_autotrading_max_entry_price(value: Option<&str>) -> Option<f64> {
+pub(crate) fn parse_autotrading_buy_early_ptb_gap_bps(value: Option<&str>) -> u32 {
+    value
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn parse_trailing_exit_min_profit_bps(value: Option<&str>) -> u32 {
+    value
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0)
+}
+
+pub(crate) fn parse_autotrading_max_entry_price(value: Option<&str>) -> Option<f64> {
     value
         .and_then(|s| s.trim().parse::<f64>().ok())
         .filter(|p| p.is_finite() && (0.01..=0.99).contains(p))

@@ -2757,7 +2757,7 @@ async fn main() -> Result<()> {
             println!("  help           Show this help.");
             println!("  run            Headless trading: `run --market btc-5m` (see `run --help`).");
             println!("  round-log-inspect  Summarize JSONL session logs (--dir, --day).");
-            println!("  signal-eval    Offline strategy replay vs logged approx wins (--dir, --mode, …).");
+            println!("  signal-eval    Offline strategy replay + optional autotrading sim vs logs (--dir, --mode, …).");
             return Ok(());
         }
         _ => {}

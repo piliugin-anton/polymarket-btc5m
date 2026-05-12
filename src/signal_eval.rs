@@ -1,15 +1,33 @@
-//! Offline replay of [`crate::strategy::evaluate_manual_signal`] on JSONL `snap` rows.
+//! Offline replay of [`crate::strategy::evaluate_manual_signal`] on JSONL `snap` rows, plus an
+//! optional **STRONG-only** autotrading-style simulation (time / max entry / max positions / GTD
+//! TTL, stop-loss, trailing min-profit exit) using the same env defaults as [`crate::config::Config`]
+//! when CLI flags are omitted.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
 
+use crate::app::{
+    clamp_prob, trailing_exit_sell_meets_min_gross_profit_bps, Outcome, MIN_LIMIT_ORDER_SHARES,
+};
+use crate::config::{
+    parse_autotrading_buy_early_ptb_gap_bps, parse_autotrading_buy_last_secs,
+    parse_autotrading_max_entry_price, parse_autotrading_max_positions,
+    parse_autotrading_order_expires_after_secs, parse_stop_loss_bps,
+    parse_trailing_exit_min_profit_bps,
+};
 use crate::round_log::{u8_to_label, u8_to_sentiment, RoundLogStrategyTunables};
+use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::strategy::{
     evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
 };
+
+/// Default USDC size for simulated autotrading entries (matches `DEFAULT_SIZE_USDC` in config).
+const SIM_DEFAULT_SIZE_USDC: f64 = 5.0;
+/// Default sell slippage bps for simulated trailing-floor checks (matches `MARKET_SELL_SLIPPAGE_BPS`).
+const SIM_DEFAULT_SELL_SLIPPAGE_BPS: u32 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EvalMode {
@@ -65,6 +83,8 @@ struct EvalSummary {
     watch_calls: u64,
     watch_correct: u64,
     replay_mismatch_live_sig: u64,
+    sim_trading: SimTradingSummary,
+    sim_trading_params: SimTradingParams,
 }
 
 fn list_jsonl_files(dir: &std::path::Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
@@ -221,11 +241,386 @@ fn snap_to_input(
     })
 }
 
+#[derive(Default)]
 struct TunableOverrides {
     strong_gap_mult: Option<f64>,
     max_spread_mult: Option<f64>,
     min_top_ask_shares: Option<f64>,
     watch_ratio: Option<f64>,
+}
+
+/// Resolved autotrading / exit simulation parameters (defaults match [`crate::config::Config`]).
+#[derive(Debug, Clone, Serialize)]
+struct SimTradingParams {
+    autotrading_buy_last_secs: Option<u64>,
+    autotrading_buy_early_ptb_gap_bps: u32,
+    autotrading_order_expires_after_secs: Option<u64>,
+    autotrading_max_entry_price: Option<f64>,
+    autotrading_max_positions: usize,
+    trailing_exit_min_profit_bps: u32,
+    stop_loss_bps: u32,
+}
+
+impl SimTradingParams {
+    fn from_cli_optional(
+        buy_last_secs: Option<&str>,
+        early_ptb_gap_bps: Option<&str>,
+        order_expires_after: Option<&str>,
+        max_entry_price: Option<&str>,
+        max_positions: Option<&str>,
+        trailing_exit_min_profit_bps: Option<&str>,
+        stop_loss_bps: Option<&str>,
+    ) -> Self {
+        Self {
+            autotrading_buy_last_secs: parse_autotrading_buy_last_secs(buy_last_secs),
+            autotrading_buy_early_ptb_gap_bps: early_ptb_gap_bps
+                .map(|s| parse_autotrading_buy_early_ptb_gap_bps(Some(s)))
+                .unwrap_or_else(|| parse_autotrading_buy_early_ptb_gap_bps(None)),
+            autotrading_order_expires_after_secs: order_expires_after
+                .map(|s| parse_autotrading_order_expires_after_secs(Some(s)))
+                .unwrap_or_else(|| parse_autotrading_order_expires_after_secs(None)),
+            autotrading_max_entry_price: max_entry_price
+                .map(|s| parse_autotrading_max_entry_price(Some(s)))
+                .unwrap_or_else(|| parse_autotrading_max_entry_price(None)),
+            autotrading_max_positions: max_positions
+                .map(|s| parse_autotrading_max_positions(Some(s)))
+                .unwrap_or_else(|| parse_autotrading_max_positions(None)),
+            trailing_exit_min_profit_bps: trailing_exit_min_profit_bps
+                .map(|s| parse_trailing_exit_min_profit_bps(Some(s)))
+                .unwrap_or_else(|| parse_trailing_exit_min_profit_bps(None)),
+            stop_loss_bps: stop_loss_bps
+                .map(|s| parse_stop_loss_bps(Some(s)))
+                .unwrap_or_else(|| parse_stop_loss_bps(None)),
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct SimTradingSummary {
+    strong_entry_signals: u64,
+    entries_filled: u64,
+    blocked_buy_last_secs: u64,
+    blocked_max_entry_price: u64,
+    blocked_max_positions: u64,
+    blocked_min_shares: u64,
+    pending_buy_expired: u64,
+    unfilled_pending_at_round_close: u64,
+    exit_stop_loss: u64,
+    exit_trailing_min_profit: u64,
+    exit_settlement_win: u64,
+    exit_settlement_lose: u64,
+    realized_pnl_usdc: f64,
+}
+
+impl SimTradingSummary {
+    fn merge(&mut self, o: &SimTradingSummary) {
+        self.strong_entry_signals += o.strong_entry_signals;
+        self.entries_filled += o.entries_filled;
+        self.blocked_buy_last_secs += o.blocked_buy_last_secs;
+        self.blocked_max_entry_price += o.blocked_max_entry_price;
+        self.blocked_max_positions += o.blocked_max_positions;
+        self.blocked_min_shares += o.blocked_min_shares;
+        self.pending_buy_expired += o.pending_buy_expired;
+        self.unfilled_pending_at_round_close += o.unfilled_pending_at_round_close;
+        self.exit_stop_loss += o.exit_stop_loss;
+        self.exit_trailing_min_profit += o.exit_trailing_min_profit;
+        self.exit_settlement_win += o.exit_settlement_win;
+        self.exit_settlement_lose += o.exit_settlement_lose;
+        self.realized_pnl_usdc += o.realized_pnl_usdc;
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingBuy {
+    limit: f64,
+    expires_ts: i64,
+}
+
+#[derive(Debug, Clone)]
+struct SimOpenLeg {
+    outcome: Outcome,
+    entry: f64,
+    shares: f64,
+}
+
+#[derive(Debug, Default)]
+struct SimRoundState {
+    pending: HashMap<Outcome, PendingBuy>,
+    open: Vec<SimOpenLeg>,
+    round: SimTradingSummary,
+}
+
+fn sim_autotrading_time_window_allows(secs_to_close: Option<i64>, buy_last_secs: Option<u64>) -> bool {
+    match buy_last_secs {
+        None => true,
+        Some(w) => secs_to_close.is_some_and(|s| s > 0 && s <= w as i64),
+    }
+}
+
+fn sim_autotrading_blocked_only_too_early(
+    secs_to_close: Option<i64>,
+    buy_last_secs: Option<u64>,
+) -> bool {
+    match buy_last_secs {
+        None => false,
+        Some(w) => secs_to_close.is_some_and(|s| s > 0 && s > w as i64),
+    }
+}
+
+fn sim_autotrading_early_ptb_gap_bypasses(
+    spot: Option<f64>,
+    ptb: Option<f64>,
+    threshold_bps: u32,
+) -> bool {
+    if threshold_bps == 0 {
+        return false;
+    }
+    let Some(spot) = spot.filter(|p| p.is_finite()) else {
+        return false;
+    };
+    let Some(ptb) = ptb.filter(|p| p.is_finite() && *p > 0.0) else {
+        return false;
+    };
+    let gap_bps = ((spot - ptb).abs() / ptb) * 10_000.0;
+    gap_bps + 1e-12 >= threshold_bps as f64
+}
+
+fn sim_buy_time_gate_ok(
+    secs_to_close: Option<i64>,
+    buy_last_secs: Option<u64>,
+    early_ptb_gap_bps: u32,
+    spot: Option<f64>,
+    ptb: Option<f64>,
+) -> bool {
+    let time_ok = sim_autotrading_time_window_allows(secs_to_close, buy_last_secs);
+    let early_bypass = sim_autotrading_blocked_only_too_early(secs_to_close, buy_last_secs)
+        && sim_autotrading_early_ptb_gap_bypasses(spot, ptb, early_ptb_gap_bps);
+    time_ok || early_bypass
+}
+
+fn label_to_autotrading_outcome(label: ManualSignalLabel) -> Option<Outcome> {
+    match label {
+        ManualSignalLabel::StrongUp => Some(Outcome::Up),
+        ManualSignalLabel::StrongDown => Some(Outcome::Down),
+        ManualSignalLabel::NoTrade | ManualSignalLabel::Watch => None,
+    }
+}
+
+fn snap_best_ask(s: &SnapParsed, outcome: Outcome) -> Option<f64> {
+    match outcome {
+        Outcome::Up => s.uba,
+        Outcome::Down => s.dba,
+    }
+}
+
+fn snap_best_bid(s: &SnapParsed, outcome: Outcome) -> Option<f64> {
+    match outcome {
+        Outcome::Up => s.ubu,
+        Outcome::Down => s.dbu,
+    }
+}
+
+fn sim_reserved_count(pending: &HashMap<Outcome, PendingBuy>, open: &[SimOpenLeg]) -> usize {
+    let mut t = HashSet::new();
+    for o in pending.keys() {
+        t.insert(*o);
+    }
+    for leg in open {
+        t.insert(leg.outcome);
+    }
+    t.len()
+}
+
+fn sim_pending_expires_ts(placed_ts: i64, order_expires_after: Option<u64>, window_end_ts: i64) -> i64 {
+    match order_expires_after {
+        Some(d) => placed_ts.saturating_add(d as i64).min(window_end_ts),
+        None => window_end_ts,
+    }
+}
+
+fn sim_try_fill_pending(state: &mut SimRoundState, snap: &SnapParsed, sim: &SimTradingParams) {
+    let mut expired = Vec::new();
+    let mut filled = Vec::new();
+    for (outcome, p) in &state.pending {
+        if snap._ts > p.expires_ts {
+            expired.push(*outcome);
+            continue;
+        }
+        let Some(ask) = snap_best_ask(snap, *outcome).filter(|a| a.is_finite() && *a > 0.0) else {
+            continue;
+        };
+        if ask <= p.limit + 1e-12 {
+            filled.push(*outcome);
+        }
+    }
+    for o in expired {
+        state.pending.remove(&o);
+        state.round.pending_buy_expired += 1;
+    }
+    for o in filled {
+        let Some(p) = state.pending.remove(&o) else {
+            continue;
+        };
+        if sim_reserved_count(&state.pending, &state.open) >= sim.autotrading_max_positions.max(1) {
+            state.round.blocked_max_positions += 1;
+            continue;
+        }
+        if state.open.iter().any(|leg| leg.outcome == o) {
+            continue;
+        }
+        let shares = (SIM_DEFAULT_SIZE_USDC / p.limit).max(0.01);
+        if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+            state.round.blocked_min_shares += 1;
+            continue;
+        }
+        state.open.push(SimOpenLeg {
+            outcome: o,
+            entry: p.limit,
+            shares,
+        });
+        state.round.entries_filled += 1;
+    }
+}
+
+fn sim_process_exits(state: &mut SimRoundState, snap: &SnapParsed, sim: &SimTradingParams) {
+    if state.open.is_empty() {
+        return;
+    }
+    let mut still_open: Vec<SimOpenLeg> = Vec::new();
+    for leg in state.open.drain(..) {
+        let bid = snap_best_bid(snap, leg.outcome);
+        let mut closed = false;
+        if sim.stop_loss_bps > 0 {
+            if let Some(b) = bid.filter(|x| x.is_finite()) {
+                if stop_loss_triggered(leg.entry, b, sim.stop_loss_bps) {
+                    let px = stop_loss_sell_limit_price(b);
+                    state.round.exit_stop_loss += 1;
+                    state.round.realized_pnl_usdc += (px - leg.entry) * leg.shares;
+                    closed = true;
+                }
+            }
+        }
+        if !closed && sim.trailing_exit_min_profit_bps > 0 {
+            if let Some(b) = bid.filter(|x| x.is_finite() && *x > 0.0) {
+                let slip = SIM_DEFAULT_SELL_SLIPPAGE_BPS as f64 / 10_000.0;
+                let sell_floor = clamp_prob(b * (1.0 - slip));
+                if trailing_exit_sell_meets_min_gross_profit_bps(
+                    sell_floor,
+                    leg.entry,
+                    sim.trailing_exit_min_profit_bps,
+                ) {
+                    state.round.exit_trailing_min_profit += 1;
+                    state.round.realized_pnl_usdc += (sell_floor - leg.entry) * leg.shares;
+                    closed = true;
+                }
+            }
+        }
+        if !closed {
+            still_open.push(leg);
+        }
+    }
+    state.open = still_open;
+}
+
+fn sim_try_enter(
+    state: &mut SimRoundState,
+    snap: &SnapParsed,
+    replay: ManualSignalLabel,
+    window_end_ts: i64,
+    sim: &SimTradingParams,
+) {
+    let Some(outcome) = label_to_autotrading_outcome(replay) else {
+        return;
+    };
+    state.round.strong_entry_signals += 1;
+    if !sim_buy_time_gate_ok(
+        snap.secs,
+        sim.autotrading_buy_last_secs,
+        sim.autotrading_buy_early_ptb_gap_bps,
+        snap.spot,
+        snap.ptb,
+    ) {
+        state.round.blocked_buy_last_secs += 1;
+        return;
+    }
+    let Some(ask) = snap_best_ask(snap, outcome).filter(|a| a.is_finite() && *a > 0.0) else {
+        return;
+    };
+    let limit = clamp_prob(ask);
+    if sim
+        .autotrading_max_entry_price
+        .is_some_and(|cap| limit > cap + 1e-12)
+    {
+        state.round.blocked_max_entry_price += 1;
+        return;
+    }
+    let shares = (SIM_DEFAULT_SIZE_USDC / limit).max(0.01);
+    if shares + 1e-9 < MIN_LIMIT_ORDER_SHARES {
+        state.round.blocked_min_shares += 1;
+        return;
+    }
+    if state.open.iter().any(|leg| leg.outcome == outcome) {
+        return;
+    }
+    if state.pending.contains_key(&outcome) {
+        return;
+    }
+    if sim_reserved_count(&state.pending, &state.open) >= sim.autotrading_max_positions.max(1) {
+        state.round.blocked_max_positions += 1;
+        return;
+    }
+    let placed_ts = snap._ts;
+    let expires_ts = sim_pending_expires_ts(placed_ts, sim.autotrading_order_expires_after_secs, window_end_ts);
+    state.pending.insert(
+        outcome,
+        PendingBuy {
+            limit,
+            expires_ts,
+        },
+    );
+}
+
+fn sim_settle_round(state: &mut SimRoundState, win: &str) {
+    for leg in state.open.drain(..) {
+        let won = match leg.outcome {
+            Outcome::Up => win == "up",
+            Outcome::Down => win == "down",
+        };
+        let payoff = if won { 1.0 } else { 0.0 };
+        if won {
+            state.round.exit_settlement_win += 1;
+        } else {
+            state.round.exit_settlement_lose += 1;
+        }
+        state.round.realized_pnl_usdc += (payoff - leg.entry) * leg.shares;
+    }
+    let n = state.pending.len() as u64;
+    state.round.unfilled_pending_at_round_close += n;
+    state.pending.clear();
+}
+
+fn simulate_trading_round(
+    snaps: &[SnapParsed],
+    tun: &RoundLogStrategyTunables,
+    ws: i64,
+    we: i64,
+    overrides: &TunableOverrides,
+    sim: &SimTradingParams,
+    win: &str,
+) -> SimTradingSummary {
+    let mut state = SimRoundState::default();
+    for s in snaps {
+        sim_try_fill_pending(&mut state, s, sim);
+        sim_process_exits(&mut state, s, sim);
+        let Some(input) = snap_to_input(s, tun, ws, we, overrides) else {
+            continue;
+        };
+        let replay = evaluate_manual_signal(&input);
+        sim_try_enter(&mut state, s, replay, we, sim);
+        sim_try_fill_pending(&mut state, s, sim);
+    }
+    sim_settle_round(&mut state, win);
+    state.round
 }
 
 fn predicted_side_strong(label: ManualSignalLabel) -> Option<&'static str> {
@@ -270,6 +665,14 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         min_top_ask_shares: None,
         watch_ratio: None,
     };
+
+    let mut sim_buy_last_secs: Option<String> = None;
+    let mut sim_early_ptb_gap_bps: Option<String> = None;
+    let mut sim_order_expires_after: Option<String> = None;
+    let mut sim_max_entry_price: Option<String> = None;
+    let mut sim_max_positions: Option<String> = None;
+    let mut sim_trailing_exit_min_profit_bps: Option<String> = None;
+    let mut sim_stop_loss_bps: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -326,10 +729,69 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
                 };
                 overrides.watch_ratio = Some(x.parse().context("watch-ratio")?);
             }
+            "--autotrading-buy-last-secs" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--autotrading-buy-last-secs requires seconds (same semantics as env; 0 = disabled)");
+                };
+                sim_buy_last_secs = Some(x.clone());
+            }
+            "--autotrading-buy-early-ptb-gap-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--autotrading-buy-early-ptb-gap-bps requires a number");
+                };
+                sim_early_ptb_gap_bps = Some(x.clone());
+            }
+            "--autotrading-order-expires-after" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--autotrading-order-expires-after requires seconds (positive) or 0 for unset default");
+                };
+                sim_order_expires_after = Some(x.clone());
+            }
+            "--autotrading-max-entry-price" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--autotrading-max-entry-price requires a probability price 0.01–0.99");
+                };
+                sim_max_entry_price = Some(x.clone());
+            }
+            "--autotrading-max-positions" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--autotrading-max-positions requires a positive integer");
+                };
+                sim_max_positions = Some(x.clone());
+            }
+            "--trailing-exit-min-profit-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--trailing-exit-min-profit-bps requires a number");
+                };
+                sim_trailing_exit_min_profit_bps = Some(x.clone());
+            }
+            "--stop-loss-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--stop-loss-bps requires a number");
+                };
+                sim_stop_loss_bps = Some(x.clone());
+            }
             other => bail!("unknown argument: {other}"),
         }
         i += 1;
     }
+
+    let sim_params = SimTradingParams::from_cli_optional(
+        sim_buy_last_secs.as_deref(),
+        sim_early_ptb_gap_bps.as_deref(),
+        sim_order_expires_after.as_deref(),
+        sim_max_entry_price.as_deref(),
+        sim_max_positions.as_deref(),
+        sim_trailing_exit_min_profit_bps.as_deref(),
+        sim_stop_loss_bps.as_deref(),
+    );
 
     let paths = list_jsonl_files(&dir, day.as_deref())?;
     if paths.is_empty() {
@@ -356,6 +818,8 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         watch_calls: 0,
         watch_correct: 0,
         replay_mismatch_live_sig: 0,
+        sim_trading: SimTradingSummary::default(),
+        sim_trading_params: sim_params.clone(),
     };
 
     for (_cid, acc) in &rounds {
@@ -372,7 +836,19 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         let ws = acc.ws.unwrap_or(0);
         let we = acc.we.unwrap_or(ws + 1).max(ws + 1);
 
-        for s in &acc.snaps {
+        let mut snaps_sorted = acc.snaps.clone();
+        snaps_sorted.sort_by_key(|s| s._ts);
+        summary.sim_trading.merge(&simulate_trading_round(
+            &snaps_sorted,
+            tun,
+            ws,
+            we,
+            &overrides,
+            &sim_params,
+            win,
+        ));
+
+        for s in &snaps_sorted {
             summary.snaps_total += 1;
             let Some(input) = snap_to_input(s, tun, ws, we, &overrides) else {
                 continue;
@@ -438,6 +914,46 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
             "  replay label != logged sig (sanity): {}",
             summary.replay_mismatch_live_sig
         );
+        println!("  sim (autotrading-style, STRONG entries only):");
+        println!(
+            "    params: buy_last_secs={:?} early_ptb_gap_bps={} order_expires_after_secs={:?} max_entry_price={:?} max_positions={} trailing_exit_min_profit_bps={} stop_loss_bps={}",
+            summary.sim_trading_params.autotrading_buy_last_secs,
+            summary.sim_trading_params.autotrading_buy_early_ptb_gap_bps,
+            summary.sim_trading_params.autotrading_order_expires_after_secs,
+            summary.sim_trading_params.autotrading_max_entry_price,
+            summary.sim_trading_params.autotrading_max_positions,
+            summary.sim_trading_params.trailing_exit_min_profit_bps,
+            summary.sim_trading_params.stop_loss_bps,
+        );
+        println!(
+            "    strong entry signals: {}",
+            summary.sim_trading.strong_entry_signals
+        );
+        println!("    entries filled: {}", summary.sim_trading.entries_filled);
+        println!(
+            "    blocked (time / max entry / max pos / min shares): {} / {} / {} / {}",
+            summary.sim_trading.blocked_buy_last_secs,
+            summary.sim_trading.blocked_max_entry_price,
+            summary.sim_trading.blocked_max_positions,
+            summary.sim_trading.blocked_min_shares
+        );
+        println!(
+            "    pending expired mid-round / unfilled at close: {} / {}",
+            summary.sim_trading.pending_buy_expired,
+            summary.sim_trading.unfilled_pending_at_round_close
+        );
+        println!(
+            "    exits — stop-loss / min-profit / settle win / settle lose: {} / {} / {} / {}",
+            summary.sim_trading.exit_stop_loss,
+            summary.sim_trading.exit_trailing_min_profit,
+            summary.sim_trading.exit_settlement_win,
+            summary.sim_trading.exit_settlement_lose
+        );
+        println!(
+            "    realized PnL (USDC est., {:.0} USDC notional per entry): {:.4}",
+            SIM_DEFAULT_SIZE_USDC,
+            summary.sim_trading.realized_pnl_usdc
+        );
     }
 
     Ok(())
@@ -448,7 +964,10 @@ mod signal_eval_tests {
     use std::collections::HashMap;
     use std::io::Write;
 
-    use super::{ingest_jsonl, list_jsonl_files, snap_to_input, RoundAccum, TunableOverrides};
+    use super::{
+        ingest_jsonl, list_jsonl_files, simulate_trading_round, snap_to_input, RoundAccum,
+        SimTradingParams, TunableOverrides,
+    };
     use crate::strategy::{evaluate_manual_signal, ManualSignalLabel};
 
     #[test]
@@ -536,6 +1055,68 @@ mod signal_eval_tests {
         assert!(
             rank(a) >= rank(b),
             "lower strong_gap_mult should not reduce signal strength class"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn sim_respects_autotrading_buy_last_secs() {
+        let dir = std::env::temp_dir().join(format!("sim_buy_last_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("day.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"open","v":1,"cid":"c1","ws":1000,"we":3000,"strong_gap_mult":1.0,"max_spread_mult":1.0,"min_top_ask_shares":5.0,"watch_ratio":0.6}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"snap","v":1,"cid":"c1","ts":1100,"spot":101.0,"ptb":100.0,"sig":0,"sent":3,"ubu":0.4,"uba":0.41,"dbu":0.58,"dba":0.59,"ubas":10.0,"dbas":10.0,"secs":200,"act":1.0}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"snap","v":1,"cid":"c1","ts":1200,"spot":101.0,"ptb":100.0,"sig":0,"sent":3,"ubu":0.4,"uba":0.41,"dbu":0.58,"dba":0.59,"ubas":10.0,"dbas":10.0,"secs":50,"act":1.0}}"#
+        )
+        .unwrap();
+        writeln!(f, r#"{{"t":"close","v":1,"cid":"c1","win":"up"}}"#).unwrap();
+
+        let mut rounds: HashMap<String, RoundAccum> = HashMap::new();
+        ingest_jsonl(&path, &mut rounds).unwrap();
+        let acc = rounds.get("c1").expect("round c1");
+        let tun = acc.tunables.as_ref().unwrap();
+        let ws = acc.ws.unwrap();
+        let we = acc.we.unwrap();
+        let mut snaps = acc.snaps.clone();
+        snaps.sort_by_key(|s| s._ts);
+
+        let sim = SimTradingParams::from_cli_optional(
+            Some("60"),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        let s = simulate_trading_round(
+            &snaps,
+            tun,
+            ws,
+            we,
+            &TunableOverrides::default(),
+            &sim,
+            "up",
+        );
+        assert!(
+            s.blocked_buy_last_secs >= 1,
+            "expected at least one STRONG snap outside the final 60s to be time-blocked"
+        );
+        assert_eq!(
+            s.entries_filled, 1,
+            "expected one fill once secs_to_close enters the window"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

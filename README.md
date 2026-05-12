@@ -268,9 +268,12 @@ For **calibrating** strategy tunables against saved sessions, enable optional ap
 polymarket-crypto round-log-inspect --dir ./data/rounds [--day YYYY-MM-DD]
 polymarket-crypto signal-eval --dir ./data/rounds [--day YYYY-MM-DD] [--mode strong-only|watch-as-hint]
   [--strong-gap-mult F] [--max-spread-mult F] [--min-top-ask-shares F] [--watch-ratio F] [--json]
+  [--autotrading-buy-last-secs N] [--autotrading-buy-early-ptb-gap-bps N] [--autotrading-order-expires-after SECS]
+  [--autotrading-max-entry-price P] [--autotrading-max-positions N] [--trailing-exit-min-profit-bps N]
+  [--stop-loss-bps N]
 ```
 
-`signal-eval` rebuilds [`ManualSignalInput`](src/strategy.rs) from each `snap` and compares replayed labels to `close.win` where it is `up` or `down`. A small example log lives at [`tests/fixtures/round_log_small.jsonl`](tests/fixtures/round_log_small.jsonl).
+`signal-eval` rebuilds [`ManualSignalInput`](src/strategy.rs) from each `snap` and compares replayed labels to `close.win` where it is `up` or `down`. It also runs an **optional autotrading-style simulation** (STRONG entries only, same defaults as `.env` when a flag is omitted): resting GTD buys fill when `best_ask` crosses at or below the signal limit, exits model stop-loss and trailing min-profit (using default **50** sell slippage bps for the sell floor), then settlement PnL vs `close.win`. A small example log lives at [`tests/fixtures/round_log_small.jsonl`](tests/fixtures/round_log_small.jsonl).
 
 When `--day YYYY-MM-DD` is provided, both CLIs read all logs for that date, including per-market files such as `YYYY-MM-DD-btc-5m.jsonl` and `YYYY-MM-DD-eth-15m.jsonl`. Older unsuffixed files like `YYYY-MM-DD.jsonl` are still included.
 
