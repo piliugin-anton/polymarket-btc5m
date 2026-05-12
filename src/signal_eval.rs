@@ -438,7 +438,7 @@ fn sim_pending_expires_ts(placed_ts: i64, order_expires_after: Option<u64>, wind
     }
 }
 
-fn sim_try_fill_pending(state: &mut SimRoundState, snap: &SnapParsed, sim: &SimTradingParams) {
+fn sim_try_fill_pending(state: &mut SimRoundState, snap: &SnapParsed, _sim: &SimTradingParams) {
     let mut expired = Vec::new();
     let mut filled = Vec::new();
     for (outcome, p) in &state.pending {
@@ -458,13 +458,11 @@ fn sim_try_fill_pending(state: &mut SimRoundState, snap: &SnapParsed, sim: &SimT
         state.round.pending_buy_expired += 1;
     }
     for o in filled {
-        let Some(p) = state.pending.remove(&o) else {
+        let Some(p) = state.pending.get(&o) else {
             continue;
         };
-        if sim_reserved_count(&state.pending, &state.open) >= sim.autotrading_max_positions.max(1) {
-            state.round.blocked_max_positions += 1;
-            continue;
-        }
+        // Do not `remove` until we commit the fill — otherwise a failed check would drop the order
+        // from `pending` without opening a leg (silent PnL / state corruption).
         if state.open.iter().any(|leg| leg.outcome == o) {
             continue;
         }
@@ -473,12 +471,85 @@ fn sim_try_fill_pending(state: &mut SimRoundState, snap: &SnapParsed, sim: &SimT
             state.round.blocked_min_shares += 1;
             continue;
         }
+        let Some(p) = state.pending.remove(&o) else {
+            continue;
+        };
         state.open.push(SimOpenLeg {
             outcome: o,
             entry: p.limit,
             shares,
         });
         state.round.entries_filled += 1;
+    }
+}
+
+#[cfg(test)]
+mod sim_fill_pending_tests {
+    use super::*;
+
+    fn snap_with_up_ask(ts: i64, up_ask: f64) -> SnapParsed {
+        SnapParsed {
+            _ts: ts,
+            spot: None,
+            ptb: None,
+            sig: 0,
+            sent: 3,
+            ubu: Some(0.39),
+            uba: Some(up_ask),
+            dbu: Some(0.5),
+            dba: Some(0.51),
+            ubas: Some(10.0),
+            dbas: Some(10.0),
+            secs: Some(100),
+            act: 50.0,
+        }
+    }
+
+    #[test]
+    fn fill_pending_keeps_resting_order_when_open_already_has_same_outcome() {
+        let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
+        let mut state = SimRoundState::default();
+        state.pending.insert(
+            Outcome::Up,
+            PendingBuy {
+                limit: 0.41,
+                expires_ts: 2000,
+            },
+        );
+        state.open.push(SimOpenLeg {
+            outcome: Outcome::Up,
+            entry: 0.40,
+            shares: 12.0,
+        });
+        let snap = snap_with_up_ask(1000, 0.40);
+        sim_try_fill_pending(&mut state, &snap, &sim);
+        assert!(
+            state.pending.contains_key(&Outcome::Up),
+            "pending Up must remain when fill is skipped due to duplicate outcome in open"
+        );
+        assert_eq!(state.open.len(), 1);
+        assert_eq!(state.round.entries_filled, 0);
+    }
+
+    #[test]
+    fn fill_pending_keeps_resting_order_when_min_shares_blocks() {
+        let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
+        let mut state = SimRoundState::default();
+        state.pending.insert(
+            Outcome::Up,
+            PendingBuy {
+                limit: 2.0,
+                expires_ts: 2000,
+            },
+        );
+        let snap = snap_with_up_ask(1000, 1.90);
+        sim_try_fill_pending(&mut state, &snap, &sim);
+        assert!(
+            state.pending.contains_key(&Outcome::Up),
+            "pending must remain when share sizing is below MIN_LIMIT_ORDER_SHARES"
+        );
+        assert!(state.open.is_empty());
+        assert_eq!(state.round.blocked_min_shares, 1);
     }
 }
 
