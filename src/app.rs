@@ -1014,13 +1014,6 @@ impl AppState {
         manual_signal_label_to_buy_outcome(self.manual_signal_label())
     }
 
-    pub fn autotrading_open_count(&self) -> usize {
-        self.autotrading_open
-            .values()
-            .filter(|qty| qty.is_finite() && **qty > AUTOTRADING_POSITION_DUST)
-            .count()
-    }
-
     pub fn autotrading_reserved_count(&self) -> usize {
         let mut tokens = HashSet::new();
         for (token_id, qty) in &self.autotrading_open {
@@ -3523,13 +3516,13 @@ mod tests {
 
         s.autotrading_apply_fill("111", Side::Buy, 4.0);
 
-        assert_eq!(s.autotrading_open_count(), 1);
+        assert_eq!(s.autotrading_reserved_count(), 1);
         assert!(!s.autotrading_can_buy("111"));
         assert!(!s.autotrading_can_buy("222"));
 
         s.autotrading_apply_fill("111", Side::Sell, 4.0);
 
-        assert_eq!(s.autotrading_open_count(), 0);
+        assert_eq!(s.autotrading_reserved_count(), 0);
         assert!(s.autotrading_can_buy("222"));
     }
 
