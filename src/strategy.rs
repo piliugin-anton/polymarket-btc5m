@@ -8,6 +8,12 @@
 //! Tunables (`ManualSignalInput`): `strong_gap_mult`, `max_spread_mult`, `min_top_ask_shares`, and
 //! `watch_ratio` are loaded from `.env` via [`crate::app::AppState`] (defaults preserve the original
 //! rubric). See project README — **Strategy signal tuning**.
+//!
+//! At evaluation time, tunables are **sanitized** (finite checks + numeric clamps) so callers that
+//! bypass [`crate::config::Config`]—tests, JSONL replay, or bad snapshots—cannot collapse the strong
+//! gap to a near-zero threshold or widen spread gates with non-finite values. Bounds match the
+//! `parse_strategy_*` helpers in [`crate::config`] except `watch_ratio`, which keeps the wider
+//! `0.25..=0.90` clamp used here historically.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualSignalLabel {
@@ -69,7 +75,53 @@ enum Direction {
     Down,
 }
 
+/// Clamps match [`crate::config`] `parse_strategy_strong_gap_mult` / `max` / `min_top_ask_shares`.
+fn sanitize_strong_gap_mult(v: f64) -> f64 {
+    if !v.is_finite() {
+        1.0
+    } else {
+        v.clamp(0.55, 1.15)
+    }
+}
+
+fn sanitize_max_spread_mult(v: f64) -> f64 {
+    if !v.is_finite() {
+        1.0
+    } else {
+        v.clamp(1.0, 1.35)
+    }
+}
+
+fn sanitize_min_top_ask_shares(v: f64) -> f64 {
+    if !v.is_finite() {
+        5.0
+    } else {
+        v.clamp(2.0, 50.0)
+    }
+}
+
+fn sanitize_watch_ratio(v: f64) -> f64 {
+    if !v.is_finite() {
+        0.60
+    } else {
+        v.clamp(0.25, 0.90)
+    }
+}
+
+fn finite_activity_notional(v: f64) -> f64 {
+    if v.is_finite() {
+        v
+    } else {
+        0.0
+    }
+}
+
 pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
+    let strong_gap_mult = sanitize_strong_gap_mult(input.strong_gap_mult);
+    let max_spread_mult = sanitize_max_spread_mult(input.max_spread_mult);
+    let min_top_ask_shares = sanitize_min_top_ask_shares(input.min_top_ask_shares);
+    let watch_ratio_clamped = sanitize_watch_ratio(input.watch_ratio);
+
     let Some(spot) = finite_positive(input.spot_price) else {
         return ManualSignalLabel::NoTrade;
     };
@@ -89,7 +141,7 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
     };
 
     let max_spread_raw =
-        adaptive_max_spread(input.seconds_to_close, input.window_secs) * input.max_spread_mult;
+        adaptive_max_spread(input.seconds_to_close, input.window_secs) * max_spread_mult;
     let max_spread = if max_spread_raw.is_finite() {
         max_spread_raw.clamp(0.005, 0.12)
     } else {
@@ -99,18 +151,19 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
         Direction::Up => input.up,
         Direction::Down => input.down,
     };
-    if !candidate_book.is_usable(max_spread, input.min_top_ask_shares) {
+    if !candidate_book.is_usable(max_spread, min_top_ask_shares) {
         return ManualSignalLabel::NoTrade;
     }
 
-    let strong_gap = (required_strong_gap(direction, input) * input.strong_gap_mult).max(1e-9);
+    let activity = finite_activity_notional(input.activity_notional_60s);
+    let strong_gap = (required_strong_gap(direction, input, activity) * strong_gap_mult).max(1e-9);
     if gap >= strong_gap {
         return match direction {
             Direction::Up => ManualSignalLabel::StrongUp,
             Direction::Down => ManualSignalLabel::StrongDown,
         };
     }
-    let watch_ratio = input.watch_ratio.clamp(0.25, 0.90);
+    let watch_ratio = watch_ratio_clamped;
     if gap >= strong_gap * watch_ratio {
         ManualSignalLabel::Watch
     } else {
@@ -167,7 +220,11 @@ fn adaptive_max_spread(seconds_to_close: Option<i64>, window_secs: Option<i64>) 
     }
 }
 
-fn required_strong_gap(direction: Direction, input: &ManualSignalInput) -> f64 {
+fn required_strong_gap(
+    direction: Direction,
+    input: &ManualSignalInput,
+    activity_notional: f64,
+) -> f64 {
     let base = time_weighted_strong_gap(input.seconds_to_close, input.window_secs);
 
     let sentiment_mult = match (direction, input.sentiment) {
@@ -177,9 +234,9 @@ fn required_strong_gap(direction: Direction, input: &ManualSignalInput) -> f64 {
         | (Direction::Down, ManualSignalSentiment::Down) => 0.90,
         _ => 1.0,
     };
-    let activity_mult = if input.activity_notional_60s >= 1_000.0 {
+    let activity_mult = if activity_notional >= 1_000.0 {
         0.90
-    } else if input.activity_notional_60s > 0.0 && input.activity_notional_60s < 100.0 {
+    } else if activity_notional > 0.0 && activity_notional < 100.0 {
         1.15
     } else {
         1.0
@@ -491,5 +548,26 @@ mod tests {
         };
 
         assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    /// Without sanitization, `strong_gap_mult = NaN` made `strong_gap` collapse to `1e-9` and could
+    /// promote tiny gaps to `STRONG`.
+    #[test]
+    fn nan_strong_gap_mult_does_not_collapse_threshold() {
+        let mut input = base_input();
+        input.spot_price = Some(100.01);
+        input.price_to_beat = Some(100.0);
+        input.strong_gap_mult = f64::NAN;
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn nan_watch_ratio_defaults_like_sensible_tuner() {
+        let mut input = base_input();
+        input.spot_price = Some(100.20);
+        input.watch_ratio = f64::NAN;
+
+        assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::StrongUp);
     }
 }
