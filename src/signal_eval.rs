@@ -2,9 +2,14 @@
 //! optional **STRONG-only** autotrading-style simulation (time / max entry / max positions / GTD
 //! TTL, stop-loss, trailing min-profit exit) using the same env defaults as [`crate::config::Config`]
 //! when CLI flags are omitted.
+//!
+//! **Performance:** after ingest, [`sort_round_snaps_by_ts`] orders snaps once per round so
+//! [`aggregate_signal_eval_on_rounds`] and `signal-eval-tune` do not clone or re-sort per grid
+//! combination. Bps grind axes share one `Arc<[u32]>` when all three bps grids are omitted.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
@@ -18,7 +23,10 @@ use crate::config::{
     parse_autotrading_order_expires_after_secs, parse_stop_loss_bps,
     parse_trailing_exit_min_profit_bps,
 };
-use crate::round_log::{u8_to_label, u8_to_sentiment, RoundLogStrategyTunables};
+use crate::market_profile::MarketProfile;
+use crate::round_log::{
+    self, u8_to_label, u8_to_sentiment, RoundLogStrategyTunables,
+};
 use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::strategy::{
     evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
@@ -36,7 +44,7 @@ pub enum EvalMode {
 }
 
 impl EvalMode {
-    fn parse(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "strong-only" => Some(Self::StrongOnly),
             "watch-as-hint" => Some(Self::WatchAsHint),
@@ -45,17 +53,18 @@ impl EvalMode {
     }
 }
 
+/// One condition (round) aggregated from JSONL `open` / `snap` / `close` lines.
 #[derive(Default)]
-struct RoundAccum {
-    ws: Option<i64>,
-    we: Option<i64>,
-    tunables: Option<RoundLogStrategyTunables>,
-    snaps: Vec<SnapParsed>,
-    win: Option<String>,
+pub(crate) struct RoundAccum {
+    pub ws: Option<i64>,
+    pub we: Option<i64>,
+    pub tunables: Option<RoundLogStrategyTunables>,
+    pub snaps: Vec<SnapParsed>,
+    pub win: Option<String>,
 }
 
 #[derive(Clone)]
-struct SnapParsed {
+pub(crate) struct SnapParsed {
     _ts: i64,
     spot: Option<f64>,
     ptb: Option<f64>,
@@ -71,7 +80,7 @@ struct SnapParsed {
     act: f64,
 }
 
-#[derive(Serialize)]
+#[derive(Clone, Serialize)]
 struct EvalSummary {
     rounds_total: usize,
     rounds_with_win: usize,
@@ -87,7 +96,9 @@ struct EvalSummary {
     sim_trading_params: SimTradingParams,
 }
 
-fn list_jsonl_files(dir: &std::path::Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
+/// Sorted paths to `*.jsonl` round logs under `dir`, optionally filtered by calendar `--day`
+/// (stem equals `YYYY-MM-DD` or starts with `YYYY-MM-DD-`).
+pub fn list_jsonl_round_paths(dir: &Path, day: Option<&str>) -> Result<Vec<PathBuf>> {
     let mut out = Vec::new();
     if !dir.exists() {
         return Ok(out);
@@ -194,6 +205,134 @@ fn ingest_jsonl(path: &std::path::Path, rounds: &mut HashMap<String, RoundAccum>
     Ok(())
 }
 
+/// Sort snap rows by timestamp once; replay and simulation require chronological order.
+fn sort_round_snaps_by_ts(rounds: &mut HashMap<String, RoundAccum>) {
+    for acc in rounds.values_mut() {
+        acc.snaps.sort_unstable_by_key(|s| s._ts);
+    }
+}
+
+fn load_rounds_from_paths(paths: &[PathBuf]) -> Result<HashMap<String, RoundAccum>> {
+    let mut rounds: HashMap<String, RoundAccum> = HashMap::new();
+    for p in paths {
+        ingest_jsonl(p, &mut rounds)?;
+    }
+    sort_round_snaps_by_ts(&mut rounds);
+    Ok(rounds)
+}
+
+/// Load and merge JSONL round logs from `dir`, optionally filtered by `--day` stem (same rules as
+/// `signal-eval`). Snap rows are sorted by timestamp per round.
+pub fn load_offline_rounds(dir: &Path, day: Option<&str>) -> Result<HashMap<String, RoundAccum>> {
+    let paths = list_jsonl_round_paths(dir, day)?;
+    load_rounds_from_paths(&paths)
+}
+
+/// Like [`load_offline_rounds`], but optionally restricts to one market profile and errors when
+/// `--day` matches multiple logs without `--profile` (avoids mixing unrelated markets in MCMC).
+pub fn load_offline_rounds_filtered(
+    dir: &Path,
+    day: Option<&str>,
+    profile: Option<&str>,
+) -> Result<(HashMap<String, RoundAccum>, Vec<PathBuf>)> {
+    let mut paths = list_jsonl_round_paths(dir, day)?;
+    if let Some(p) = profile {
+        let mp = MarketProfile::parse_cli_token(p).map_err(|e| anyhow::anyhow!("{e:#}"))?;
+        let (sa, stf) = round_log::round_log_path_suffix_for_profile(&mp);
+        let suffix = format!("{sa}-{stf}");
+        paths.retain(|path| {
+            let stem = path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(d) = day {
+                stem == round_log::expected_round_log_stem(d, &mp)
+            } else {
+                stem == suffix || stem.ends_with(&format!("-{suffix}"))
+            }
+        });
+        if paths.is_empty() {
+            bail!(
+                "no JSONL round logs match --profile {p:?} under {}",
+                dir.display()
+            );
+        }
+    } else if day.is_some() && paths.len() > 1 {
+        bail!(
+            "multiple round logs for day {}; pass --profile (e.g. sol-5m, btc-5m)",
+            day.expect("day is_some")
+        );
+    }
+    let rounds = load_rounds_from_paths(&paths)?;
+    Ok((rounds, paths))
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ReplayStrategyMetrics {
+    pub rounds_with_win: usize,
+    pub snaps_total: u64,
+    pub snaps_usable_book: u64,
+    pub strong_calls: u64,
+    pub strong_correct: u64,
+    pub watch_calls: u64,
+    pub watch_correct: u64,
+    pub replay_mismatch_live_sig: u64,
+}
+
+/// Replay-only counts (no autotrading simulation). Requires [`sort_round_snaps_by_ts`].
+pub fn replay_strategy_metrics(
+    rounds: &HashMap<String, RoundAccum>,
+    mode: EvalMode,
+    overrides: &TunableOverrides,
+) -> ReplayStrategyMetrics {
+    let mut out = ReplayStrategyMetrics::default();
+    for (_cid, acc) in rounds {
+        let Some(win) = acc.win.as_deref() else {
+            continue;
+        };
+        if win != "up" && win != "down" {
+            continue;
+        }
+        out.rounds_with_win += 1;
+        let Some(tun) = acc.tunables.as_ref() else {
+            continue;
+        };
+        let ws = acc.ws.unwrap_or(0);
+        let we = acc.we.unwrap_or(ws + 1).max(ws + 1);
+
+        for s in acc.snaps.as_slice() {
+            out.snaps_total += 1;
+            let Some(input) = snap_to_input(s, tun, ws, we, overrides) else {
+                continue;
+            };
+            out.snaps_usable_book += 1;
+            let replay = evaluate_manual_signal(&input);
+            if let Some(live) = u8_to_label(s.sig) {
+                if live != replay {
+                    out.replay_mismatch_live_sig += 1;
+                }
+            }
+
+            if let Some(pred) = predicted_side_strong(replay) {
+                out.strong_calls += 1;
+                if pred == win {
+                    out.strong_correct += 1;
+                }
+            }
+
+            if mode == EvalMode::WatchAsHint && matches!(replay, ManualSignalLabel::Watch) {
+                out.watch_calls += 1;
+                if let Some(pred) = predicted_side_watch_hint(replay, s.spot, s.ptb) {
+                    if pred == win {
+                        out.watch_correct += 1;
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn snap_to_input(
     s: &SnapParsed,
     tunables: &RoundLogStrategyTunables,
@@ -241,12 +380,22 @@ fn snap_to_input(
     })
 }
 
-#[derive(Default)]
-struct TunableOverrides {
-    strong_gap_mult: Option<f64>,
-    max_spread_mult: Option<f64>,
-    min_top_ask_shares: Option<f64>,
-    watch_ratio: Option<f64>,
+#[derive(Default, Clone)]
+pub(crate) struct TunableOverrides {
+    pub(crate) strong_gap_mult: Option<f64>,
+    pub(crate) max_spread_mult: Option<f64>,
+    pub(crate) min_top_ask_shares: Option<f64>,
+    pub(crate) watch_ratio: Option<f64>,
+}
+
+/// Strategy overrides with every field set to `t` (MCMC / global replay over logs).
+pub(crate) fn tunable_overrides_global(t: &RoundLogStrategyTunables) -> TunableOverrides {
+    TunableOverrides {
+        strong_gap_mult: Some(t.strong_gap_mult),
+        max_spread_mult: Some(t.max_spread_mult),
+        min_top_ask_shares: Some(t.min_top_ask_shares),
+        watch_ratio: Some(t.watch_ratio),
+    }
 }
 
 /// Resolved autotrading / exit simulation parameters (defaults match [`crate::config::Config`]).
@@ -724,6 +873,873 @@ fn predicted_side_watch_hint(
     }
 }
 
+fn sim_total_exits(sim: &SimTradingSummary) -> u64 {
+    sim.exit_stop_loss
+        + sim.exit_trailing_min_profit
+        + sim.exit_settlement_win
+        + sim.exit_settlement_lose
+}
+
+/// All closed legs exited via trailing take-profit or winning settlement (no stop-loss, no losing settlement).
+fn sim_perfect_exit_win_rate(sim: &SimTradingSummary) -> bool {
+    let n = sim_total_exits(sim);
+    n > 0 && sim.exit_stop_loss == 0 && sim.exit_settlement_lose == 0
+}
+
+fn strong_replay_perfect(summary: &EvalSummary) -> bool {
+    summary.strong_calls > 0 && summary.strong_correct == summary.strong_calls
+}
+
+/// Among sim-exit-perfect combos: prefer 100% strong replay vs settlement, then higher PnL.
+fn is_better_tune_candidate(new: &EvalSummary, old: &EvalSummary) -> bool {
+    let ns = u8::from(strong_replay_perfect(new));
+    let os = u8::from(strong_replay_perfect(old));
+    if ns != os {
+        return ns > os;
+    }
+    new.sim_trading.realized_pnl_usdc > old.sim_trading.realized_pnl_usdc
+}
+
+fn strong_replay_win_rate(summary: &EvalSummary) -> Option<f64> {
+    if summary.strong_calls == 0 {
+        return None;
+    }
+    Some(summary.strong_correct as f64 / summary.strong_calls as f64)
+}
+
+fn sim_trading_win_rate(sim: &SimTradingSummary) -> Option<f64> {
+    let n = sim_total_exits(sim);
+    if n == 0 {
+        return None;
+    }
+    let wins = sim.exit_trailing_min_profit + sim.exit_settlement_win;
+    Some(wins as f64 / n as f64)
+}
+
+/// Requires [`sort_round_snaps_by_ts`] to have been applied to `rounds` (or snaps otherwise
+/// chronologically sorted).
+fn aggregate_signal_eval_on_rounds(
+    rounds: &HashMap<String, RoundAccum>,
+    mode: EvalMode,
+    overrides: &TunableOverrides,
+    sim_params: &SimTradingParams,
+) -> EvalSummary {
+    let rep = replay_strategy_metrics(rounds, mode, overrides);
+    let mut summary = EvalSummary {
+        rounds_total: rounds.len(),
+        rounds_with_win: rep.rounds_with_win,
+        snaps_total: rep.snaps_total,
+        snaps_usable_book: rep.snaps_usable_book,
+        mode: match mode {
+            EvalMode::StrongOnly => "strong-only".into(),
+            EvalMode::WatchAsHint => "watch-as-hint".into(),
+        },
+        strong_calls: rep.strong_calls,
+        strong_correct: rep.strong_correct,
+        watch_calls: rep.watch_calls,
+        watch_correct: rep.watch_correct,
+        replay_mismatch_live_sig: rep.replay_mismatch_live_sig,
+        sim_trading: SimTradingSummary::default(),
+        sim_trading_params: sim_params.clone(),
+    };
+
+    for (_cid, acc) in rounds {
+        let Some(win) = acc.win.as_deref() else {
+            continue;
+        };
+        if win != "up" && win != "down" {
+            continue;
+        }
+        let Some(tun) = acc.tunables.as_ref() else {
+            continue;
+        };
+        let ws = acc.ws.unwrap_or(0);
+        let we = acc.we.unwrap_or(ws + 1).max(ws + 1);
+
+        summary.sim_trading.merge(&simulate_trading_round(
+            acc.snaps.as_slice(),
+            tun,
+            ws,
+            we,
+            overrides,
+            sim_params,
+            win,
+        ));
+    }
+
+    summary
+}
+
+/// STRONG autotrading simulation on round logs using default `signal-eval` sim parameters
+/// (same as omitting `--sim-*` overrides). Returns total **realized PnL in USDC** merged across
+/// rounds with a resolved `up`/`down` winner.
+pub fn replay_sim_realized_pnl_usdc(
+    rounds: &HashMap<String, RoundAccum>,
+    mode: EvalMode,
+    overrides: &TunableOverrides,
+) -> f64 {
+    let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
+    aggregate_signal_eval_on_rounds(rounds, mode, overrides, &sim).sim_trading.realized_pnl_usdc
+}
+
+fn aggregate_signal_eval(
+    dir: &std::path::Path,
+    day: Option<&str>,
+    mode: EvalMode,
+    overrides: &TunableOverrides,
+    sim_params: &SimTradingParams,
+) -> Result<Option<EvalSummary>> {
+    let rounds = load_offline_rounds(dir, day)?;
+
+    Ok(Some(aggregate_signal_eval_on_rounds(
+        &rounds,
+        mode,
+        overrides,
+        sim_params,
+    )))
+}
+
+fn sim_trading_params_from_tuning_env() -> SimTradingParams {
+    SimTradingParams::from_cli_optional(
+        std::env::var("AUTOTRADING_BUY_LAST_SECS").ok().as_deref(),
+        std::env::var("AUTOTRADING_BUY_EARLY_PTB_GAP_BPS")
+            .ok()
+            .as_deref(),
+        std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
+            .ok()
+            .as_deref(),
+        std::env::var("AUTOTRADING_MAX_ENTRY_PRICE").ok().as_deref(),
+        std::env::var("AUTOTRADING_MAX_POSITIONS").ok().as_deref(),
+        std::env::var("TRAILING_EXIT_MIN_PROFIT_BPS")
+            .ok()
+            .as_deref(),
+        std::env::var("STOP_LOSS_BPS").ok().as_deref(),
+    )
+}
+
+fn split_csv_grid(s: &str) -> Vec<&str> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn parse_grid_option_u64(token: &str) -> Result<Option<u64>> {
+    let t = token.trim();
+    if t.eq_ignore_ascii_case("none") || t == "-" {
+        return Ok(None);
+    }
+    let n: u64 = t.parse().context("expected unsigned int or none")?;
+    Ok(Some(n))
+}
+
+fn parse_grid_option_f64_prob(token: &str) -> Result<Option<f64>> {
+    let t = token.trim();
+    if t.eq_ignore_ascii_case("none") || t == "-" {
+        return Ok(None);
+    }
+    let p: f64 = t.parse().context("max-entry price")?;
+    if !p.is_finite() || !(0.01..=0.99).contains(&p) {
+        bail!("max-entry price must be in 0.01..=0.99");
+    }
+    Ok(Some(p))
+}
+
+/// Upper bound for basis-point grids in `--grind bps` (inclusive).
+const GRIND_BPS_INCLUSIVE_MAX: u32 = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum GrindMode {
+    /// Normal tuning: explicit `--grid-*` or single default per axis.
+    #[default]
+    None,
+    /// Full `0..=GRIND_BPS_INCLUSIVE_MAX` for each sim bps axis whose `--grid-*` was omitted.
+    Bps,
+    /// Stepped exhaustive strategy overrides (no `log` / JSONL-only path) for omitted `--grid-strategy-*`.
+    Strategy,
+}
+
+struct TuneAxes {
+    strong_gap_mult: Vec<Option<f64>>,
+    max_spread_mult: Vec<Option<f64>>,
+    min_top_ask_shares: Vec<Option<f64>>,
+    watch_ratio: Vec<Option<f64>>,
+    buy_last_secs: Vec<Option<u64>>,
+    early_ptb_gap_bps: Arc<[u32]>,
+    order_expires_after_secs: Vec<Option<u64>>,
+    max_entry_price: Vec<Option<f64>>,
+    max_positions: Vec<usize>,
+    trailing_exit_min_profit_bps: Arc<[u32]>,
+    stop_loss_bps: Arc<[u32]>,
+}
+
+impl TuneAxes {
+    fn combo_count_u64(&self) -> Option<u64> {
+        let mut p: u64 = 1;
+        for n in [
+            self.strong_gap_mult.len() as u64,
+            self.max_spread_mult.len() as u64,
+            self.min_top_ask_shares.len() as u64,
+            self.watch_ratio.len() as u64,
+            self.buy_last_secs.len() as u64,
+            self.early_ptb_gap_bps.len() as u64,
+            self.order_expires_after_secs.len() as u64,
+            self.max_entry_price.len() as u64,
+            self.max_positions.len() as u64,
+            self.trailing_exit_min_profit_bps.len() as u64,
+            self.stop_loss_bps.len() as u64,
+        ] {
+            p = p.checked_mul(n)?;
+        }
+        Some(p)
+    }
+
+    fn for_each_combo(&self, mut f: impl FnMut(TunableOverrides, SimTradingParams)) {
+        for &strong_gap_mult in &self.strong_gap_mult {
+            for &max_spread_mult in &self.max_spread_mult {
+                for &min_top_ask_shares in &self.min_top_ask_shares {
+                    for &watch_ratio in &self.watch_ratio {
+                        for &buy_last in &self.buy_last_secs {
+                            for &early_ptb in self.early_ptb_gap_bps.iter() {
+                                for &order_exp in &self.order_expires_after_secs {
+                                    for &max_entry in &self.max_entry_price {
+                                        for &max_pos in &self.max_positions {
+                                            for &trail_bps in self.trailing_exit_min_profit_bps.iter() {
+                                                for &sl_bps in self.stop_loss_bps.iter() {
+                                                    let overrides = TunableOverrides {
+                                                        strong_gap_mult,
+                                                        max_spread_mult,
+                                                        min_top_ask_shares,
+                                                        watch_ratio,
+                                                    };
+                                                    let sim = SimTradingParams {
+                                                        autotrading_buy_last_secs: buy_last,
+                                                        autotrading_buy_early_ptb_gap_bps: early_ptb,
+                                                        autotrading_order_expires_after_secs: order_exp,
+                                                        autotrading_max_entry_price: max_entry,
+                                                        autotrading_max_positions: max_pos,
+                                                        trailing_exit_min_profit_bps: trail_bps,
+                                                        stop_loss_bps: sl_bps,
+                                                    };
+                                                    f(overrides, sim);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn grind_bps_full_arc() -> Arc<[u32]> {
+    Arc::from(
+        (0..=GRIND_BPS_INCLUSIVE_MAX)
+            .collect::<Vec<u32>>()
+            .into_boxed_slice(),
+    )
+}
+
+/// Overrides aligned with [`crate::config::parse_strategy_strong_gap_mult`] clamp range (0.55–1.15).
+fn grind_strategy_strong_gap_somes() -> Vec<Option<f64>> {
+    (55_i32..=115).map(|c| Some(c as f64 / 100.0)).collect()
+}
+
+/// 1.00–1.35 step 0.01 ([`crate::config::parse_strategy_max_spread_mult`]).
+fn grind_strategy_max_spread_somes() -> Vec<Option<f64>> {
+    (100_i32..=135).map(|c| Some(c as f64 / 100.0)).collect()
+}
+
+/// 2.0–50.0 step 0.5 shares ([`crate::config::parse_strategy_min_top_ask_shares`]).
+fn grind_strategy_min_top_ask_somes() -> Vec<Option<f64>> {
+    (4_i32..=100).map(|h| Some(h as f64 * 0.5)).collect()
+}
+
+/// 0.40–0.85 step 0.01 ([`crate::config::parse_strategy_watch_ratio`]).
+fn grind_strategy_watch_ratio_somes() -> Vec<Option<f64>> {
+    (40_i32..=85).map(|c| Some(c as f64 / 100.0)).collect()
+}
+
+fn parse_strategy_float_grid(arg: Option<&str>, label: &str) -> Result<Vec<Option<f64>>> {
+    let Some(raw) = arg else {
+        return Ok(vec![None]);
+    };
+    let mut out = Vec::new();
+    for tok in split_csv_grid(raw) {
+        if tok.eq_ignore_ascii_case("log") {
+            out.push(None);
+            continue;
+        }
+        let v: f64 = tok.parse().with_context(|| format!("{label}: {tok}"))?;
+        if !v.is_finite() {
+            bail!("{}: non-finite value", label);
+        }
+        out.push(Some(v));
+    }
+    if out.is_empty() {
+        bail!("{}: empty grid", label);
+    }
+    Ok(out)
+}
+
+fn parse_usize_grid(arg: Option<&str>, label: &str, default: usize) -> Result<Vec<usize>> {
+    let Some(raw) = arg else {
+        return Ok(vec![default]);
+    };
+    let mut out = Vec::new();
+    for tok in split_csv_grid(raw) {
+        out.push(
+            tok.parse::<usize>()
+                .with_context(|| format!("{label}: {tok}"))?,
+        );
+    }
+    if out.is_empty() {
+        bail!("{}: empty grid", label);
+    }
+    Ok(out)
+}
+
+fn parse_option_u64_grid(arg: Option<&str>, label: &str) -> Result<Vec<Option<u64>>> {
+    let Some(raw) = arg else {
+        return Ok(vec![parse_autotrading_buy_last_secs(
+            std::env::var("AUTOTRADING_BUY_LAST_SECS")
+                .ok()
+                .as_deref(),
+        )]);
+    };
+    let mut out = Vec::new();
+    for tok in split_csv_grid(raw) {
+        out.push(parse_grid_option_u64(tok).with_context(|| format!("{label}: {tok}"))?);
+    }
+    if out.is_empty() {
+        bail!("{}: empty grid", label);
+    }
+    Ok(out)
+}
+
+fn parse_option_u64_grid_order_expires(arg: Option<&str>, label: &str) -> Result<Vec<Option<u64>>> {
+    let Some(raw) = arg else {
+        return Ok(vec![parse_autotrading_order_expires_after_secs(
+            std::env::var("AUTOTRADING_ORDER_EXPIRES_AFTER")
+                .ok()
+                .as_deref(),
+        )]);
+    };
+    let mut out = Vec::new();
+    for tok in split_csv_grid(raw) {
+        out.push(parse_grid_option_u64(tok).with_context(|| format!("{label}: {tok}"))?);
+    }
+    if out.is_empty() {
+        bail!("{}: empty grid", label);
+    }
+    Ok(out)
+}
+
+fn parse_option_f64_entry_grid(arg: Option<&str>, label: &str) -> Result<Vec<Option<f64>>> {
+    let Some(raw) = arg else {
+        return Ok(vec![parse_autotrading_max_entry_price(
+            std::env::var("AUTOTRADING_MAX_ENTRY_PRICE")
+                .ok()
+                .as_deref(),
+        )]);
+    };
+    let mut out = Vec::new();
+    for tok in split_csv_grid(raw) {
+        out.push(parse_grid_option_f64_prob(tok).with_context(|| format!("{label}: {tok}"))?);
+    }
+    if out.is_empty() {
+        bail!("{}: empty grid", label);
+    }
+    Ok(out)
+}
+
+fn print_recommended_env_exports(overrides: &TunableOverrides, sim: &SimTradingParams) {
+    println!("# Strategy (set empty/unset to use per-round log tunables for that key)");
+    if let Some(v) = overrides.strong_gap_mult {
+        println!("export STRATEGY_STRONG_GAP_MULT={v}");
+    } else {
+        println!("# STRATEGY_STRONG_GAP_MULT unset → per-round JSONL tunables");
+    }
+    if let Some(v) = overrides.max_spread_mult {
+        println!("export STRATEGY_MAX_SPREAD_MULT={v}");
+    } else {
+        println!("# STRATEGY_MAX_SPREAD_MULT unset → per-round JSONL tunables");
+    }
+    if let Some(v) = overrides.min_top_ask_shares {
+        println!("export STRATEGY_MIN_TOP_ASK_SHARES={v}");
+    } else {
+        println!("# STRATEGY_MIN_TOP_ASK_SHARES unset → per-round JSONL tunables");
+    }
+    if let Some(v) = overrides.watch_ratio {
+        println!("export STRATEGY_WATCH_RATIO={v}");
+    } else {
+        println!("# STRATEGY_WATCH_RATIO unset → per-round JSONL tunables");
+    }
+    println!();
+    if let Some(v) = sim.autotrading_buy_last_secs {
+        println!("export AUTOTRADING_BUY_LAST_SECS={v}");
+    } else {
+        println!("# AUTOTRADING_BUY_LAST_SECS unset (no final-seconds buy window)");
+    }
+    println!(
+        "export AUTOTRADING_BUY_EARLY_PTB_GAP_BPS={}",
+        sim.autotrading_buy_early_ptb_gap_bps
+    );
+    if let Some(v) = sim.autotrading_order_expires_after_secs {
+        println!("export AUTOTRADING_ORDER_EXPIRES_AFTER={v}");
+    } else {
+        println!("# AUTOTRADING_ORDER_EXPIRES_AFTER unset (resting until window end)");
+    }
+    if let Some(v) = sim.autotrading_max_entry_price {
+        println!("export AUTOTRADING_MAX_ENTRY_PRICE={v}");
+    } else {
+        println!("# AUTOTRADING_MAX_ENTRY_PRICE unset");
+    }
+    println!(
+        "export AUTOTRADING_MAX_POSITIONS={}",
+        sim.autotrading_max_positions
+    );
+    println!(
+        "export TRAILING_EXIT_MIN_PROFIT_BPS={}",
+        sim.trailing_exit_min_profit_bps
+    );
+    println!("export STOP_LOSS_BPS={}", sim.stop_loss_bps);
+}
+
+/// Grid-search tuning (same logs as `signal-eval`). Picks combos with **100% simulated exit win
+/// rate** (≥1 closed leg, no stop-loss exits, no losing settlements). Among those, prefers **100%
+/// strong replay vs final winner**, then highest `realized_pnl_usdc`. If none qualify, falls back
+/// to best sim exit win rate then PnL.
+///
+/// **`--grind`**: exhaustive default grids (no comma lists needed for those axes):
+/// - **`--grind`** or **`--grind bps`**: each omitted `--grid-*` among early-PTB / trailing / stop-loss
+///   bps is enumerated from **0 through 10_000** inclusive.
+/// - **`--grind strategy`**: each omitted `--grid-strategy-*` uses a fixed stepped list matching config
+///   clamp ranges (all `Some` overrides; no per-round `log` path).
+/// Only one grind mode per run (`bps` and `strategy` are not combined — run twice for both).
+///
+/// **`--grind` requires `--day`** and an explicit **`--dir`** (not the implicit `./data/rounds` default).
+/// **`--max-combos 0`** means unlimited (default when `--grind` is active unless you pass an explicit
+/// **`--max-combos`**). **`--progress-every N`** prints stderr progress (default **100_000** when total
+/// combos > 500_000 and `N` not set).
+pub fn run_signal_eval_tune_cli(args: &[String]) -> Result<()> {
+    let _ = dotenvy::dotenv();
+    let mut dir = PathBuf::from("./data/rounds");
+    let mut day: Option<String> = None;
+    let mut mode = EvalMode::StrongOnly;
+    let mut json_out = false;
+    let mut max_combos: usize = 250_000;
+    let mut max_combos_explicit = false;
+    let mut grind_mode = GrindMode::None;
+    let mut progress_every_cfg: u64 = 0;
+    let mut dir_explicit = false;
+
+    let mut g_strong_gap: Option<String> = None;
+    let mut g_max_spread: Option<String> = None;
+    let mut g_min_top_ask: Option<String> = None;
+    let mut g_watch_ratio: Option<String> = None;
+    let mut g_buy_last: Option<String> = None;
+    let mut g_early_ptb: Option<String> = None;
+    let mut g_order_exp: Option<String> = None;
+    let mut g_max_entry: Option<String> = None;
+    let mut g_max_pos: Option<String> = None;
+    let mut g_trail: Option<String> = None;
+    let mut g_stop: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--dir" => {
+                i += 1;
+                let Some(p) = args.get(i) else {
+                    bail!("--dir requires a path");
+                };
+                dir = PathBuf::from(p);
+                dir_explicit = true;
+            }
+            "--day" => {
+                i += 1;
+                let Some(d) = args.get(i) else {
+                    bail!("--day requires YYYY-MM-DD");
+                };
+                day = Some(d.clone());
+            }
+            "--mode" => {
+                i += 1;
+                let Some(m) = args.get(i) else {
+                    bail!("--mode requires strong-only|watch-as-hint");
+                };
+                mode = EvalMode::parse(m).with_context(|| format!("unknown mode {m}"))?;
+            }
+            "--json" => {
+                json_out = true;
+            }
+            "--max-combos" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--max-combos requires a number (0 = unlimited)");
+                };
+                max_combos = x.parse().context("max-combos")?;
+                max_combos_explicit = true;
+            }
+            "--grind" => {
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    grind_mode = match args[i + 1].as_str() {
+                        "bps" => GrindMode::Bps,
+                        "strategy" => GrindMode::Strategy,
+                        other => {
+                            bail!("--grind: unknown mode '{other}'; use bps|strategy (or pass --grind alone for bps)")
+                        }
+                    };
+                    i += 1;
+                } else {
+                    grind_mode = GrindMode::Bps;
+                }
+            }
+            "--progress-every" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--progress-every requires a positive integer");
+                };
+                progress_every_cfg = x.parse().context("progress-every")?;
+            }
+            "--grid-strategy-strong-gap-mult" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-strategy-strong-gap-mult requires comma-separated floats or `log`");
+                };
+                g_strong_gap = Some(x.clone());
+            }
+            "--grid-strategy-max-spread-mult" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-strategy-max-spread-mult requires values");
+                };
+                g_max_spread = Some(x.clone());
+            }
+            "--grid-strategy-min-top-ask-shares" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-strategy-min-top-ask-shares requires values");
+                };
+                g_min_top_ask = Some(x.clone());
+            }
+            "--grid-strategy-watch-ratio" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-strategy-watch-ratio requires values");
+                };
+                g_watch_ratio = Some(x.clone());
+            }
+            "--grid-autotrading-buy-last-secs" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-autotrading-buy-last-secs requires comma list (none,60,…)");
+                };
+                g_buy_last = Some(x.clone());
+            }
+            "--grid-autotrading-buy-early-ptb-gap-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-autotrading-buy-early-ptb-gap-bps requires values");
+                };
+                g_early_ptb = Some(x.clone());
+            }
+            "--grid-autotrading-order-expires-after" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-autotrading-order-expires-after requires values");
+                };
+                g_order_exp = Some(x.clone());
+            }
+            "--grid-autotrading-max-entry-price" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-autotrading-max-entry-price requires values");
+                };
+                g_max_entry = Some(x.clone());
+            }
+            "--grid-autotrading-max-positions" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-autotrading-max-positions requires values");
+                };
+                g_max_pos = Some(x.clone());
+            }
+            "--grid-trailing-exit-min-profit-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-trailing-exit-min-profit-bps requires values");
+                };
+                g_trail = Some(x.clone());
+            }
+            "--grid-stop-loss-bps" => {
+                i += 1;
+                let Some(x) = args.get(i) else {
+                    bail!("--grid-stop-loss-bps requires values");
+                };
+                g_stop = Some(x.clone());
+            }
+            other => bail!("unknown argument: {other}"),
+        }
+        i += 1;
+    }
+
+    if grind_mode != GrindMode::None && !max_combos_explicit {
+        max_combos = 0;
+    }
+    if grind_mode != GrindMode::None && day.is_none() {
+        bail!("--grind requires --day YYYY-MM-DD (restrict to one UTC day of logs)");
+    }
+    if grind_mode != GrindMode::None && !dir_explicit {
+        bail!("--grind requires an explicit --dir path (refuse default ./data/rounds)");
+    }
+
+    let base_sim = sim_trading_params_from_tuning_env();
+
+    let strong_gap_mult = if grind_mode == GrindMode::Strategy && g_strong_gap.is_none() {
+        grind_strategy_strong_gap_somes()
+    } else {
+        parse_strategy_float_grid(g_strong_gap.as_deref(), "grid-strategy-strong-gap-mult")?
+    };
+    let max_spread_mult = if grind_mode == GrindMode::Strategy && g_max_spread.is_none() {
+        grind_strategy_max_spread_somes()
+    } else {
+        parse_strategy_float_grid(g_max_spread.as_deref(), "grid-strategy-max-spread-mult")?
+    };
+    let min_top_ask_shares = if grind_mode == GrindMode::Strategy && g_min_top_ask.is_none() {
+        grind_strategy_min_top_ask_somes()
+    } else {
+        parse_strategy_float_grid(g_min_top_ask.as_deref(), "grid-strategy-min-top-ask-shares")?
+    };
+    let watch_ratio = if grind_mode == GrindMode::Strategy && g_watch_ratio.is_none() {
+        grind_strategy_watch_ratio_somes()
+    } else {
+        parse_strategy_float_grid(g_watch_ratio.as_deref(), "grid-strategy-watch-ratio")?
+    };
+
+    let triple_bps_grind = grind_mode == GrindMode::Bps
+        && g_early_ptb.is_none()
+        && g_trail.is_none()
+        && g_stop.is_none();
+    let grind_bps_shared: Option<Arc<[u32]>> = triple_bps_grind.then(grind_bps_full_arc);
+
+    let early_ptb_gap_bps = if grind_mode == GrindMode::Bps && g_early_ptb.is_none() {
+        grind_bps_shared
+            .as_ref()
+            .map(|a| a.clone())
+            .unwrap_or_else(grind_bps_full_arc)
+    } else {
+        parse_u32_axis_arc(
+            g_early_ptb.as_deref(),
+            "grid-autotrading-buy-early-ptb-gap-bps",
+            base_sim.autotrading_buy_early_ptb_gap_bps,
+            parse_autotrading_buy_early_ptb_gap_bps,
+        )?
+    };
+    let trailing_exit_min_profit_bps = if grind_mode == GrindMode::Bps && g_trail.is_none() {
+        grind_bps_shared
+            .as_ref()
+            .map(|a| a.clone())
+            .unwrap_or_else(grind_bps_full_arc)
+    } else {
+        parse_u32_axis_arc(
+            g_trail.as_deref(),
+            "grid-trailing-exit-min-profit-bps",
+            base_sim.trailing_exit_min_profit_bps,
+            parse_trailing_exit_min_profit_bps,
+        )?
+    };
+    let stop_loss_bps = if grind_mode == GrindMode::Bps && g_stop.is_none() {
+        grind_bps_shared
+            .as_ref()
+            .map(|a| a.clone())
+            .unwrap_or_else(grind_bps_full_arc)
+    } else {
+        parse_u32_axis_arc(
+            g_stop.as_deref(),
+            "grid-stop-loss-bps",
+            base_sim.stop_loss_bps,
+            parse_stop_loss_bps,
+        )?
+    };
+
+    let axes = TuneAxes {
+        strong_gap_mult,
+        max_spread_mult,
+        min_top_ask_shares,
+        watch_ratio,
+        buy_last_secs: parse_option_u64_grid(g_buy_last.as_deref(), "grid-autotrading-buy-last-secs")?,
+        early_ptb_gap_bps,
+        order_expires_after_secs: parse_option_u64_grid_order_expires(
+            g_order_exp.as_deref(),
+            "grid-autotrading-order-expires-after",
+        )?,
+        max_entry_price: parse_option_f64_entry_grid(g_max_entry.as_deref(), "grid-autotrading-max-entry-price")?,
+        max_positions: parse_usize_grid(
+            g_max_pos.as_deref(),
+            "grid-autotrading-max-positions",
+            base_sim.autotrading_max_positions,
+        )?,
+        trailing_exit_min_profit_bps,
+        stop_loss_bps,
+    };
+
+    let n = axes
+        .combo_count_u64()
+        .context("grid Cartesian product overflowed u64 (too many axes)")?;
+    if max_combos > 0 && n > max_combos as u64 {
+        bail!(
+            "grid Cartesian product is {n} combos (limit {max_combos}); narrow grids, use a different --grind mode, or pass --max-combos 0 for unlimited"
+        );
+    }
+
+    let progress_every = if progress_every_cfg > 0 {
+        progress_every_cfg
+    } else if n > 500_000 {
+        100_000
+    } else {
+        0
+    };
+    if grind_mode != GrindMode::None {
+        eprintln!(
+            "signal-eval-tune: grind mode {:?} — {n} combinations{}",
+            grind_mode,
+            if progress_every > 0 {
+                format!(" (progress every {progress_every})")
+            } else {
+                String::new()
+            }
+        );
+    }
+
+    let paths = list_jsonl_round_paths(&dir, day.as_deref())?;
+    if paths.is_empty() {
+        println!("No .jsonl files under {}", dir.display());
+        return Ok(());
+    }
+
+    let mut rounds: HashMap<String, RoundAccum> = HashMap::new();
+    for p in &paths {
+        ingest_jsonl(p, &mut rounds)?;
+    }
+    sort_round_snaps_by_ts(&mut rounds);
+
+    let mut best_perfect: Option<(EvalSummary, TunableOverrides, SimTradingParams)> = None;
+    let mut best_fallback: Option<(EvalSummary, TunableOverrides, SimTradingParams)> = None;
+    let mut best_fallback_rate: f64 = -1.0;
+
+    let mut done: u64 = 0;
+    axes.for_each_combo(|overrides, sim| {
+        done += 1;
+        if progress_every > 0 && done % progress_every == 0 {
+            eprintln!(
+                "signal-eval-tune: progress {done}/{n} ({:.2}%)",
+                100.0 * done as f64 / n as f64
+            );
+        }
+        let summary = aggregate_signal_eval_on_rounds(&rounds, mode, &overrides, &sim);
+        let sim_sr = sim_trading_win_rate(&summary.sim_trading).unwrap_or(-1.0);
+        let perfect = sim_perfect_exit_win_rate(&summary.sim_trading);
+
+        if perfect {
+            let replace = best_perfect
+                .as_ref()
+                .map_or(true, |(s, _, _)| is_better_tune_candidate(&summary, s));
+            if replace {
+                best_perfect = Some((summary, overrides, sim));
+            }
+        } else if sim_sr > best_fallback_rate + 1e-15
+            || (f64::abs(sim_sr - best_fallback_rate) <= 1e-15
+                && best_fallback.as_ref().map_or(true, |(s, _, _)| {
+                    summary.sim_trading.realized_pnl_usdc > s.sim_trading.realized_pnl_usdc
+                }))
+        {
+            best_fallback_rate = sim_sr;
+            best_fallback = Some((summary, overrides.clone(), sim.clone()));
+        }
+    });
+
+    let picked_perfect = best_perfect.is_some();
+    let (winner_summary, winner_o, winner_s) = best_perfect
+        .or(best_fallback)
+        .context("internal: no grid combo evaluated")?;
+
+    let sim_wr = sim_trading_win_rate(&winner_summary.sim_trading);
+    let strong_wr = strong_replay_win_rate(&winner_summary);
+
+    if json_out {
+        #[derive(Serialize)]
+        struct TuneJsonOut {
+            picked_perfect_exit_win_rate: bool,
+            sim_exit_win_rate: Option<f64>,
+            strong_replay_win_rate: Option<f64>,
+            realized_pnl_usdc: f64,
+            summary: EvalSummary,
+        }
+        let out = TuneJsonOut {
+            picked_perfect_exit_win_rate: picked_perfect,
+            sim_exit_win_rate: sim_wr,
+            strong_replay_win_rate: strong_wr,
+            realized_pnl_usdc: winner_summary.sim_trading.realized_pnl_usdc,
+            summary: winner_summary,
+        };
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    if picked_perfect {
+        println!("signal-eval-tune: best combo (100% sim exit win rate; tie-break: 100% strong replay vs win, then highest PnL)");
+    } else {
+        println!("signal-eval-tune: no combo achieved 100% sim exit win rate; showing best exit win rate then PnL");
+    }
+    println!(
+        "  evaluated {n} combinations on {} rounds ({} with up/down win)",
+        winner_summary.rounds_total, winner_summary.rounds_with_win
+    );
+    println!(
+        "  sim exit win rate: {:.4}%  |  strong replay vs win: {}",
+        sim_wr.map(|r| 100.0 * r).unwrap_or(f64::NAN),
+        strong_wr
+            .map(|r| format!("{:.4}%", 100.0 * r))
+            .unwrap_or_else(|| "n/a (no strong calls)".into())
+    );
+    println!(
+        "  realized PnL (USDC est.): {:.4}",
+        winner_summary.sim_trading.realized_pnl_usdc
+    );
+    println!();
+    println!("Recommended environment (matches .env names used by config + strategy):");
+    print_recommended_env_exports(&winner_o, &winner_s);
+
+    Ok(())
+}
+
+fn parse_u32_axis_arc(
+    arg: Option<&str>,
+    label: &str,
+    default: u32,
+    parse_one: fn(Option<&str>) -> u32,
+) -> Result<Arc<[u32]>> {
+    let v: Vec<u32> = if let Some(raw) = arg {
+        let mut out = Vec::new();
+        for tok in split_csv_grid(raw) {
+            out.push(parse_one(Some(tok)));
+        }
+        if out.is_empty() {
+            bail!("{}: empty grid", label);
+        }
+        out
+    } else {
+        vec![default]
+    };
+    Ok(Arc::from(v.into_boxed_slice()))
+}
+
 /// Run `signal-eval` CLI (args after subcommand name).
 pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
     let mut dir = PathBuf::from("./data/rounds");
@@ -864,91 +1880,11 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         sim_stop_loss_bps.as_deref(),
     );
 
-    let paths = list_jsonl_files(&dir, day.as_deref())?;
-    if paths.is_empty() {
+    let Some(summary) = aggregate_signal_eval(&dir, day.as_deref(), mode, &overrides, &sim_params)?
+    else {
         println!("No .jsonl files under {}", dir.display());
         return Ok(());
-    }
-
-    let mut rounds: HashMap<String, RoundAccum> = HashMap::new();
-    for p in &paths {
-        ingest_jsonl(p, &mut rounds)?;
-    }
-
-    let mut summary = EvalSummary {
-        rounds_total: rounds.len(),
-        rounds_with_win: 0,
-        snaps_total: 0,
-        snaps_usable_book: 0,
-        mode: match mode {
-            EvalMode::StrongOnly => "strong-only".into(),
-            EvalMode::WatchAsHint => "watch-as-hint".into(),
-        },
-        strong_calls: 0,
-        strong_correct: 0,
-        watch_calls: 0,
-        watch_correct: 0,
-        replay_mismatch_live_sig: 0,
-        sim_trading: SimTradingSummary::default(),
-        sim_trading_params: sim_params.clone(),
     };
-
-    for (_cid, acc) in &rounds {
-        let Some(win) = acc.win.as_deref() else {
-            continue;
-        };
-        if win != "up" && win != "down" {
-            continue;
-        }
-        summary.rounds_with_win += 1;
-        let Some(tun) = acc.tunables.as_ref() else {
-            continue;
-        };
-        let ws = acc.ws.unwrap_or(0);
-        let we = acc.we.unwrap_or(ws + 1).max(ws + 1);
-
-        let mut snaps_sorted = acc.snaps.clone();
-        snaps_sorted.sort_by_key(|s| s._ts);
-        summary.sim_trading.merge(&simulate_trading_round(
-            &snaps_sorted,
-            tun,
-            ws,
-            we,
-            &overrides,
-            &sim_params,
-            win,
-        ));
-
-        for s in &snaps_sorted {
-            summary.snaps_total += 1;
-            let Some(input) = snap_to_input(s, tun, ws, we, &overrides) else {
-                continue;
-            };
-            summary.snaps_usable_book += 1;
-            let replay = evaluate_manual_signal(&input);
-            if let Some(live) = u8_to_label(s.sig) {
-                if live != replay {
-                    summary.replay_mismatch_live_sig += 1;
-                }
-            }
-
-            if let Some(pred) = predicted_side_strong(replay) {
-                summary.strong_calls += 1;
-                if pred == win {
-                    summary.strong_correct += 1;
-                }
-            }
-
-            if mode == EvalMode::WatchAsHint && matches!(replay, ManualSignalLabel::Watch) {
-                summary.watch_calls += 1;
-                if let Some(pred) = predicted_side_watch_hint(replay, s.spot, s.ptb) {
-                    if pred == win {
-                        summary.watch_correct += 1;
-                    }
-                }
-            }
-        }
-    }
 
     if json_out {
         println!("{}", serde_json::to_string_pretty(&summary)?);
@@ -1036,8 +1972,9 @@ mod signal_eval_tests {
     use std::io::Write;
 
     use super::{
-        ingest_jsonl, list_jsonl_files, simulate_trading_round, snap_to_input, RoundAccum,
-        SimTradingParams, TunableOverrides,
+        aggregate_signal_eval_on_rounds, ingest_jsonl, list_jsonl_round_paths,
+        load_offline_rounds_filtered, replay_strategy_metrics, simulate_trading_round, snap_to_input,
+        EvalMode, RoundAccum, SimTradingParams, TunableOverrides,
     };
     use crate::strategy::{evaluate_manual_signal, ManualSignalLabel};
 
@@ -1051,11 +1988,87 @@ mod signal_eval_tests {
         std::fs::write(dir.join("2026-05-11-btc-5m.jsonl"), "").unwrap();
         std::fs::write(dir.join("2026-05-12-btc-5m.jsonl"), "").unwrap();
 
-        let paths = list_jsonl_files(&dir, Some("2026-05-11")).unwrap();
+        let paths = list_jsonl_round_paths(&dir, Some("2026-05-11")).unwrap();
 
         assert_eq!(paths.len(), 2);
         assert!(paths.iter().any(|p| p.ends_with("2026-05-11.jsonl")));
         assert!(paths.iter().any(|p| p.ends_with("2026-05-11-btc-5m.jsonl")));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_offline_rounds_filtered_errors_without_profile_when_multiple_match_day() {
+        let dir = std::env::temp_dir().join(format!(
+            "signal_eval_filtered_multi_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("2026-05-11-btc-5m.jsonl"), "").unwrap();
+        std::fs::write(dir.join("2026-05-11-sol-5m.jsonl"), "").unwrap();
+        match load_offline_rounds_filtered(&dir, Some("2026-05-11"), None) {
+            Err(e) => assert!(e.to_string().contains("--profile"), "{e}"),
+            Ok(_) => panic!("expected error without --profile"),
+        }
+        let (rounds, paths) =
+            load_offline_rounds_filtered(&dir, Some("2026-05-11"), Some("sol-5m")).unwrap();
+        assert_eq!(paths.len(), 1);
+        assert!(paths[0].ends_with("2026-05-11-sol-5m.jsonl"));
+        assert!(rounds.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn replay_metrics_match_aggregate_replay_fields() {
+        let dir = std::env::temp_dir().join(format!(
+            "replay_metrics_agg_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("2026-05-10.jsonl");
+        let mut f = std::fs::File::create(&path).unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"open","v":1,"cid":"c1","slug":"s","ws":1000,"we":1300,"ptb":100.0,"up":"u","down":"d","asset":"BTC","strong_gap_mult":1.0,"max_spread_mult":1.0,"min_top_ask_shares":5.0,"watch_ratio":0.6}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"snap","v":1,"cid":"c1","ts":1100,"spot":100.5,"ptb":100.0,"sig":0,"sent":3,"ubu":0.4,"uba":0.41,"dbu":0.58,"dba":0.59,"ubas":10.0,"dbas":10.0,"secs":200,"act":50.0}}"#
+        )
+        .unwrap();
+        writeln!(
+            f,
+            r#"{{"t":"close","v":1,"cid":"c1","ts_close":1300,"spot_last":100.6,"win":"up","src":"approx_spot"}}"#
+        )
+        .unwrap();
+
+        let mut rounds: HashMap<String, RoundAccum> = HashMap::new();
+        ingest_jsonl(&path, &mut rounds).unwrap();
+        for acc in rounds.values_mut() {
+            acc.snaps.sort_by_key(|s| s._ts);
+        }
+        let overrides = TunableOverrides::default();
+        let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
+        let rep = replay_strategy_metrics(&rounds, EvalMode::StrongOnly, &overrides);
+        let summary = aggregate_signal_eval_on_rounds(
+            &rounds,
+            EvalMode::StrongOnly,
+            &overrides,
+            &sim,
+        );
+        assert_eq!(summary.rounds_with_win, rep.rounds_with_win);
+        assert_eq!(summary.snaps_total, rep.snaps_total);
+        assert_eq!(summary.snaps_usable_book, rep.snaps_usable_book);
+        assert_eq!(summary.strong_calls, rep.strong_calls);
+        assert_eq!(summary.strong_correct, rep.strong_correct);
+        assert_eq!(summary.watch_calls, rep.watch_calls);
+        assert_eq!(summary.watch_correct, rep.watch_correct);
+        assert_eq!(
+            summary.replay_mismatch_live_sig,
+            rep.replay_mismatch_live_sig
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1190,5 +2203,32 @@ mod signal_eval_tests {
             "expected one fill once secs_to_close enters the window"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grind_bps_axis_covers_zero_through_max_inclusive() {
+        let a = super::grind_bps_full_arc();
+        assert_eq!(a.len(), 10_001);
+        assert_eq!(a.first().copied(), Some(0));
+        assert_eq!(a.last().copied(), Some(super::GRIND_BPS_INCLUSIVE_MAX));
+    }
+
+    #[test]
+    fn grind_strategy_axes_cartesian_is_finite_millions() {
+        let axes = super::TuneAxes {
+            strong_gap_mult: super::grind_strategy_strong_gap_somes(),
+            max_spread_mult: super::grind_strategy_max_spread_somes(),
+            min_top_ask_shares: super::grind_strategy_min_top_ask_somes(),
+            watch_ratio: super::grind_strategy_watch_ratio_somes(),
+            buy_last_secs: vec![None],
+            early_ptb_gap_bps: std::sync::Arc::from([0_u32]),
+            order_expires_after_secs: vec![None],
+            max_entry_price: vec![None],
+            max_positions: vec![1],
+            trailing_exit_min_profit_bps: std::sync::Arc::from([0_u32]),
+            stop_loss_bps: std::sync::Arc::from([0_u32]),
+        };
+        let n = axes.combo_count_u64().expect("combo count");
+        assert_eq!(n, 9_798_552);
     }
 }

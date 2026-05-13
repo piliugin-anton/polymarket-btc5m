@@ -20,7 +20,7 @@ use crate::trading::Side;
 const SCHEMA_V: u32 = 1;
 
 /// Tunables persisted on each `open` line for offline replay.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RoundLogStrategyTunables {
     pub strong_gap_mult: f64,
     pub max_spread_mult: f64,
@@ -168,7 +168,8 @@ fn round_log_path_for_date(dir: &Path, day: NaiveDate, profile: Option<(&str, &s
     }
 }
 
-fn sanitize_round_log_path_component(value: &str) -> String {
+/// Lowercase path segment for round-log filenames (matches [`round_log_path_for_date`]).
+pub fn sanitize_round_log_path_component(value: &str) -> String {
     let s: String = value
         .trim()
         .chars()
@@ -189,6 +190,20 @@ fn sanitize_round_log_path_component(value: &str) -> String {
     } else {
         s
     }
+}
+
+/// `(asset_segment, timeframe_segment)` as used in `{day}-{asset}-{tf}.jsonl`.
+pub fn round_log_path_suffix_for_profile(profile: &MarketProfile) -> (String, String) {
+    (
+        sanitize_round_log_path_component(profile.asset.label),
+        sanitize_round_log_path_component(profile.timeframe.label()),
+    )
+}
+
+/// Expected JSONL stem for a calendar `day` (`YYYY-MM-DD`) and market profile.
+pub fn expected_round_log_stem(day: &str, profile: &MarketProfile) -> String {
+    let (a, t) = round_log_path_suffix_for_profile(profile);
+    format!("{day}-{a}-{t}")
 }
 
 #[derive(Debug, Clone)]

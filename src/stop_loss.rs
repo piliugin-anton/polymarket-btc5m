@@ -46,4 +46,39 @@ mod tests {
         assert!((stop_loss_sell_limit_price(0.55) - 0.54).abs() < 1e-12);
         assert!((stop_loss_sell_limit_price(0.015) - 0.01).abs() < 1e-12);
     }
+
+    /// Prob prices from 0.01 through 0.10: limit is `max(p - 0.01, MIN_PROB_PRICE)` (no hit to 0.99 cap).
+    #[test]
+    fn stop_loss_sell_limit_price_range_01_to_010() {
+        for cent in 1..=10 {
+            let p = cent as f64 / 100.0;
+            let want = (p - STOP_LOSS_LIMIT_OFFSET).max(MIN_PROB_PRICE);
+            let got = stop_loss_sell_limit_price(p);
+            assert!(
+                (got - want).abs() < 1e-12,
+                "sell_limit({p}) got {got} want {want}"
+            );
+        }
+    }
+
+    /// Reference and threshold current in the same band: 1000 bps (10%) drawdown boundary.
+    #[test]
+    fn stop_loss_triggered_range_01_to_010_at_1000bps() {
+        let bps = 1_000u32;
+        let drawdown = bps as f64 / 10_000.0;
+        for cent in 1..=10 {
+            let ref_p = cent as f64 / 100.0;
+            let at_threshold = ref_p * (1.0 - drawdown);
+            assert!(
+                stop_loss_triggered(ref_p, at_threshold, bps),
+                "expected trigger at ref={ref_p} current={at_threshold}"
+            );
+
+            let inside = ref_p * (1.0 - drawdown) + ref_p * 1e-9;
+            assert!(
+                !stop_loss_triggered(ref_p, inside, bps),
+                "expected no trigger slightly inside ref={ref_p} current={inside}"
+            );
+        }
+    }
 }

@@ -12,6 +12,7 @@
 use chrono::{DateTime, Utc};
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -21,10 +22,7 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_activity::RollingTradedNotional;
 use crate::market_profile::MarketProfile;
-use crate::strategy::{
-    evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
-    ManualSignalSentiment,
-};
+use crate::strategy::{ManualSignalBookSide, ManualSignalInput, ManualSignalLabel, ManualSignalSentiment};
 use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::take_profit::{
     clob_order_has_open_size, clob_order_remaining_size, CLOB_ORDER_REMAINING_DUST,
@@ -616,6 +614,9 @@ pub struct AppState {
     /// Optional JSONL session logger ([`crate::round_log::RoundLogHandle`]).
     pub round_log: Option<std::sync::Arc<crate::round_log::RoundLogHandle>>,
 
+    /// Directory for optional `{crypto}_{time_window}.json` signal model overrides ([`crate::signal`]).
+    pub signal_model_dir: PathBuf,
+
     traded_activity: RollingTradedNotional,
 }
 
@@ -689,6 +690,7 @@ impl AppState {
             strategy_min_top_ask_shares: 5.0,
             strategy_watch_ratio: 0.60,
             round_log: None,
+            signal_model_dir: PathBuf::from("./models"),
             traded_activity: RollingTradedNotional::new(),
         }
     }
@@ -960,7 +962,18 @@ impl AppState {
     }
 
     pub fn manual_signal_label(&self) -> ManualSignalLabel {
-        evaluate_manual_signal(&self.manual_signal_input_snapshot())
+        self.signal_bundle().effective()
+    }
+
+    /// Rubric label plus optional model-driven label (see [`crate::signal`]).
+    pub fn signal_bundle(&self) -> crate::signal::SignalBundle {
+        crate::signal::evaluate(
+            &self.signal_model_dir,
+            self.market_profile
+                .as_ref()
+                .map(std::sync::Arc::as_ref),
+            &self.manual_signal_input_snapshot(),
+        )
     }
 
     /// Snapshot of inputs passed to [`evaluate_manual_signal`] (for JSONL `snap` replay).

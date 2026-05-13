@@ -141,6 +141,9 @@ pub struct Config {
     pub round_log_snap_interval_secs: u64,
     /// When true and round logging is enabled, also append `fill` lines (diagnostics).
     pub round_log_fills: bool,
+
+    /// Directory for optional per-profile signal model JSON (`{crypto}_{time_window}.json`).
+    pub signal_model_dir: std::path::PathBuf,
 }
 
 impl Config {
@@ -296,6 +299,12 @@ impl Config {
             .and_then(parse_env_bool)
             .unwrap_or(false);
 
+        let signal_model_dir = std::env::var("POLYMARKET_SIGNAL_MODEL_DIR")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::path::PathBuf::from("./models"));
+
         let signer: alloy_signer_local::PrivateKeySigner = private_key
             .parse()
             .context("Could not parse POLYMARKET_PK as a private key")?;
@@ -351,6 +360,7 @@ impl Config {
             round_log_dir,
             round_log_snap_interval_secs,
             round_log_fills,
+            signal_model_dir,
         })
     }
 }
@@ -421,7 +431,7 @@ fn parse_autotrading_signal_min(value: Option<&str>) -> AutotradingSignalMin {
     }
 }
 
-fn parse_strategy_strong_gap_mult(value: Option<&str>) -> f64 {
+pub(crate) fn parse_strategy_strong_gap_mult(value: Option<&str>) -> f64 {
     const DEFAULT: f64 = 1.0;
     let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
         return DEFAULT;
@@ -432,7 +442,7 @@ fn parse_strategy_strong_gap_mult(value: Option<&str>) -> f64 {
     raw.clamp(0.55, 1.15)
 }
 
-fn parse_strategy_max_spread_mult(value: Option<&str>) -> f64 {
+pub(crate) fn parse_strategy_max_spread_mult(value: Option<&str>) -> f64 {
     const DEFAULT: f64 = 1.0;
     let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
         return DEFAULT;
@@ -443,7 +453,7 @@ fn parse_strategy_max_spread_mult(value: Option<&str>) -> f64 {
     raw.clamp(1.0, 1.35)
 }
 
-fn parse_strategy_min_top_ask_shares(value: Option<&str>) -> f64 {
+pub(crate) fn parse_strategy_min_top_ask_shares(value: Option<&str>) -> f64 {
     const DEFAULT: f64 = 5.0;
     let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
         return DEFAULT;
@@ -454,7 +464,7 @@ fn parse_strategy_min_top_ask_shares(value: Option<&str>) -> f64 {
     raw.clamp(2.0, 50.0)
 }
 
-fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
+pub(crate) fn parse_strategy_watch_ratio(value: Option<&str>) -> f64 {
     const DEFAULT: f64 = 0.60;
     let Some(raw) = value.and_then(|s| s.trim().parse::<f64>().ok()) else {
         return DEFAULT;

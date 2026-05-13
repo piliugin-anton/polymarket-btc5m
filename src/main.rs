@@ -29,10 +29,12 @@ mod gamma;
 mod gamma_series;
 mod market_activity;
 mod market_profile;
+mod mcmc_train;
 mod poly1271;
 mod polymarket_relayer;
 mod redeem;
 mod round_log;
+mod signal;
 mod signal_eval;
 mod strategy;
 mod stop_loss;
@@ -2742,6 +2744,12 @@ async fn main() -> Result<()> {
         Some("signal-eval") => {
             return signal_eval::run_signal_eval_cli(&args[2..]).map_err(Into::into);
         }
+        Some("signal-eval-tune") => {
+            return signal_eval::run_signal_eval_tune_cli(&args[2..]).map_err(Into::into);
+        }
+        Some("mcmc-train") => {
+            return mcmc_train::run_cli(&args[2..]).map_err(Into::into);
+        }
         Some("help") | Some("-h") | Some("--help") => {
             println!("Usage: polymarket-crypto [SUBCOMMAND]\n");
             println!("Without a subcommand, launches the interactive TUI.\n");
@@ -2758,6 +2766,8 @@ async fn main() -> Result<()> {
             println!("  run            Headless trading: `run --market btc-5m` (see `run --help`).");
             println!("  round-log-inspect  Summarize JSONL session logs (--dir, --day).");
             println!("  signal-eval    Offline strategy replay + optional autotrading sim vs logs (--dir, --mode, …).");
+            println!("  signal-eval-tune  Env/grid tuning: --grind bps|strategy, --grid-…, --dir/--day (see module docs).");
+            println!("  mcmc-train     MCMC tunables from round logs; --write-model, --install-model, --warm-start, --profile (see mcmc-train --help).");
             return Ok(());
         }
         _ => {}
@@ -2782,6 +2792,7 @@ async fn main() -> Result<()> {
         round_log_dir = %cfg.round_log_dir.display(),
         round_log_snap_interval_secs = cfg.round_log_snap_interval_secs,
         round_log_fills = cfg.round_log_fills,
+        signal_model_dir = %cfg.signal_model_dir.display(),
         "config loaded (GTD take-profit if TAKE_PROFIT_BPS>0 and BUY_TRAIL=0; trailing if BUY_TRAIL_BPS>0; trail arm when bid >= entry×(1+TP bps) from position; trailing FAK sell floor vs entry if TRAILING_EXIT_MIN_PROFIT_BPS>0)",
     );
 
@@ -2877,6 +2888,7 @@ async fn main() -> Result<()> {
     state.strategy_max_spread_mult = cfg.strategy_max_spread_mult;
     state.strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares;
     state.strategy_watch_ratio = cfg.strategy_watch_ratio;
+    state.signal_model_dir = cfg.signal_model_dir.clone();
     state.round_log = if cfg.round_log_enabled {
         Some(Arc::new(RoundLogHandle::spawn(RoundLogWriterConfig {
             dir: cfg.round_log_dir.clone(),

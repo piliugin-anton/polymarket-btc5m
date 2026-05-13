@@ -1,0 +1,16 @@
+{
+  "acceptance_rate": 0.98425,
+  "burn_in": 3000,
+  "iterations": 12000,
+  "max_spread_mult": 5.777727131524868,
+  "min_top_ask_shares": -760.3714224635106,
+  "model_id": "sol_5m",
+  "seed": 7165768831720747490,
+  "source_jsonl": [
+    "./data/rounds/2026-05-12-sol-5m.jsonl"
+  ],
+  "strong_gap_mult": -11.871026235209202,
+  "trained_day": "2026-05-12",
+  "version": 1,
+  "watch_ratio": 34.16537525264707
+}

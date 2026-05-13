@@ -323,7 +323,8 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
             .fg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
-    let signal = s.manual_signal_label();
+    let bundle = s.signal_bundle();
+    let signal = bundle.effective();
     line1_parts.push(Span::raw("  "));
     line1_parts.push(Span::styled(
         "Signal:",
@@ -336,6 +337,13 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
             .fg(manual_signal_color(signal))
             .add_modifier(Modifier::BOLD),
     ));
+    if bundle.model.is_some_and(|m| m != bundle.rubric) {
+        line1_parts.push(Span::raw(" "));
+        line1_parts.push(Span::styled(
+            format!("(rubric {})", bundle.rubric.as_str()),
+            Style::default().fg(Color::DarkGray),
+        ));
+    }
     let line1 = Line::from(line1_parts);
     // Line 2: price to beat + countdown + market (+ background trailing sessions)
     let bg_trail = s.background_trail_count();

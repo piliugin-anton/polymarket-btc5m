@@ -735,7 +735,8 @@ mod tests {
 
     #[test]
     fn frac_long_percent_trail_uses_full_tick_distance_sweep() {
-        for pct in [0.01, 0.02, 0.05, 0.10] {
+        for hundredth in 1..=10 {
+            let pct = hundredth as f64 / 100.0;
             for best_tick in 1..=99 {
                 let price = from_tick(best_tick);
                 let spec = TrailSpec::Percent(pct);
@@ -761,7 +762,8 @@ mod tests {
 
     #[test]
     fn frac_short_percent_trail_uses_full_tick_distance_sweep() {
-        for pct in [0.01, 0.02, 0.05, 0.10] {
+        for hundredth in 1..=10 {
+            let pct = hundredth as f64 / 100.0;
             for best_tick in 1..=99 {
                 let price = from_tick(best_tick);
                 let spec = TrailSpec::Percent(pct);
