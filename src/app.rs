@@ -219,6 +219,11 @@ pub enum AppEvent {
         success: bool,
         error: Option<String>,
     },
+    /// Manual market **FAK** SELL task finished (`spawn_order`); decrements per-token depth so
+    /// trailing exit does not double-sell while the CLOB request is in flight (no resting row).
+    ManualFakSellDispatchDone {
+        token_id: String,
+    },
     /// Auto-trading GTD limit BUY task finished. Errors free the reserved capacity immediately;
     /// accepted resting orders keep it reserved until a fill arrives from the user channel or the
     /// order is cancelled/expired.
@@ -578,6 +583,10 @@ pub struct AppState {
     /// `token_id`s with a `run_trailing_exit_fak_sell` task in progress; capped by
     /// [`TRAILING_SELL_MAX_PARALLEL`].
     pub trailing_sell_in_flight: HashSet<String>,
+    /// Manual market FAK SELL `spawn_order` tasks in flight per `token_id` (depth for concurrent
+    /// submits). Resting sells appear in [`Self::open_orders`]; FAK does not, so this blocks trailing
+    /// exit from double-selling the same inventory.
+    pub manual_fak_sell_in_flight_depth: HashMap<String, u32>,
     /// `token_id`s with a stop-loss GTD SELL task in progress; prevents duplicate submits on
     /// repeated book ticks while the CLOB order is being placed.
     pub stop_loss_sell_in_flight: HashSet<String>,
@@ -671,6 +680,7 @@ impl AppState {
             watched_books: HashMap::new(),
             pending_trailing_sells: VecDeque::new(),
             trailing_sell_in_flight: HashSet::new(),
+            manual_fak_sell_in_flight_depth: HashMap::new(),
             stop_loss_sell_in_flight: HashSet::new(),
             trailing_sell_partial_fill_grace_until: HashMap::new(),
             cached_book_watch_tokens: Vec::new(),
@@ -805,6 +815,12 @@ impl AppState {
             .iter()
             .any(|e| e.token_id == token_id)
             || self.trailing_sell_in_flight.contains(token_id)
+            || self
+                .manual_fak_sell_in_flight_depth
+                .get(token_id)
+                .copied()
+                .unwrap_or(0)
+                > 0
             || self.stop_loss_sell_in_flight.contains(token_id)
             || self
                 .trailing_sell_partial_fill_grace_until
@@ -892,6 +908,18 @@ impl AppState {
             let canonical = canonical_clob_token_id(token_id);
             self.stop_loss_sell_in_flight.remove(canonical.as_ref());
         }
+    }
+
+    /// Manual market FAK SELL is about to POST: no resting row yet, so trailing must treat this
+    /// like in-flight inventory exit. Drops queued [`Self::pending_trailing_sells`] for the token.
+    pub fn manual_fak_sell_begin(&mut self, token_id: &str) {
+        let tid = canonical_clob_token_id(token_id).into_owned();
+        *self
+            .manual_fak_sell_in_flight_depth
+            .entry(tid.clone())
+            .or_insert(0) += 1;
+        self.pending_trailing_sells.retain(|e| e.token_id != tid);
+        self.book_watch_tokens_dirty = true;
     }
 
     fn stop_loss_sell_candidate_for_outcome(
@@ -1394,7 +1422,7 @@ impl AppState {
     }
 
     /// Drop a trailing plan when the user (or the exchange) reduces position via a SELL fill.
-    fn clear_trailing_on_sell_token(&mut self, token_id: &str) {
+    pub(crate) fn clear_trailing_on_sell_token(&mut self, token_id: &str) {
         // All map/set keys are stored in canonical decimal form; canonicalize once so
         // every comparison below is a plain string equality — no U256 bignum fallback.
         let canonical = canonical_clob_token_id(token_id);
@@ -1692,24 +1720,36 @@ impl AppState {
         // became wrong when the feed switched from mid to best bid — bid at the stop is often
         // ≤ entry even for profitable round-trips (spread), which suppressed all SELLs.
         let sh = live.min(plan);
-        if sh > CLOB_ORDER_REMAINING_DUST {
-            if !self.trailing_sell_queued_or_in_flight(&token_id) {
-                self.pending_trailing_sells.push_back(TrailingExit {
-                    token_id,
-                    market,
-                    outcome,
-                    sell_shares: sh,
-                });
-                self.book_watch_tokens_dirty = true;
-            }
+        if sh <= CLOB_ORDER_REMAINING_DUST {
+            self.remove_trailing_and_pending_arm_for_token(&token_id);
+            self.status_line = format!(
+                "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — no shares to SELL",
+                outcome.as_str()
+            );
+        } else if sh.mul_add(bid, 1e-12) < TRAILING_FAK_SELL_MIN_NOTIONAL_USDC {
+            // Conservative vs slippage floor: if bid×sh can't reach $0.01, POST will round to dust.
+            self.clear_trailing_on_sell_token(&token_id);
+            self.status_line = format!(
+                "trailing: {} tripped (bid {bid:.2}) — exit skipped (≈${:.4} < ${} min notional)",
+                outcome.as_str(),
+                sh * bid,
+                TRAILING_FAK_SELL_MIN_NOTIONAL_USDC
+            );
+        } else if !self.trailing_sell_queued_or_in_flight(&token_id) {
+            self.pending_trailing_sells.push_back(TrailingExit {
+                token_id,
+                market,
+                outcome,
+                sell_shares: sh,
+            });
+            self.book_watch_tokens_dirty = true;
             self.status_line = format!(
                 "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — SELL {sh:.2} sh",
                 outcome.as_str()
             );
         } else {
-            self.remove_trailing_and_pending_arm_for_token(&token_id);
             self.status_line = format!(
-                "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — no shares to SELL",
+                "trailing: {} tripped (bid {bid:.2}, entry {entry_px:.2}) — SELL {sh:.2} sh",
                 outcome.as_str()
             );
         }
@@ -1899,6 +1939,7 @@ impl AppState {
                 self.pending_trail_arms.clear();
                 self.pending_trailing_sells.clear();
                 self.trailing_sell_in_flight.clear();
+                self.manual_fak_sell_in_flight_depth.clear();
                 self.stop_loss_sell_in_flight.clear();
                 self.trailing_sell_partial_fill_grace_until.clear();
                 self.watched_books.clear();
@@ -2389,6 +2430,15 @@ impl AppState {
                     });
                 } else if success {
                     self.status_line = "stop-loss SELL submitted".into();
+                }
+            }
+            AppEvent::ManualFakSellDispatchDone { token_id } => {
+                let tid = canonical_clob_token_id(&token_id).into_owned();
+                if let Some(n) = self.manual_fak_sell_in_flight_depth.get_mut(&tid) {
+                    *n = n.saturating_sub(1);
+                    if *n == 0 {
+                        self.manual_fak_sell_in_flight_depth.remove(&tid);
+                    }
                 }
             }
             AppEvent::TrailingExitDispatchDone {
@@ -3257,6 +3307,25 @@ pub fn resolve_market_order(
             Some((shares, price, OrderType::Fak))
         }
     }
+}
+
+/// CLOB sell wire amounts round to whole US cents; below this implied `shares × sell_limit_price`
+/// the trailing FAK path often no-ops or rejects (`trading::amounts_for` Side::Sell).
+pub const TRAILING_FAK_SELL_MIN_NOTIONAL_USDC: f64 = 0.01;
+
+/// `true` when a trailing FAK SELL should not be POSTed: sub-dust share count, or sub-minimum
+/// implied taker notional at the aggressive sell limit price.
+#[inline]
+pub fn trailing_exit_fak_sell_is_dust(shares: f64, sell_limit_price: f64) -> bool {
+    if !shares.is_finite() || shares <= 0.0 {
+        return true;
+    }
+    if shares <= CLOB_ORDER_REMAINING_DUST {
+        return true;
+    }
+    sell_limit_price.is_finite()
+        && sell_limit_price > 0.0
+        && shares.mul_add(sell_limit_price, 1e-12) < TRAILING_FAK_SELL_MIN_NOTIONAL_USDC
 }
 
 /// Gross minimum edge vs `entry_px` for a trailing FAK sell floor (after sell slippage).
@@ -5292,6 +5361,76 @@ mod tests {
         assert!(
             s.pending_trailing_sells.is_empty(),
             "stop-loss in-flight/protected marker should block duplicate trailing FAK"
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_fak_sell_begin_drops_pending_trailing_exit() {
+        let mut s = test_state();
+        let m = test_market("UP_MF", "DOWN_MF", "0xmf");
+        s.pending_trailing_sells.push_back(TrailingExit {
+            token_id: "UP_MF".into(),
+            market: m.clone(),
+            outcome: Outcome::Up,
+            sell_shares: 5.0,
+        });
+        s.manual_fak_sell_begin("UP_MF");
+        assert!(
+            s.pending_trailing_sells.is_empty(),
+            "starting a manual FAK SELL should cancel queued trailing exit for the same token"
+        );
+    }
+
+    /// Manual market FAK SELL has no resting `open_orders` row until fills land; trailing must not
+    /// enqueue a second exit for the same inventory.
+    #[tokio::test]
+    async fn trailing_does_not_enqueue_when_manual_fak_sell_in_flight() {
+        let mut s = test_state();
+        let m = test_market("UP_MF_TRAIL", "DOWN_MF_TRAIL", "0xmftrail");
+        s.market = Some(m.clone());
+        s.position_up = Position {
+            shares: 10.0,
+            avg_entry: 0.50,
+        };
+        s.book_up = Some(Arc::new(BookSnapshot {
+            asset_id: "UP_MF_TRAIL".into(),
+            bids: vec![BookLevel {
+                price: 0.70,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.72,
+                size: 100.0,
+            }],
+        }));
+        s.apply(AppEvent::RequestTrailingArm {
+            outcome: Outcome::Up,
+            entry_price: 0.50,
+            plan_sell_shares: 10.0,
+            token_id: "UP_MF_TRAIL".into(),
+            trail_bps: 500,
+            activation_bps: 0,
+            market: m,
+        })
+        .await;
+        s.manual_fak_sell_begin("UP_MF_TRAIL");
+
+        s.apply(AppEvent::Book(BookSnapshot {
+            asset_id: "UP_MF_TRAIL".into(),
+            bids: vec![BookLevel {
+                price: 0.65,
+                size: 100.0,
+            }],
+            asks: vec![BookLevel {
+                price: 0.67,
+                size: 100.0,
+            }],
+        }))
+        .await;
+
+        assert!(
+            s.pending_trailing_sells.is_empty(),
+            "manual FAK SELL in flight should block duplicate trailing FAK"
         );
     }
 

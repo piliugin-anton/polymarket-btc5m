@@ -50,7 +50,8 @@ use anyhow::{Context, Result};
 use clap::{error::ErrorKind, Parser};
 use app::{
     clamp_prob, escrow_sell_shares_from_clob_orders, hydrate_positions_from_trades,
-    resolve_market_order, resolve_trailing_sell, trailing_exit_sell_meets_min_gross_profit_bps,
+    resolve_market_order, resolve_trailing_sell, trailing_exit_fak_sell_is_dust,
+    trailing_exit_sell_meets_min_gross_profit_bps,
     AppEvent, AppState, Outcome, StopLossSell, TrailingExit, MIN_LIMIT_ORDER_SHARES,
     TRAILING_SELL_MAX_PARALLEL,
 };
@@ -719,6 +720,16 @@ fn try_dispatch_trailing_sell(
             newq.push_back(ex);
             continue;
         }
+        if state
+            .manual_fak_sell_in_flight_depth
+            .get(ex.token_id.as_str())
+            .copied()
+            .unwrap_or(0)
+            > 0
+        {
+            newq.push_back(ex);
+            continue;
+        }
         if started >= can {
             newq.push_back(ex);
             continue;
@@ -734,6 +745,10 @@ fn try_dispatch_trailing_sell(
             newq.push_back(ex);
             continue;
         };
+        if trailing_exit_fak_sell_is_dust(shares, price) {
+            state.clear_trailing_on_sell_token(ex.token_id.as_str());
+            continue;
+        }
         if cfg.trailing_exit_min_profit_bps > 0 {
             if let Some(entry) = state.trailing_exit_entry_for_dispatch(&ex) {
                 if !trailing_exit_sell_meets_min_gross_profit_bps(
@@ -1357,10 +1372,10 @@ async fn run_trailing_exit_fak_sell(
         "trailing: FAK SELL (await place_order, up to {n} attempts)",
         n = TRAILING_EXIT_FAK_ATTEMPTS,
     );
-    if trailing_exit_sell_size_is_dust(shares) {
+    if trailing_exit_fak_sell_is_dust(shares, price) {
         let _ = tx
             .send(AppEvent::StatusInfo(format!(
-                "trailing {} SELL skipped — dust residual",
+                "trailing {} SELL skipped — dust / sub-min notional",
                 outcome.as_str()
             )))
             .await;
@@ -1520,10 +1535,6 @@ async fn run_trailing_exit_fak_sell(
             }
         }
     }
-}
-
-fn trailing_exit_sell_size_is_dust(shares: f64) -> bool {
-    !shares.is_finite() || shares <= crate::take_profit::CLOB_ORDER_REMAINING_DUST
 }
 
 fn trailing_exit_response_is_resting_without_fill_ack(
@@ -3302,15 +3313,21 @@ mod tests {
     }
 
     #[test]
-    fn trailing_exit_sell_size_dust_is_not_dispatched() {
-        assert!(trailing_exit_sell_size_is_dust(
-            crate::take_profit::CLOB_ORDER_REMAINING_DUST
+    fn trailing_exit_dust_skips_sub_min_notional() {
+        let px = 0.50;
+        assert!(crate::app::trailing_exit_fak_sell_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST,
+            px
         ));
-        assert!(trailing_exit_sell_size_is_dust(
-            crate::take_profit::CLOB_ORDER_REMAINING_DUST / 2.0
+        assert!(crate::app::trailing_exit_fak_sell_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST / 2.0,
+            px
         ));
-        assert!(!trailing_exit_sell_size_is_dust(
-            crate::take_profit::CLOB_ORDER_REMAINING_DUST * 2.0
+        // Above share-count dust but implied USDC below $0.01 at the sell limit.
+        assert!(crate::app::trailing_exit_fak_sell_is_dust(0.015, 0.50));
+        assert!(!crate::app::trailing_exit_fak_sell_is_dust(
+            crate::take_profit::CLOB_ORDER_REMAINING_DUST * 2.0,
+            4.0
         ));
     }
 
@@ -3895,6 +3912,13 @@ fn dispatch_action(
                 forward_order_err(tx, "no book liquidity".into());
                 return;
             };
+            if matches!(side, Side::Sell) && matches!(otype, OrderType::Fak) {
+                let tid = match outcome {
+                    Outcome::Up => market.up_token_id.as_str(),
+                    Outcome::Down => market.down_token_id.as_str(),
+                };
+                state.manual_fak_sell_begin(tid);
+            }
             let buy_notional = matches!(side, Side::Buy).then_some(size_usdc);
             spawn_order(
                 trading.clone(),
@@ -3997,6 +4021,18 @@ fn spawn_order(
         let market_for_refresh = market;
         let up_token = market_for_refresh.up_token_id.clone();
         let down_token = market_for_refresh.down_token_id.clone();
+        let manual_fak_done_tid: Option<String> =
+            if matches!(side, Side::Sell) && matches!(otype, OrderType::Fak) {
+                Some(
+                    canonical_clob_token_id(match outcome {
+                        Outcome::Up => up_token.as_str(),
+                        Outcome::Down => down_token.as_str(),
+                    })
+                    .into_owned(),
+                )
+            } else {
+                None
+            };
         let token_id = match outcome {
             Outcome::Up => market_for_refresh.up_token_id.clone(),
             Outcome::Down => market_for_refresh.down_token_id.clone(),
@@ -4420,6 +4456,11 @@ fn spawn_order(
                 }
                 let _ = tx.send(AppEvent::OrderErrModal(e.to_string())).await;
             }
+        }
+        if let Some(tid) = manual_fak_done_tid {
+            let _ = tx
+                .send(AppEvent::ManualFakSellDispatchDone { token_id: tid })
+                .await;
         }
     });
 }
