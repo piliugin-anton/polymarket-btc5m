@@ -639,6 +639,298 @@ mod tests {
     }
 
     #[test]
+    fn catch_up_exact_min_ask_skew_passes_gate() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        // up_ask - down_ask == 0.02
+        input.up = side(0.50, 0.52, 80.0);
+        input.down = side(0.48, 0.50, 80.0);
+
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+    }
+
+    #[test]
+    fn catch_up_ask_skew_below_min_edge_blocked() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        // 0.51 - 0.491 = 0.019 < CATCHUP_MIN_ASK_EDGE (stable in f64)
+        input.up = side(0.50, 0.51, 80.0);
+        input.down = side(0.48, 0.491, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_spot_above_ptb_blocks_when_mover_ask_not_richer() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        // DOWN ask above UP ask → wrong-way skew for fading UP momentum
+        input.up = side(0.29, 0.30, 80.0);
+        input.down = side(0.64, 0.65, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_spot_below_ptb_exact_min_skew_passes_gate() {
+        let mut input = base_input();
+        input.spot_price = Some(99.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        // down_ask - up_ask == 0.02
+        input.up = side(0.48, 0.50, 80.0);
+        input.down = side(0.50, 0.52, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::StrongUp);
+    }
+
+    #[test]
+    fn catch_up_spot_below_ptb_blocks_when_down_ask_not_richer() {
+        let mut input = base_input();
+        input.spot_price = Some(99.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_equal_spot_and_ptb_is_no_trade() {
+        let mut input = base_input();
+        input.spot_price = Some(100.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_missing_spot_or_target_blocks() {
+        let mut input = base_input();
+        input.spot_price = None;
+        input.price_to_beat = Some(100.0);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+
+        input.spot_price = Some(101.0);
+        input.price_to_beat = None;
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_missing_or_invalid_best_ask_blocks() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = ManualSignalBookSide {
+            best_bid: Some(0.5),
+            best_ask: None,
+            best_ask_size: Some(80.0),
+        };
+        input.down = side(0.29, 0.30, 80.0);
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = ManualSignalBookSide {
+            best_bid: Some(0.29),
+            best_ask: Some(f64::NAN),
+            best_ask_size: Some(80.0),
+        };
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_wide_spread_on_fade_book_blocks_even_with_skew() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.20, 0.35, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_thin_top_ask_on_fade_book_blocks() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.54, 0.55, 4.99);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_price_outside_game_range_on_fade_side_blocks() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.001, 0.005, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_mover_side_wide_spread_does_not_block_when_fade_book_ok() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.10, 0.36, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+    }
+
+    #[test]
+    fn catch_up_watch_when_spot_gap_in_watch_band() {
+        let mut input = base_input();
+        input.spot_price = Some(100.05);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.60, 0.61, 80.0);
+        input.down = side(0.38, 0.39, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::Watch);
+    }
+
+    #[test]
+    fn catch_up_no_trade_when_spot_gap_below_watch_band() {
+        let mut input = base_input();
+        input.spot_price = Some(100.02);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.60, 0.61, 80.0);
+        input.down = side(0.38, 0.39, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_watch_mirrors_for_spot_below_ptb() {
+        let mut input = base_input();
+        input.spot_price = Some(99.95);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.38, 0.39, 80.0);
+        input.down = side(0.60, 0.61, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::Watch);
+    }
+
+    #[test]
+    fn catch_up_nan_strong_gap_mult_does_not_collapse_threshold() {
+        let mut input = base_input();
+        input.spot_price = Some(100.01);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(120);
+        input.window_secs = Some(300);
+        input.up = side(0.52, 0.53, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+        input.strong_gap_mult = f64::NAN;
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_strong_gap_mult_below_one_can_promote_to_strong() {
+        let mut input = base_input();
+        input.spot_price = Some(100.40);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(240);
+        input.window_secs = Some(300);
+        input.up = side(0.60, 0.61, 80.0);
+        input.down = side(0.38, 0.39, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::Watch);
+
+        input.strong_gap_mult = 0.80;
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+    }
+
+    #[test]
+    fn catch_up_aligned_sentiment_on_fade_can_promote_borderline_to_strong() {
+        let mut input = base_input();
+        input.spot_price = Some(100.19);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(120);
+        input.window_secs = Some(300);
+        input.up = side(0.60, 0.61, 80.0);
+        input.down = side(0.38, 0.39, 80.0);
+        input.sentiment = ManualSignalSentiment::Neutral;
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::Watch);
+
+        // Fade is DOWN; sentiment Down aligns with fade leg (0.90 mult vs neutral 1.0).
+        input.sentiment = ManualSignalSentiment::Down;
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+    }
+
+    #[test]
+    fn catch_up_opposing_sentiment_on_fade_can_downgrade_borderline_to_watch() {
+        let mut input = base_input();
+        input.spot_price = Some(100.21);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(120);
+        input.window_secs = Some(300);
+        input.up = side(0.60, 0.61, 80.0);
+        input.down = side(0.38, 0.39, 80.0);
+        input.sentiment = ManualSignalSentiment::Neutral;
+
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+
+        // Fade is DOWN; sentiment Up opposes fade (1.25 mult) and drops Strong → Watch.
+        input.sentiment = ManualSignalSentiment::Up;
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::Watch);
+    }
+
+    #[test]
     fn catch_up_strong_down_when_mover_rich_and_fade_book_usable() {
         let mut input = base_input();
         input.spot_price = Some(101.0);
@@ -666,6 +958,26 @@ mod tests {
 
         assert_eq!(
             evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongUp
+        );
+    }
+
+    #[test]
+    fn evaluate_signal_catch_up_vs_rubric_spot_below_ptb() {
+        let mut input = base_input();
+        input.spot_price = Some(99.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.29, 0.30, 80.0);
+        input.down = side(0.64, 0.65, 80.0);
+
+        assert_eq!(
+            evaluate_signal(SignalStrategy::Rubric, &input),
+            ManualSignalLabel::StrongDown
+        );
+        assert_eq!(
+            evaluate_signal(SignalStrategy::CatchUp, &input),
             ManualSignalLabel::StrongUp
         );
     }

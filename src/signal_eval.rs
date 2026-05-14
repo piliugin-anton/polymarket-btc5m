@@ -2307,4 +2307,101 @@ mod signal_eval_tests {
         let n = axes.combo_count_u64().expect("combo count");
         assert_eq!(n, 9_798_552);
     }
+
+    #[test]
+    fn predicted_side_watch_hint_catch_up_inverts_rubric_for_watch() {
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::Rubric,
+                ManualSignalLabel::Watch,
+                Some(101.0),
+                Some(100.0),
+            ),
+            Some("up")
+        );
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::Watch,
+                Some(101.0),
+                Some(100.0),
+            ),
+            Some("down")
+        );
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::Rubric,
+                ManualSignalLabel::Watch,
+                Some(99.0),
+                Some(100.0),
+            ),
+            Some("down")
+        );
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::Watch,
+                Some(99.0),
+                Some(100.0),
+            ),
+            Some("up")
+        );
+    }
+
+    #[test]
+    fn predicted_side_watch_hint_returns_none_without_spot_or_ptb() {
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::Watch,
+                None,
+                Some(100.0),
+            ),
+            None
+        );
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::Watch,
+                Some(101.0),
+                None,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn predicted_side_watch_hint_equal_spot_ptb_is_none() {
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::Watch,
+                Some(100.0),
+                Some(100.0),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn predicted_side_watch_hint_strong_labels_ignore_strategy() {
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::Rubric,
+                ManualSignalLabel::StrongUp,
+                Some(100.0),
+                Some(100.0),
+            ),
+            Some("up")
+        );
+        assert_eq!(
+            super::predicted_side_watch_hint(
+                SignalStrategy::CatchUp,
+                ManualSignalLabel::StrongDown,
+                Some(100.0),
+                Some(100.0),
+            ),
+            Some("down")
+        );
+    }
 }

@@ -226,4 +226,43 @@ mod tests {
         assert_ne!(b.effective(), b.rubric, "model should thin book below min ask");
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    #[test]
+    fn evaluate_passes_catch_up_through_base_path_when_no_model() {
+        let dir = std::env::temp_dir().join(format!(
+            "signal_models_catch_up_base_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let input = ManualSignalInput {
+            spot_price: Some(101.0),
+            price_to_beat: Some(100.0),
+            up: ManualSignalBookSide {
+                best_bid: Some(0.64),
+                best_ask: Some(0.65),
+                best_ask_size: Some(80.0),
+            },
+            down: ManualSignalBookSide {
+                best_bid: Some(0.29),
+                best_ask: Some(0.30),
+                best_ask_size: Some(80.0),
+            },
+            seconds_to_close: Some(20),
+            window_secs: Some(300),
+            sentiment: ManualSignalSentiment::Neutral,
+            activity_notional_60s: 500.0,
+            strong_gap_mult: 1.0,
+            max_spread_mult: 1.0,
+            min_top_ask_shares: 5.0,
+            watch_ratio: 0.6,
+        };
+        let b = evaluate(SignalStrategy::CatchUp, &dir, None, &input);
+        assert!(b.model.is_none());
+        assert_eq!(b.rubric, ManualSignalLabel::StrongDown);
+        assert_eq!(b.effective(), ManualSignalLabel::StrongDown);
+        let rub = evaluate(SignalStrategy::Rubric, &dir, None, &input);
+        assert_eq!(rub.rubric, ManualSignalLabel::StrongUp);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
