@@ -1,8 +1,8 @@
-//! Live signal composition: rubric ([`crate::strategy::evaluate_manual_signal`]) plus optional
+//! Live signal composition: rubric or catch-up ([`crate::strategy::evaluate_signal`]) plus optional
 //! per-market JSON tunables under [`POLYMARKET_SIGNAL_MODEL_DIR`](crate::config::Config) named
 //! `{crypto}_{time_window}.json` (e.g. `btc_5m.json`). When such a file exists, parses, and
-//! supplies at least one tunable override, a **model** label is computed by re-running the rubric
-//! on a merged [`ManualSignalInput`]. [`SignalBundle::effective`] prefers the model label when
+//! supplies at least one tunable override, a **model** label is computed by re-running the active
+//! strategy on a merged [`ManualSignalInput`]. [`SignalBundle::effective`] prefers the model label when
 //! present (see product wiring in `AppState` / autotrading).
 
 use std::collections::HashMap;
@@ -12,8 +12,9 @@ use std::time::SystemTime;
 
 use serde::Deserialize;
 
+use crate::config::SignalStrategy;
 use crate::market_profile::{MarketProfile, Timeframe};
-use crate::strategy::{evaluate_manual_signal, ManualSignalInput, ManualSignalLabel};
+use crate::strategy::{evaluate_signal, ManualSignalInput, ManualSignalLabel};
 
 /// `POLYMARKET_SIGNAL_MODEL_DIR` / `{model_id}.json` — e.g. `btc_5m`, `eth_15m`, `sol_1d`.
 pub fn model_id(profile: &MarketProfile) -> String {
@@ -113,17 +114,18 @@ fn load_model_file(dir: &Path, profile: &MarketProfile) -> Option<ModelFile> {
 }
 
 /// `model_dir`: from [`crate::config::Config::signal_model_dir`]. `profile`: active market profile
-/// when known (after wizard / headless start).
+/// when known (after wizard / headless start). `strategy`: from `STRATEGY` ([`SignalStrategy`]).
 pub fn evaluate(
+    strategy: SignalStrategy,
     model_dir: &Path,
     profile: Option<&MarketProfile>,
     input: &ManualSignalInput,
 ) -> SignalBundle {
-    let rubric = evaluate_manual_signal(input);
+    let rubric = evaluate_signal(strategy, input);
     let model = profile.and_then(|p| {
         let mf = load_model_file(model_dir, p)?;
         let merged = merge_input(input, &mf);
-        let mlabel = evaluate_manual_signal(&merged);
+        let mlabel = evaluate_signal(strategy, &merged);
         Some(mlabel)
     });
     SignalBundle { rubric, model }
@@ -132,6 +134,7 @@ pub fn evaluate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::SignalStrategy;
     use crate::market_profile::MarketProfile;
     use crate::strategy::{
         ManualSignalBookSide, ManualSignalInput, ManualSignalSentiment,
@@ -179,7 +182,7 @@ mod tests {
             min_top_ask_shares: 5.0,
             watch_ratio: 0.6,
         };
-        let b = evaluate(&dir, Some(&btc_5m_profile()), &input);
+        let b = evaluate(SignalStrategy::Rubric, &dir, Some(&btc_5m_profile()), &input);
         assert!(b.model.is_none());
         assert_eq!(b.effective(), b.rubric);
         let _ = std::fs::remove_dir_all(&dir);
@@ -217,7 +220,7 @@ mod tests {
             min_top_ask_shares: 5.0,
             watch_ratio: 0.6,
         };
-        let b = evaluate(&dir, Some(&btc_5m_profile()), &input);
+        let b = evaluate(SignalStrategy::Rubric, &dir, Some(&btc_5m_profile()), &input);
         assert!(b.model.is_some());
         assert_eq!(b.model, Some(ManualSignalLabel::NoTrade));
         assert_ne!(b.effective(), b.rubric, "model should thin book below min ask");

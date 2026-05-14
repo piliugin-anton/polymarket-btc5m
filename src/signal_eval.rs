@@ -1,4 +1,4 @@
-//! Offline replay of [`crate::strategy::evaluate_manual_signal`] on JSONL `snap` rows, plus an
+//! Offline replay of strategy labels ([`crate::strategy::evaluate_signal`]) on JSONL `snap` rows, plus an
 //! optional **STRONG-only** autotrading-style simulation (time / max entry / max positions / GTD
 //! TTL, stop-loss, trailing min-profit exit) using the same env defaults as [`crate::config::Config`]
 //! when CLI flags are omitted.
@@ -21,7 +21,7 @@ use crate::config::{
     parse_autotrading_buy_early_ptb_gap_bps, parse_autotrading_buy_last_secs,
     parse_autotrading_max_entry_price, parse_autotrading_max_positions,
     parse_autotrading_order_expires_after_secs, parse_stop_loss_bps,
-    parse_trailing_exit_min_profit_bps,
+    parse_trailing_exit_min_profit_bps, SignalStrategy,
 };
 use crate::market_profile::MarketProfile;
 use crate::round_log::{
@@ -29,10 +29,28 @@ use crate::round_log::{
 };
 use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::strategy::{
-    evaluate_manual_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
+    evaluate_signal, ManualSignalBookSide, ManualSignalInput, ManualSignalLabel,
 };
 
-/// Default USDC size for simulated autotrading entries (matches `DEFAULT_SIZE_USDC` in config).
+/// Resolve `STRATEGY` for offline tools: explicit `--strategy` wins, else `STRATEGY` env, else rubric.
+fn signal_strategy_cli_or_env(cli: Option<&str>) -> Result<SignalStrategy> {
+    if let Some(raw) = cli {
+        let t = raw.trim();
+        if t.is_empty() {
+            bail!("--strategy requires rubric or catch-up");
+        }
+        SignalStrategy::parse_env(Some(t))
+    } else {
+        SignalStrategy::parse_env(std::env::var("STRATEGY").ok().as_deref())
+    }
+}
+
+fn strategy_label(s: SignalStrategy) -> &'static str {
+    match s {
+        SignalStrategy::Rubric => "rubric",
+        SignalStrategy::CatchUp => "catch-up",
+    }
+}
 const SIM_DEFAULT_SIZE_USDC: f64 = 5.0;
 /// Default sell slippage bps for simulated trailing-floor checks (matches `MARKET_SELL_SLIPPAGE_BPS`).
 const SIM_DEFAULT_SELL_SLIPPAGE_BPS: u32 = 50;
@@ -283,6 +301,7 @@ pub struct ReplayStrategyMetrics {
 pub fn replay_strategy_metrics(
     rounds: &HashMap<String, RoundAccum>,
     mode: EvalMode,
+    strategy: SignalStrategy,
     overrides: &TunableOverrides,
 ) -> ReplayStrategyMetrics {
     let mut out = ReplayStrategyMetrics::default();
@@ -306,7 +325,7 @@ pub fn replay_strategy_metrics(
                 continue;
             };
             out.snaps_usable_book += 1;
-            let replay = evaluate_manual_signal(&input);
+            let replay = evaluate_signal(strategy, &input);
             if let Some(live) = u8_to_label(s.sig) {
                 if live != replay {
                     out.replay_mismatch_live_sig += 1;
@@ -322,7 +341,7 @@ pub fn replay_strategy_metrics(
 
             if mode == EvalMode::WatchAsHint && matches!(replay, ManualSignalLabel::Watch) {
                 out.watch_calls += 1;
-                if let Some(pred) = predicted_side_watch_hint(replay, s.spot, s.ptb) {
+                if let Some(pred) = predicted_side_watch_hint(strategy, replay, s.spot, s.ptb) {
                     if pred == win {
                         out.watch_correct += 1;
                     }
@@ -826,6 +845,7 @@ fn simulate_trading_round(
     we: i64,
     overrides: &TunableOverrides,
     sim: &SimTradingParams,
+    strategy: SignalStrategy,
     win: &str,
 ) -> SimTradingSummary {
     let mut state = SimRoundState::default();
@@ -835,7 +855,7 @@ fn simulate_trading_round(
         let Some(input) = snap_to_input(s, tun, ws, we, overrides) else {
             continue;
         };
-        let replay = evaluate_manual_signal(&input);
+        let replay = evaluate_signal(strategy, &input);
         sim_try_enter(&mut state, s, replay, we, sim);
         sim_try_fill_pending(&mut state, s, sim);
     }
@@ -852,6 +872,7 @@ fn predicted_side_strong(label: ManualSignalLabel) -> Option<&'static str> {
 }
 
 fn predicted_side_watch_hint(
+    strategy: SignalStrategy,
     label: ManualSignalLabel,
     spot: Option<f64>,
     ptb: Option<f64>,
@@ -861,12 +882,25 @@ fn predicted_side_watch_hint(
         ManualSignalLabel::StrongDown => Some("down"),
         ManualSignalLabel::Watch => {
             let (s, p) = (spot?, ptb?);
-            if s > p {
-                Some("up")
-            } else if s < p {
-                Some("down")
-            } else {
-                None
+            match strategy {
+                SignalStrategy::Rubric => {
+                    if s > p {
+                        Some("up")
+                    } else if s < p {
+                        Some("down")
+                    } else {
+                        None
+                    }
+                }
+                SignalStrategy::CatchUp => {
+                    if s > p {
+                        Some("down")
+                    } else if s < p {
+                        Some("up")
+                    } else {
+                        None
+                    }
+                }
             }
         }
         ManualSignalLabel::NoTrade => None,
@@ -921,10 +955,11 @@ fn sim_trading_win_rate(sim: &SimTradingSummary) -> Option<f64> {
 fn aggregate_signal_eval_on_rounds(
     rounds: &HashMap<String, RoundAccum>,
     mode: EvalMode,
+    strategy: SignalStrategy,
     overrides: &TunableOverrides,
     sim_params: &SimTradingParams,
 ) -> EvalSummary {
-    let rep = replay_strategy_metrics(rounds, mode, overrides);
+    let rep = replay_strategy_metrics(rounds, mode, strategy, overrides);
     let mut summary = EvalSummary {
         rounds_total: rounds.len(),
         rounds_with_win: rep.rounds_with_win,
@@ -963,6 +998,7 @@ fn aggregate_signal_eval_on_rounds(
             we,
             overrides,
             sim_params,
+            strategy,
             win,
         ));
     }
@@ -976,16 +1012,18 @@ fn aggregate_signal_eval_on_rounds(
 pub fn replay_sim_realized_pnl_usdc(
     rounds: &HashMap<String, RoundAccum>,
     mode: EvalMode,
+    strategy: SignalStrategy,
     overrides: &TunableOverrides,
 ) -> f64 {
     let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
-    aggregate_signal_eval_on_rounds(rounds, mode, overrides, &sim).sim_trading.realized_pnl_usdc
+    aggregate_signal_eval_on_rounds(rounds, mode, strategy, overrides, &sim).sim_trading.realized_pnl_usdc
 }
 
 fn aggregate_signal_eval(
     dir: &std::path::Path,
     day: Option<&str>,
     mode: EvalMode,
+    strategy: SignalStrategy,
     overrides: &TunableOverrides,
     sim_params: &SimTradingParams,
 ) -> Result<Option<EvalSummary>> {
@@ -994,6 +1032,7 @@ fn aggregate_signal_eval(
     Ok(Some(aggregate_signal_eval_on_rounds(
         &rounds,
         mode,
+        strategy,
         overrides,
         sim_params,
     )))
@@ -1337,6 +1376,7 @@ pub fn run_signal_eval_tune_cli(args: &[String]) -> Result<()> {
     let mut grind_mode = GrindMode::None;
     let mut progress_every_cfg: u64 = 0;
     let mut dir_explicit = false;
+    let mut strategy_cli: Option<String> = None;
 
     let mut g_strong_gap: Option<String> = None;
     let mut g_max_spread: Option<String> = None;
@@ -1374,6 +1414,13 @@ pub fn run_signal_eval_tune_cli(args: &[String]) -> Result<()> {
                     bail!("--mode requires strong-only|watch-as-hint");
                 };
                 mode = EvalMode::parse(m).with_context(|| format!("unknown mode {m}"))?;
+            }
+            "--strategy" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    bail!("--strategy requires rubric|catch-up");
+                };
+                strategy_cli = Some(s.clone());
             }
             "--json" => {
                 json_out = true;
@@ -1629,6 +1676,8 @@ pub fn run_signal_eval_tune_cli(args: &[String]) -> Result<()> {
     }
     sort_round_snaps_by_ts(&mut rounds);
 
+    let strategy = signal_strategy_cli_or_env(strategy_cli.as_deref())?;
+
     let mut best_perfect: Option<(EvalSummary, TunableOverrides, SimTradingParams)> = None;
     let mut best_fallback: Option<(EvalSummary, TunableOverrides, SimTradingParams)> = None;
     let mut best_fallback_rate: f64 = -1.0;
@@ -1642,7 +1691,7 @@ pub fn run_signal_eval_tune_cli(args: &[String]) -> Result<()> {
                 100.0 * done as f64 / n as f64
             );
         }
-        let summary = aggregate_signal_eval_on_rounds(&rounds, mode, &overrides, &sim);
+        let summary = aggregate_signal_eval_on_rounds(&rounds, mode, strategy, &overrides, &sim);
         let sim_sr = sim_trading_win_rate(&summary.sim_trading).unwrap_or(-1.0);
         let perfect = sim_perfect_exit_win_rate(&summary.sim_trading);
 
@@ -1742,10 +1791,12 @@ fn parse_u32_axis_arc(
 
 /// Run `signal-eval` CLI (args after subcommand name).
 pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
+    let _ = dotenvy::dotenv();
     let mut dir = PathBuf::from("./data/rounds");
     let mut day: Option<String> = None;
     let mut mode = EvalMode::StrongOnly;
     let mut json_out = false;
+    let mut strategy_cli: Option<String> = None;
     let mut overrides = TunableOverrides {
         strong_gap_mult: None,
         max_spread_mult: None,
@@ -1784,6 +1835,13 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
                     bail!("--mode requires strong-only|watch-as-hint");
                 };
                 mode = EvalMode::parse(m).with_context(|| format!("unknown mode {m}"))?;
+            }
+            "--strategy" => {
+                i += 1;
+                let Some(s) = args.get(i) else {
+                    bail!("--strategy requires rubric|catch-up");
+                };
+                strategy_cli = Some(s.clone());
             }
             "--json" => {
                 json_out = true;
@@ -1880,7 +1938,16 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         sim_stop_loss_bps.as_deref(),
     );
 
-    let Some(summary) = aggregate_signal_eval(&dir, day.as_deref(), mode, &overrides, &sim_params)?
+    let strategy = signal_strategy_cli_or_env(strategy_cli.as_deref())?;
+
+    let Some(summary) = aggregate_signal_eval(
+        &dir,
+        day.as_deref(),
+        mode,
+        strategy,
+        &overrides,
+        &sim_params,
+    )?
     else {
         println!("No .jsonl files under {}", dir.display());
         return Ok(());
@@ -1890,6 +1957,7 @@ pub fn run_signal_eval_cli(args: &[String]) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&summary)?);
     } else {
         println!("signal-eval summary ({})", summary.mode);
+        println!("  strategy: {}", strategy_label(strategy));
         println!("  rounds (total): {}", summary.rounds_total);
         println!("  rounds with win up/down: {}", summary.rounds_with_win);
         println!("  snaps total: {}", summary.snaps_total);
@@ -1976,6 +2044,7 @@ mod signal_eval_tests {
         load_offline_rounds_filtered, replay_strategy_metrics, simulate_trading_round, snap_to_input,
         EvalMode, RoundAccum, SimTradingParams, TunableOverrides,
     };
+    use crate::config::SignalStrategy;
     use crate::strategy::{evaluate_manual_signal, ManualSignalLabel};
 
     #[test]
@@ -2051,10 +2120,16 @@ mod signal_eval_tests {
         }
         let overrides = TunableOverrides::default();
         let sim = SimTradingParams::from_cli_optional(None, None, None, None, None, None, None);
-        let rep = replay_strategy_metrics(&rounds, EvalMode::StrongOnly, &overrides);
+        let rep = replay_strategy_metrics(
+            &rounds,
+            EvalMode::StrongOnly,
+            SignalStrategy::Rubric,
+            &overrides,
+        );
         let summary = aggregate_signal_eval_on_rounds(
             &rounds,
             EvalMode::StrongOnly,
+            SignalStrategy::Rubric,
             &overrides,
             &sim,
         );
@@ -2192,6 +2267,7 @@ mod signal_eval_tests {
             we,
             &TunableOverrides::default(),
             &sim,
+            SignalStrategy::Rubric,
             "up",
         );
         assert!(

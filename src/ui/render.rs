@@ -340,7 +340,7 @@ fn draw_header_btc(f: &mut Frame, area: Rect, s: &AppState) {
     if bundle.model.is_some_and(|m| m != bundle.rubric) {
         line1_parts.push(Span::raw(" "));
         line1_parts.push(Span::styled(
-            format!("(rubric {})", bundle.rubric.as_str()),
+            format!("(base {})", bundle.rubric.as_str()),
             Style::default().fg(Color::DarkGray),
         ));
     }

@@ -56,6 +56,34 @@ pub enum AutotradingSignalMin {
     Watch,
 }
 
+/// Which entry-signal evaluator feeds the UI / autotrading base label (`STRATEGY` env).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SignalStrategy {
+    /// Legacy spot-vs-PTB momentum rubric ([`crate::strategy::evaluate_manual_signal`]).
+    #[default]
+    Rubric,
+    /// Fade: bet opposite side when book skew shows the mover token richer vs the lagging side.
+    CatchUp,
+}
+
+impl SignalStrategy {
+    /// Parse `STRATEGY`: unset or empty → [`SignalStrategy::Rubric`]. Accepts `rubric`, `catch-up`,
+    /// case-insensitive; `catch_up` normalized to `catch-up`.
+    pub fn parse_env(value: Option<&str>) -> Result<Self> {
+        let Some(raw) = value.map(str::trim).filter(|s| !s.is_empty()) else {
+            return Ok(Self::Rubric);
+        };
+        let normalized = raw.to_ascii_lowercase().replace('_', "-");
+        match normalized.as_str() {
+            "rubric" => Ok(Self::Rubric),
+            "catch-up" => Ok(Self::CatchUp),
+            _ => bail!(
+                "STRATEGY must be rubric or catch-up (got {raw:?}; try STRATEGY=rubric or STRATEGY=catch-up)"
+            ),
+        }
+    }
+}
+
 /// Runtime configuration — resolved once at startup.
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -126,6 +154,8 @@ pub struct Config {
     pub strategy_min_top_ask_shares: f64,
     /// `WATCH` when `gap >= strong_gap * ratio` (default `0.60`). Lower → more `WATCH` labels.
     pub strategy_watch_ratio: f64,
+    /// Base signal evaluator: momentum rubric vs catch-up fade ([`SignalStrategy::parse_env`]).
+    pub signal_strategy: SignalStrategy,
     /// Polymarket Relayer API key (Settings → API) — required for gasless Safe `execTransaction` (CTF redeem).
     pub relayer_api_key: Option<String>,
     /// Address paired with the relayer API key (same screen in Polymarket settings).
@@ -262,6 +292,7 @@ impl Config {
         );
         let strategy_watch_ratio =
             parse_strategy_watch_ratio(std::env::var("STRATEGY_WATCH_RATIO").ok().as_deref());
+        let signal_strategy = SignalStrategy::parse_env(std::env::var("STRATEGY").ok().as_deref())?;
 
         let relayer_api_key = std::env::var("POLYMARKET_RELAYER_API_KEY")
             .ok()
@@ -353,6 +384,7 @@ impl Config {
             strategy_max_spread_mult,
             strategy_min_top_ask_shares,
             strategy_watch_ratio,
+            signal_strategy,
             relayer_api_key,
             relayer_api_key_address,
             polygon_rpc_url,
@@ -483,6 +515,7 @@ mod tests {
         parse_autotrading_signal_min, parse_env_bool, parse_round_log_snap_interval_secs,
         parse_stop_loss_bps, parse_strategy_max_spread_mult, parse_strategy_min_top_ask_shares,
         parse_strategy_strong_gap_mult, parse_strategy_watch_ratio, AutotradingSignalMin,
+        SignalStrategy,
     };
 
     #[test]
@@ -603,5 +636,34 @@ mod tests {
         assert_eq!(parse_round_log_snap_interval_secs(Some("10")), 10);
         assert_eq!(parse_round_log_snap_interval_secs(Some("1")), 2);
         assert_eq!(parse_round_log_snap_interval_secs(Some("500")), 120);
+    }
+
+    #[test]
+    fn signal_strategy_parse_env() {
+        assert_eq!(
+            SignalStrategy::parse_env(None).unwrap(),
+            SignalStrategy::Rubric
+        );
+        assert_eq!(
+            SignalStrategy::parse_env(Some("")).unwrap(),
+            SignalStrategy::Rubric
+        );
+        assert_eq!(
+            SignalStrategy::parse_env(Some("rubric")).unwrap(),
+            SignalStrategy::Rubric
+        );
+        assert_eq!(
+            SignalStrategy::parse_env(Some("RUBRIC")).unwrap(),
+            SignalStrategy::Rubric
+        );
+        assert_eq!(
+            SignalStrategy::parse_env(Some("catch-up")).unwrap(),
+            SignalStrategy::CatchUp
+        );
+        assert_eq!(
+            SignalStrategy::parse_env(Some("CATCH_UP")).unwrap(),
+            SignalStrategy::CatchUp
+        );
+        assert!(SignalStrategy::parse_env(Some("momentum")).is_err());
     }
 }

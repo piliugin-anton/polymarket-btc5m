@@ -2799,6 +2799,7 @@ async fn main() -> Result<()> {
         strategy_max_spread_mult = cfg.strategy_max_spread_mult,
         strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares,
         strategy_watch_ratio = cfg.strategy_watch_ratio,
+        signal_strategy = ?cfg.signal_strategy,
         round_log_enabled = cfg.round_log_enabled,
         round_log_dir = %cfg.round_log_dir.display(),
         round_log_snap_interval_secs = cfg.round_log_snap_interval_secs,
@@ -2899,6 +2900,7 @@ async fn main() -> Result<()> {
     state.strategy_max_spread_mult = cfg.strategy_max_spread_mult;
     state.strategy_min_top_ask_shares = cfg.strategy_min_top_ask_shares;
     state.strategy_watch_ratio = cfg.strategy_watch_ratio;
+    state.signal_strategy = cfg.signal_strategy;
     state.signal_model_dir = cfg.signal_model_dir.clone();
     state.round_log = if cfg.round_log_enabled {
         Some(Arc::new(RoundLogHandle::spawn(RoundLogWriterConfig {

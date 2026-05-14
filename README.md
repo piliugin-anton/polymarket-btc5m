@@ -144,6 +144,7 @@ Optional but useful:
 | `AUTOTRADING_ORDER_EXPIRES_AFTER` | Optional. Positive **seconds**: autotrading GTD BUY expires about that long after the order is built (Polymarket uses a +60s signing offset; unset = same as manual limits — expire near **window end**) |
 | `AUTOTRADING_MAX_ENTRY_PRICE` | Optional. Skip automatic GTD BUY entries when the signal-time best ask is above this probability price, e.g. `0.95` to avoid chasing `0.99` entries |
 | `AUTOTRADING_SIGNAL_MIN` | Minimum signal for automatic BUYs: `strong` keeps legacy behavior; `watch` allows earlier, lower-confidence WATCH entries, best paired with `AUTOTRADING_MAX_ENTRY_PRICE` |
+| `STRATEGY` | Base signal path: `rubric` (default) = spot-vs-PTB momentum; `catch-up` = fade when best-ask skew favors the mover leg vs the lagging side |
 | `STRATEGY_STRONG_GAP_MULT` | **Safest first knob** for more `STRONG` signals: multiply the required spot-vs-Price-to-Beat gap (default `1.0`, clamped ~`0.55`–`1.15`). Try `0.85`–`0.92` before loosening spreads |
 | `STRATEGY_MAX_SPREAD_MULT` | Scale max allowed bid–ask spread for strategy book checks (default `1.0`, up to ~`1.35`). **Higher → more signals, worse fill risk** |
 | `STRATEGY_MIN_TOP_ASK_SHARES` | Minimum best-ask size to treat a book as tradable (default `5`, clamped `2`–`50`). **Lower → more signals, thinner book risk** |

@@ -15,6 +15,7 @@ use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use serde::Deserialize;
 
+use crate::config::SignalStrategy;
 use crate::market_profile::MarketProfile;
 use crate::round_log::RoundLogStrategyTunables;
 use crate::signal_eval::{
@@ -112,7 +113,7 @@ fn eval_log_target(
     theta: &RoundLogStrategyTunables,
 ) -> (f64, ReplayStrategyMetrics) {
     let overrides = tunable_overrides_global(theta);
-    let rep = replay_strategy_metrics(rounds, mode, &overrides);
+    let rep = replay_strategy_metrics(rounds, mode, SignalStrategy::Rubric, &overrides);
     (
         log_target(&rep, mode, temperature, watch_weight, theta),
         rep,
@@ -662,9 +663,9 @@ pub fn run_cli(args: &[String]) -> Result<()> {
         watch_ratio: mean_wr,
     });
     let pnl_start =
-        replay_sim_realized_pnl_usdc(&rounds, mode, &tunable_overrides_global(&start));
+        replay_sim_realized_pnl_usdc(&rounds, mode, SignalStrategy::Rubric, &tunable_overrides_global(&start));
     let pnl_mean =
-        replay_sim_realized_pnl_usdc(&rounds, mode, &tunable_overrides_global(&mean_tun));
+        replay_sim_realized_pnl_usdc(&rounds, mode, SignalStrategy::Rubric, &tunable_overrides_global(&mean_tun));
 
     if write_model || install_model {
         let sources: Vec<String> = paths

@@ -5,6 +5,10 @@
 //! only compares **live spot** vs Price to Beat to suggest which *side* to consider — it does not
 //! implement resolution.
 //!
+//! Switch **base** evaluator with env `STRATEGY=rubric|catch-up` ([`crate::config::SignalStrategy`]);
+//! the default rubric compares spot vs PTB on the momentum side. **Catch-up** fades that move when
+//! best-ask skew shows the mover outcome richer than the lagging leg (see [`evaluate_catch_up_signal`]).
+//!
 //! Tunables (`ManualSignalInput`): `strong_gap_mult`, `max_spread_mult`, `min_top_ask_shares`, and
 //! `watch_ratio` are loaded from `.env` via [`crate::app::AppState`] (defaults preserve the original
 //! rubric). See project README — **Strategy signal tuning**.
@@ -15,6 +19,7 @@
 //! `parse_strategy_*` helpers in [`crate::config`] except `watch_ratio`, which keeps the wider
 //! `0.25..=0.90` clamp used here historically.
 
+use crate::config::SignalStrategy;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ManualSignalLabel {
     NoTrade,
@@ -75,6 +80,8 @@ enum Direction {
     Down,
 }
 
+/// Minimum `best_ask` difference (mover minus fade leg) required for [`evaluate_catch_up_signal`].
+const CATCHUP_MIN_ASK_EDGE: f64 = 0.02;
 /// Clamps match [`crate::config`] `parse_strategy_strong_gap_mult` / `max` / `min_top_ask_shares`.
 fn sanitize_strong_gap_mult(v: f64) -> f64 {
     if !v.is_finite() {
@@ -116,12 +123,52 @@ fn finite_activity_notional(v: f64) -> f64 {
     }
 }
 
-pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
-    let strong_gap_mult = sanitize_strong_gap_mult(input.strong_gap_mult);
-    let max_spread_mult = sanitize_max_spread_mult(input.max_spread_mult);
-    let min_top_ask_shares = sanitize_min_top_ask_shares(input.min_top_ask_shares);
-    let watch_ratio_clamped = sanitize_watch_ratio(input.watch_ratio);
+pub fn evaluate_signal(strategy: SignalStrategy, input: &ManualSignalInput) -> ManualSignalLabel {
+    match strategy {
+        SignalStrategy::Rubric => evaluate_manual_signal(input),
+        SignalStrategy::CatchUp => evaluate_catch_up_signal(input),
+    }
+}
 
+/// Fade the spot-vs-PTB move when the **mover** outcome’s best ask is sufficiently richer than the
+/// fade leg’s ask (book “caught up” on the move). Uses the same gap / liquidity / time weighting as
+/// the rubric on the **fade** side.
+pub fn evaluate_catch_up_signal(input: &ManualSignalInput) -> ManualSignalLabel {
+    let Some(spot) = finite_positive(input.spot_price) else {
+        return ManualSignalLabel::NoTrade;
+    };
+    let Some(target) = finite_positive(input.price_to_beat) else {
+        return ManualSignalLabel::NoTrade;
+    };
+    let diff = spot - target;
+    if diff == 0.0 {
+        return ManualSignalLabel::NoTrade;
+    }
+    let gap = (diff / target).abs();
+
+    let Some(up_ask) = finite_positive(input.up.best_ask) else {
+        return ManualSignalLabel::NoTrade;
+    };
+    let Some(down_ask) = finite_positive(input.down.best_ask) else {
+        return ManualSignalLabel::NoTrade;
+    };
+
+    let direction = if diff > 0.0 {
+        if up_ask - down_ask + 1e-12 < CATCHUP_MIN_ASK_EDGE {
+            return ManualSignalLabel::NoTrade;
+        }
+        Direction::Down
+    } else {
+        if down_ask - up_ask + 1e-12 < CATCHUP_MIN_ASK_EDGE {
+            return ManualSignalLabel::NoTrade;
+        }
+        Direction::Up
+    };
+
+    evaluate_directional_signal(input, direction, gap)
+}
+
+pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
     let Some(spot) = finite_positive(input.spot_price) else {
         return ManualSignalLabel::NoTrade;
     };
@@ -139,6 +186,19 @@ pub fn evaluate_manual_signal(input: &ManualSignalInput) -> ManualSignalLabel {
     } else {
         return ManualSignalLabel::NoTrade;
     };
+
+    evaluate_directional_signal(input, direction, gap)
+}
+
+fn evaluate_directional_signal(
+    input: &ManualSignalInput,
+    direction: Direction,
+    gap: f64,
+) -> ManualSignalLabel {
+    let strong_gap_mult = sanitize_strong_gap_mult(input.strong_gap_mult);
+    let max_spread_mult = sanitize_max_spread_mult(input.max_spread_mult);
+    let min_top_ask_shares = sanitize_min_top_ask_shares(input.min_top_ask_shares);
+    let watch_ratio_clamped = sanitize_watch_ratio(input.watch_ratio);
 
     let max_spread_raw =
         adaptive_max_spread(input.seconds_to_close, input.window_secs) * max_spread_mult;
@@ -278,6 +338,8 @@ fn time_weighted_strong_gap(seconds_to_close: Option<i64>, window_secs: Option<i
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::config::SignalStrategy;
 
     fn side(best_bid: f64, best_ask: f64, best_ask_size: f64) -> ManualSignalBookSide {
         ManualSignalBookSide {
@@ -560,6 +622,72 @@ mod tests {
         input.strong_gap_mult = f64::NAN;
 
         assert_eq!(evaluate_manual_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_blocks_when_ask_skew_below_min_edge() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        // Skew 0.01 < CATCHUP_MIN_ASK_EDGE
+        input.up = side(0.50, 0.51, 80.0);
+        input.down = side(0.48, 0.50, 80.0);
+
+        assert_eq!(evaluate_catch_up_signal(&input), ManualSignalLabel::NoTrade);
+    }
+
+    #[test]
+    fn catch_up_strong_down_when_mover_rich_and_fade_book_usable() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongDown
+        );
+    }
+
+    #[test]
+    fn catch_up_strong_up_mirrors_when_spot_below_ptb() {
+        let mut input = base_input();
+        input.spot_price = Some(99.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.29, 0.30, 80.0);
+        input.down = side(0.64, 0.65, 80.0);
+
+        assert_eq!(
+            evaluate_catch_up_signal(&input),
+            ManualSignalLabel::StrongUp
+        );
+    }
+
+    #[test]
+    fn evaluate_signal_dispatches_rubric_vs_catch_up() {
+        let mut input = base_input();
+        input.spot_price = Some(101.0);
+        input.price_to_beat = Some(100.0);
+        input.seconds_to_close = Some(20);
+        input.window_secs = Some(300);
+        input.up = side(0.64, 0.65, 80.0);
+        input.down = side(0.29, 0.30, 80.0);
+
+        assert_eq!(
+            evaluate_signal(SignalStrategy::Rubric, &input),
+            ManualSignalLabel::StrongUp
+        );
+        assert_eq!(
+            evaluate_signal(SignalStrategy::CatchUp, &input),
+            ManualSignalLabel::StrongDown
+        );
     }
 
     #[test]

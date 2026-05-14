@@ -22,6 +22,7 @@ use crate::gamma::ActiveMarket;
 use crate::gamma_series::SeriesRow;
 use crate::market_activity::RollingTradedNotional;
 use crate::market_profile::MarketProfile;
+use crate::config::SignalStrategy;
 use crate::strategy::{ManualSignalBookSide, ManualSignalInput, ManualSignalLabel, ManualSignalSentiment};
 use crate::stop_loss::{stop_loss_sell_limit_price, stop_loss_triggered};
 use crate::take_profit::{
@@ -619,6 +620,8 @@ pub struct AppState {
     pub strategy_min_top_ask_shares: f64,
     /// Watch threshold as fraction of strong gap (`STRATEGY_WATCH_RATIO`).
     pub strategy_watch_ratio: f64,
+    /// Base signal path: rubric vs catch-up fade (`STRATEGY`).
+    pub signal_strategy: SignalStrategy,
 
     /// Optional JSONL session logger ([`crate::round_log::RoundLogHandle`]).
     pub round_log: Option<std::sync::Arc<crate::round_log::RoundLogHandle>>,
@@ -699,6 +702,7 @@ impl AppState {
             strategy_max_spread_mult: 1.0,
             strategy_min_top_ask_shares: 5.0,
             strategy_watch_ratio: 0.60,
+            signal_strategy: SignalStrategy::Rubric,
             round_log: None,
             signal_model_dir: PathBuf::from("./models"),
             traded_activity: RollingTradedNotional::new(),
@@ -996,6 +1000,7 @@ impl AppState {
     /// Rubric label plus optional model-driven label (see [`crate::signal`]).
     pub fn signal_bundle(&self) -> crate::signal::SignalBundle {
         crate::signal::evaluate(
+            self.signal_strategy,
             &self.signal_model_dir,
             self.market_profile
                 .as_ref()
